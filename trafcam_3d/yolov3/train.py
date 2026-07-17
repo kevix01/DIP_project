@@ -1,0 +1,840 @@
+import argparse
+
+import torch.distributed as dist
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+from torch.utils.tensorboard import SummaryWriter
+
+import test  # import test.py to get mAP after each epoch
+from models import *
+from utils.datasets import *
+from utils.utils import *
+from utils.sampler import BatchFrozenSampler
+
+import torchsnooper
+import json
+
+mixed_precision = True
+try:  # Mixed precision training https://github.com/NVIDIA/apex
+    from apex import amp
+except:
+    print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
+    mixed_precision = False  # not installed
+
+wdir = 'weights' + os.sep  # weights dir
+last = wdir + 'last.pt'
+best = wdir + 'best.pt'
+rdir = 'results' + os.sep       ## added 11132020
+results_file = rdir + 'results.txt'
+
+# Hyperparameters
+hyp = {'giou': 3.54,  # giou loss gain
+       'cls': 37.4,  # cls loss gain
+       'cls_pw': 1.0,  # cls BCELoss positive_weight
+       'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
+       'obj_pw': 1.0,  # obj BCELoss positive_weight
+       'iou_t': 0.20,  # iou training threshold
+       'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
+       'lrf': 0.0005,  # final learning rate (with cos scheduler)
+       'momentum': 0.937,  # SGD momentum
+       'weight_decay': 0.0005,  # optimizer weight decay
+       'fl_gamma': 0.0,  # focal loss gamma (efficientDet default is gamma=1.5)
+       'hsv_h': 0.0138,  # image HSV-Hue augmentation (fraction)
+       'hsv_s': 0.678,  # image HSV-Saturation augmentation (fraction)
+       'hsv_v': 0.36,  # image HSV-Value augmentation (fraction)
+       'degrees': 1.98 * 0,  # image rotation (+/- deg)
+       'translate': 0.05 * 0,  # image translation (+/- fraction)
+       'scale': 0.05 * 0,  # image scale (+/- gain)
+       'shear': 0.641 * 0}  # image shear (+/- deg)
+
+## for traffic cam
+# hyp.update({
+#     'xy': 4.062, 
+#     'wh': 0.1845,
+#     'r': 4.062, 
+#     'tt': 0.01845, })#4.062
+# hyp.update({
+#     'xy': 0.1845, 
+#     'wh': 0.1845,
+#     'r': 4.062, 
+#     'tt': 4.062,
+#     'giou': 0.0354 })### tail_inv
+# ### for kitti
+# hyp.update({
+#     'xy': 4.062, 
+#     'wh': 1.845,
+#     'r': 0.4 })#4.062
+    # {'giou': 1.008,  # giou loss gain
+    #    'xy': 4.062,  # xy loss gain
+    #    'wh': 0.1845,  # wh loss gain
+    #    'cls': 16.94,  # cls loss gain
+    #    'cls_pw': 6.215,  # cls BCELoss positive_weight
+    #    'obj': 10.61,  # obj loss gain
+    #    'obj_pw': 4.272,  # obj BCELoss positive_weight
+    #    'iou_t': 0.251,  # iou target-anchor training threshold
+    #    'lr0': 0.001,  # initial learning rate
+    #    'lrf': -4.,  # final learning rate = lr0 * (10 ** lrf)
+    #    'momentum': 0.90,  # SGD momentum
+    #    'weight_decay': 0.0005}  # optimizer weight decay
+
+def set_hyp_by_opt(opt):
+    if opt.tail_inv:
+        hyp.update({
+            'xy': 0.1845, 
+            'wh': 0.1845,
+            'r': 4.062, 
+            'tt': 4.062,
+            'giou': 0.0354 })### tail_inv
+    else:
+        hyp.update({
+            'xy': 4.062, 
+            'wh': 0.1845,
+            'r': 4.062, 
+            'tt': 0.01845, })#4.062
+    return
+
+def save_cfg(opt, hyp):
+    fpath = wdir + "cfg_" + opt.name + ".txt"
+    if not os.path.exists(os.path.dirname(fpath)):
+        os.makedirs(os.path.dirname(fpath))
+    with open(fpath, "w") as f:
+        f.write(time.ctime() + "\n")
+        opt_dict = opt.__dict__.copy()
+        json.dump(opt_dict, f, indent=2)
+        f.write("\n")
+        json.dump(hyp, f, indent=2)
+        print("cfg file saved to {}".format(fpath))
+
+# Overwrite hyp with hyp*.txt (optional)
+f = glob.glob('hyp*.txt')
+if f:
+    print('Using %s' % f[0])
+    for k, v in zip(hyp.keys(), np.loadtxt(f[0])):
+        hyp[k] = v
+
+# Print focal loss if gamma > 0
+if hyp['fl_gamma']:
+    print('Using FocalLoss(gamma=%g)' % hyp['fl_gamma'])
+
+# @torchsnooper.snoop()
+def train(hyp):
+    torch.cuda.empty_cache()        # in case previously run application is exited abnormally without clearing the cache in GPU memory
+    cfg = opt.cfg
+    data = opt.data
+    epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
+    batch_size = opt.batch_size
+    accumulate = max(round(64 / batch_size), 1)  # accumulate n times before optimizer update (bs 64)
+    weights = opt.weights  # initial training weights
+    imgsz_min, imgsz_max, imgsz_test = opt.img_size  # img sizes (min, max, test)
+
+    rotated = opt.rotated
+    rotated_anchor = opt.rotated_anchor
+    half_angle = opt.half_angle
+
+    dual_view = opt.dual_view
+    use_mask = opt.use_mask
+
+    # Image Sizes
+    gs = 32 # 64  # (pixels) grid size
+    assert math.fmod(imgsz_min, gs) == 0, '--img-size %g must be a %g-multiple' % (imgsz_min, gs)
+    opt.multi_scale |= imgsz_min != imgsz_max  # multi if different (min, max)
+    if opt.multi_scale:
+        if imgsz_min == imgsz_max:
+            imgsz_min //= 1.5
+            imgsz_max //= 0.667
+        grid_min, grid_max = imgsz_min // gs, imgsz_max // gs
+        imgsz_min, imgsz_max = int(grid_min * gs), int(grid_max * gs)
+    img_size = imgsz_max  # initialize with max size
+
+    # Configure run
+    init_seeds()
+    if data.endswith("yaml"):
+        assert opt.bev_dataset, "yaml data config file can be used only when the dataset is in bev_dataset format"
+        data_dict = parse_data_yaml(data)
+    else:        
+        data_dict = parse_data_cfg(data)
+    train_path = data_dict['train']
+    test_path = data_dict['valid']
+    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
+    hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
+
+    # Remove previous results
+    for f in glob.glob(rdir+'*_batch*.jpg') + glob.glob(results_file):
+        os.remove(f)
+
+    # Initialize model
+    model = Darknet(cfg, rotated=rotated, half_angle=half_angle, tail=opt.tail, tail_inv=opt.tail_inv, rotated_anchor=rotated_anchor, dual_view=dual_view).to(device)
+
+    # Optimizer
+    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    for k, v in dict(model.named_parameters()).items():
+        if '.bias' in k:
+            pg2 += [v]  # biases
+        elif 'Conv2d.weight' in k:
+            pg1 += [v]  # apply weight_decay
+        else:
+            pg0 += [v]  # all else
+
+    if opt.adam:
+        # hyp['lr0'] *= 0.1  # reduce lr (i.e. SGD=5E-3, Adam=5E-4)
+        optimizer = optim.Adam(pg0, lr=hyp['lr0'])
+        # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
+    else:
+        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        # optimizer = optim.SGD(pg1, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True, weight_decay=hyp['weight_decay'])  # add pg1 with weight_decay       # VISMODE1113 do not have pg0
+    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+    print('Optimizer groups: %g .bias, %g Conv2d.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    del pg0, pg1, pg2
+
+    start_epoch = 0
+    best_fitness = 0.0
+    attempt_download(weights)
+    if weights.endswith('.pt'):  # pytorch format
+        # possible weights are '*.pt', 'yolov3-spp.pt', 'yolov3-tiny.pt' etc.
+        chkpt = torch.load(weights, map_location=device)
+
+        # load model
+        try:
+            # ### VISMODE1113 manually set the weight to identical mapping
+            # for key in chkpt['model']:
+            #     if 'Conv2d' in key:
+            #         # print("{}:".format(key), chkpt['model'][key].shape)
+            #         if 'weight' in key:
+            #             chkpt['model'][key] = torch.zeros_like(chkpt['model'][key])
+            #             filter_h = chkpt['model'][key].shape[2]
+            #             filter_w = chkpt['model'][key].shape[3]
+            #             mid_h = int((filter_h - 1) / 2)
+            #             mid_w = int((filter_w - 1) / 2)
+            #             chkpt['model'][key][0,0,mid_h, mid_w] = 1
+            #             chkpt['model'][key][1,1,mid_h, mid_w] = 1
+            #             chkpt['model'][key][2,2,mid_h, mid_w] = 1
+            #         elif 'bias' in key:
+            #             chkpt['model'][key] = torch.zeros_like(chkpt['model'][key])
+                        
+
+            if not dual_view or "yolov3-spp-ultralytics" not in weights:
+                chkpt['model'] = {k: v for k, v in chkpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+                model.load_state_dict(chkpt['model'], strict=False)
+            else:
+                chkpt_keys = [k for k in chkpt['model'] ]
+                modify_keys = [k for k in chkpt['model'] if k[:12] == "module_list." and k.split(".")[1].isdigit() and int(k.split(".")[1]) > 61 ]
+                modify_key_mapping = {k: k.replace(k.split(".")[1], str(int(k.split(".")[1])+1)) if k in modify_keys else k for k in chkpt['model'] }
+                additional_key_mapping = {k: k.replace("module_list.", "module_list_sub.") for k in chkpt['model'] if k[:12] == "module_list." and k.split(".")[1].isdigit() and int(k.split(".")[1]) <= 61 }
+
+                for idx in [62, 94, 106]:
+                    modify_weight = chkpt['model']['module_list.{}.Conv2d.weight'.format(idx)].clone()
+                    modify_weight_chn = modify_weight.shape[1]
+                    if idx in [94, 106]:
+                        assert modify_weight_chn % 3 == 0
+                        modify_weight[:, modify_weight_chn//3:] = modify_weight[:, modify_weight_chn//3:] * 0.5
+                        new_weight = torch.cat([modify_weight, modify_weight[:, modify_weight_chn//3:]], dim=1) # for accepting dual view features
+                    else:
+                        modify_weight = modify_weight * 0.5
+                        new_weight = torch.cat([modify_weight, modify_weight], dim=1) # for accepting dual view features
+                    chkpt['model']['module_list.{}.Conv2d.weight'.format(idx)] = new_weight
+
+                chkpt_new = {modify_key_mapping[k]: v for k, v in chkpt['model'].items() if model.state_dict()[modify_key_mapping[k]].numel() == v.numel() }
+                chkpt_new.update({additional_key_mapping[k]: chkpt['model'][k] for k in additional_key_mapping if model.state_dict()[additional_key_mapping[k]].numel() == chkpt['model'][k].numel()  })
+
+                # ### VISMODE1113 the model has fewer keys than checkpoint
+                # chkpt_new = {modify_key_mapping[k]: v for k, v in chkpt['model'].items() if modify_key_mapping[k] in model.state_dict() and model.state_dict()[modify_key_mapping[k]].numel() == v.numel() }
+                # chkpt_new.update({additional_key_mapping[k]: chkpt['model'][k] for k in additional_key_mapping if additional_key_mapping[k] in model.state_dict() and model.state_dict()[additional_key_mapping[k]].numel() == chkpt['model'][k].numel()  })
+
+                for idx in [62, 94, 106]:
+                    test_key = 'module_list.{}.Conv2d.weight'.format(idx)
+                    test_key_new = 'module_list.{}.Conv2d.weight'.format(idx+1)
+                    
+                    assert test_key_new in chkpt_new, "{}: {}, model {}, chkpt_new {}".format(test_key, chkpt['model'][test_key].shape, model.state_dict()[test_key].shape, chkpt_new[test_key_new].shape)
+                    
+                model.load_state_dict(chkpt_new, strict=False)
+
+                
+        except KeyError as e:
+            s = "%s is not compatible with %s. Specify --weights '' or specify a --cfg compatible with %s. " \
+                "See https://github.com/ultralytics/yolov3/issues/657" % (opt.weights, opt.cfg, opt.weights)
+            raise KeyError(s) from e
+
+        # load optimizer
+        # if False:
+        if chkpt['optimizer'] is not None:
+            optimizer.load_state_dict(chkpt['optimizer'])
+            best_fitness = chkpt['best_fitness']
+            
+            print("loading optimizer:", optimizer.param_groups[0]['lr'])
+        else:
+            
+            print("Not loading optimizer")
+
+        # load results
+        if chkpt.get('training_results') is not None:
+            with open(results_file, 'w') as file:
+                file.write(chkpt['training_results'])  # write results.txt
+
+        start_epoch = chkpt['epoch'] + 1
+        del chkpt
+
+    elif len(weights) > 0:  # darknet format
+        # possible weights are '*.weights', 'yolov3-tiny.conv.15',  'darknet53.conv.74' etc.
+        load_darknet_weights(model, weights)
+
+    # Mixed precision training https://github.com/NVIDIA/apex
+    if mixed_precision:
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
+
+    # Scheduler https://arxiv.org/pdf/1812.01187.pdf
+    lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    scheduler.last_epoch = start_epoch - 1  # see link below
+    # scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf, last_epoch=start_epoch-1)    ## weight is loaded this way
+    # https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822
+
+    # Plot lr schedule
+    # y = []
+    # for _ in range(epochs):
+    #     scheduler.step()
+    #     y.append(optimizer.param_groups[0]['lr'])
+    # plt.plot(y, '.-', label='LambdaLR')
+    # plt.xlabel('epoch')
+    # plt.ylabel('LR')
+    # plt.tight_layout()
+    # plt.savefig('LR.png', dpi=300)
+
+    # Initialize distributed training
+    if device.type != 'cpu' and torch.cuda.device_count() > 1 and torch.distributed.is_available():
+        dist.init_process_group(backend='nccl',  # 'distributed backend'
+                                init_method='tcp://127.0.0.1:9999',  # distributed training init method
+                                world_size=1,  # number of nodes for distributed training
+                                rank=0)  # distributed training node rank
+        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
+
+    if not dual_view:
+        # Dataset
+        dataset = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_train", img_size, batch_size,
+                                    augment=True,
+                                    hyp=hyp,  # augmentation hyperparameters
+                                    rect=opt.rect,  # rectangular training
+                                    cache_images=opt.cache_images,
+                                    single_cls=opt.single_cls, 
+                                    rotated=rotated, 
+                                    half_angle=half_angle, 
+                                    bev_dataset=opt.bev_dataset, 
+                                    tail=opt.tail)
+    else:
+        # Dataset
+        dataset_bev = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_train", img_size, batch_size,
+                                    augment=True,
+                                    hyp=hyp,  # augmentation hyperparameters
+                                    rect=opt.rect,  # rectangular training
+                                    cache_images=opt.cache_images,
+                                    single_cls=opt.single_cls, 
+                                    rotated=rotated, 
+                                    half_angle=half_angle, 
+                                    bev_dataset=opt.bev_dataset, 
+                                    tail=opt.tail, 
+                                    dual_view_first=True)
+        # Dataset
+        dataset_ori = LoadImagesAndLabels(train_path, opt.data.rsplit(".", 1)[0]+"_ori_train", img_size, batch_size,
+                                    augment=True,
+                                    hyp=hyp,  # augmentation hyperparameters
+                                    rect=opt.rect,  # rectangular training
+                                    cache_images=opt.cache_images,
+                                    single_cls=opt.single_cls, 
+                                    rotated=rotated, 
+                                    half_angle=half_angle, 
+                                    bev_dataset=opt.bev_dataset, 
+                                    tail=opt.tail, 
+                                    dual_view_second=True, 
+                                    i_files=dataset_bev.i_files)
+        dataset = LoadImagesAndLabelsDual(dataset_bev, dataset_ori)
+
+
+    ### batch sampler
+    sampler = BatchFrozenSampler(len(dataset), batch_size, True)
+    # Dataloader
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    ### original one, which does not shuffle when using opt.rect (which we use)
+    # dataloader = torch.utils.data.DataLoader(dataset,
+    #                                          batch_size=batch_size,
+    #                                          num_workers=nw,
+    #                                          shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
+    #                                          pin_memory=True,
+    #                                          collate_fn=dataset.collate_fn)
+    ### shuffle using the BatchFrozenSampler
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_sampler=sampler, 
+                                             num_workers=nw,
+                                             pin_memory=True,
+                                             collate_fn=dataset.collate_fn)
+
+    # Testloader
+    if not dual_view:
+        test_set = LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_valid", imgsz_test, batch_size,
+                                        hyp=hyp,
+                                        rect=True,
+                                        cache_images=opt.cache_images,
+                                        single_cls=opt.single_cls, 
+                                        rotated=rotated, 
+                                        half_angle=half_angle, 
+                                        bev_dataset=opt.bev_dataset, 
+                                        tail=opt.tail, 
+                                        use_mask=use_mask)
+    else:
+        test_set_bev = LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_valid", imgsz_test, batch_size,
+                                        hyp=hyp,
+                                        rect=True,
+                                        cache_images=opt.cache_images,
+                                        single_cls=opt.single_cls, 
+                                        rotated=rotated, 
+                                        half_angle=half_angle, 
+                                        bev_dataset=opt.bev_dataset, 
+                                        tail=opt.tail, 
+                                        dual_view_first=True, 
+                                        use_mask=use_mask)
+        test_set_ori = LoadImagesAndLabels(test_path, opt.data.rsplit(".", 1)[0]+"_ori_valid", imgsz_test, batch_size,
+                                        hyp=hyp,
+                                        rect=True,
+                                        cache_images=opt.cache_images,
+                                        single_cls=opt.single_cls, 
+                                        rotated=rotated, 
+                                        half_angle=half_angle, 
+                                        bev_dataset=opt.bev_dataset, 
+                                        tail=opt.tail, 
+                                        dual_view_second=True, 
+                                        i_files=test_set_bev.i_files, 
+                                        use_mask=use_mask)
+        test_set = LoadImagesAndLabelsDual(test_set_bev, test_set_ori)
+
+    testloader = torch.utils.data.DataLoader(test_set, 
+                                             batch_size=batch_size,
+                                             num_workers=nw,
+                                             pin_memory=True,
+                                             collate_fn=dataset.collate_fn)
+
+    # Model parameters
+    model.nc = nc  # attach number of classes to model
+    model.hyp = hyp  # attach hyperparameters to model
+    model.gr = 1.0  # giou loss ratio (obj_loss = 1.0 or giou)
+    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
+
+    # Model EMA
+    ema = torch_utils.ModelEMA(model)
+
+    # Start training
+    nb = len(dataloader)  # number of batches
+    n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
+    maps = np.zeros(nc)  # mAP per class
+    torch.autograd.set_detect_anomaly(True)         ### Minghan 08202020 debugging the nan in backprop: remember to set it to False after debug!!!!!!!!!
+    results = (0, 0, 0, 0, 0, 0, 0)  # 'P', 'R', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification'
+    t0 = time.time()
+    print('Image sizes %g - %g train, %g test' % (imgsz_min, imgsz_max, imgsz_test))
+    print('Using %g dataloader workers' % nw)
+    print('Starting training for %g epochs...' % epochs)
+
+    # # Process epoch results before training
+    # ema.update_attr(model)
+    # final_epoch = False
+    # if not opt.notest or final_epoch:  # Calculate mAP
+    #     is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
+    #     results, maps = test.test(cfg,
+    #                                   data,
+    #                                   batch_size=batch_size,
+    #                                   imgsz=imgsz_test,
+    #                                   model=ema.ema,
+    #                                   save_json=final_epoch and is_coco,
+    #                                   single_cls=opt.single_cls,
+    #                                   dataloader=testloader,
+    #                                   multi_label=False, 
+    #                                   rotated=rotated, 
+    #                                   conf_thres=0.1, 
+    #                                   iou_thres=0.2,
+    #                                   id=-1, 
+    #                                   rotated_anchor=rotated_anchor, 
+    #                                   half_angle=half_angle )
+    #     print("results", results)
+    #     print("len(results)", len(results))
+    #     s = ('%10s' * 2 + '%10.3g' * 9) % ('%g/%g' % (0, 0 - 1), 0, *torch.zeros(7), 0, 0)  # 6 changed to 9 because rbbox produces lxy, lwh, lr
+    #     with open(results_file, 'a') as f:
+    #         # f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+    #         f.write(s + '%10.3g' * 10 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls, lxy, lwh, lr) to be compatible with rotated case
+
+    #     fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
+    #     print("fi", fi)
+    #     print("best_fitness",best_fitness)
+    #     if fi > best_fitness:
+    #         best_fitness = fi
+    #         print("should save")
+    #     if (best_fitness == fi) and not final_epoch:
+    #         print("saving")
+    #         torch.save(chkpt, best)
+
+    with open(results_file, 'a') as f:  
+        f.write('%10s' * (12+11) % ('epochs', 'mem_cache', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr', 'ltt', 'tot_loss', 'n_targets', 'longside', 'test:mP', 'mR', 'mAP', 'mF1', 'lbox', 'lobj', 'lcls', 'lxy', 'lwh', 'lr', 'ltt')+'\n')
+
+    writer_vis = None
+    # ### VISMODE1113
+    # import socket
+    # from datetime import datetime
+    # current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+    # log_dir = os.path.join(
+    #     'vis_feature', current_time + '_' + socket.gethostname())
+    # writer_vis = SummaryWriter(log_dir)
+
+    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
+    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        model.train()
+
+        # Update image weights (optional)
+        if dataset.image_weights:
+            w = model.class_weights.cpu().numpy() * (1 - maps) ** 2  # class weights
+            image_weights = labels_to_image_weights(dataset.labels, nc=nc, class_weights=w)
+            dataset.indices = random.choices(range(dataset.n), weights=image_weights, k=dataset.n)  # rand weighted idx
+
+        # mloss = torch.zeros(4).to(device)  # mean losses
+        mloss = torch.zeros(8).to(device)  # mean losses    # to be compatible with rotated cases and tail prediction
+        # print(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        print(('\n' + '%10s' * 12) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'xy', 'wh', 'r', 'tt', 'total', 'targets', 'img_size'))
+        pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
+        for i, sample_batch in pbar:  # batch -------------------------------------------------------------
+            if dual_view:
+                imgs, invalid_masks, targets, paths, _, oris, _, H_img_bev = sample_batch
+                oris = oris.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+                H_img_bev = H_img_bev.to(device).float()
+            else:
+                imgs, invalid_masks, targets, paths, _ = sample_batch
+            ni = i + nb * epoch  # number integrated batches (since train start)
+            imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+            targets = targets.to(device)
+
+            # with open("log_path.txt", "w") as f_tmp:
+            #     for path_item in paths:
+            #         f_tmp.write(path_item+"\n")
+            # Burn-in
+            if ni <= n_burn:
+                xi = [0, n_burn]  # x interp
+                model.gr = np.interp(ni, xi, [0.0, 1.0])  # giou loss ratio (obj_loss = 1.0 or giou)
+                accumulate = max(1, np.interp(ni, xi, [1, 64 / batch_size]).round())
+                for j, x in enumerate(optimizer.param_groups):
+                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                    x['lr'] = np.interp(ni, xi, [0.1 if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
+                    x['weight_decay'] = np.interp(ni, xi, [0.0, hyp['weight_decay'] if j == 1 else 0.0])
+                    if 'momentum' in x:
+                        x['momentum'] = np.interp(ni, xi, [0.9, hyp['momentum']])
+
+            # Multi-Scale
+            if opt.multi_scale:
+                if ni / accumulate % 1 == 0:  #  adjust img_size (67% - 150%) every 1 batch
+                    img_size = random.randrange(grid_min, grid_max + 1) * gs
+                sf = img_size / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
+                    imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+                    invalid_masks = [F.interpolate(x, size=ns, mode='bilinear', align_corners=False) if x is not None else None for x in invalid_masks]
+
+            # Forward
+            if not dual_view:
+                pred = model(imgs)
+            else:
+                ## VISMODE1113 make sure image is positive
+                # print("imgs max min", imgs.max(), imgs.min())   # 0-1
+                # print("oris max min", oris.max(), oris.min())
+                # print("imgs oris", imgs.size(), oris.size())
+                # if epoch == start_epoch and i % 1000 == 0:
+                if writer_vis is not None:
+                    writer_vis.add_images("bevs", imgs, i)
+                    writer_vis.add_images("oris", oris, i)
+                    for ib in range(imgs.shape[0]):
+                        writer_vis.add_image("imgs/%d"%ib, imgs[ib], i)
+                        writer_vis.add_image("oris/%d"%ib, oris[ib], i)
+
+                    ##########################################################        ## testing the correctness of the H
+                    grid_shape = imgs.shape
+                    height = grid_shape[2]
+                    width = grid_shape[3]
+                    batch_size = grid_shape[0]
+                    # xs = torch.linspace(-1, 1, width)   # if align_corners==True, the corner pixel center is -1 / 1
+                    # ys = torch.linspace(-1, 1, height)  # if align_corners==False, the corner of corner pixels is -1 / 1, thererfore the corner pixel center is not -1 / 1
+                    xs = torch.arange(width) + 0.5
+                    ys = torch.arange(height) + 0.5
+                    # xs = (torch.arange(width) + 0.5) / width * 2 - 1
+                    # ys = (torch.arange(height) + 0.5) / height * 2 - 1
+                    
+                    base_grid = torch.stack(
+                        torch.meshgrid([xs, ys])).transpose(1, 2).to(device=imgs.device, dtype=imgs.dtype)  # 2xHxW
+                    base_grid = torch.unsqueeze(base_grid, dim=0).permute(0, 2, 3, 1).expand(batch_size, -1, -1, -1)  # BxHxWx2
+                    grid_flat = base_grid.reshape(batch_size, -1, 2)    # B*N*2
+                    grid_flat_homo = torch.nn.functional.pad(grid_flat, (0, 1), "constant", 1.0)    # B*N*3
+
+                    H_to_use = H_img_bev[:, 0] # B*3*3
+
+                    grid_warped_flat_homo = torch.matmul(
+                        H_to_use.unsqueeze(1), grid_flat_homo.unsqueeze(-1))    # B*1*3*3 x B*N*3*1 => B*N*3*1
+                    grid_warped_flat_homo = torch.squeeze(grid_warped_flat_homo, dim=-1)    # B*N*3
+
+                    grid_warped_flat = grid_warped_flat_homo[..., :-1] / grid_warped_flat_homo[..., -1:]    # B*N*2
+                    grid_warped = grid_warped_flat.view(batch_size, height, width, 2)   # B*H*W*2
+
+                    height_ori = oris.shape[2]
+                    width_ori = oris.shape[3]
+                    grid_warped[..., 0] = grid_warped[..., 0] / width_ori * 2 - 1
+                    grid_warped[..., 1] = grid_warped[..., 1] / height_ori * 2 - 1
+
+                    feature_warped = torch.nn.functional.grid_sample(oris, grid_warped, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+                    writer_vis.add_images("warped_oris", feature_warped, i)
+                    ##########################################################
+                
+                pred = model(imgs, x_sec_view=oris, H_img_bev=H_img_bev, writer=writer_vis)   ### VISMODE1113
+
+            # Loss
+            loss, loss_items = compute_loss(pred, targets, model, use_giou_loss=opt.giou_loss, half_angle=half_angle, tail_inv=opt.tail_inv)
+            if not torch.isfinite(loss):
+                print('WARNING: non-finite loss, ending training ', loss_items)
+                return results
+
+            # Backward
+            loss *= batch_size / 64  # scale loss
+            if mixed_precision:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            # print("lr_print:", optimizer.param_groups[0]['lr'])
+            # Optimize
+            if ni % accumulate == 0:
+                optimizer.step()    # VISMODE1113: comment this line, do not update the weights
+                optimizer.zero_grad()
+                ema.update(model)
+
+            # Print
+            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+            mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+            # s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size) # 2 + 4 + 2
+            s = ('%10s' * 2 + '%10.3g' * 10) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)  # 6 changed to 9 because rbbox produces lxy, lwh, lr, ltt # 2 + 8 + 2
+            # mloss=(lbox, lobj, lcls, loss) originally
+            # mloss=(lbox, lobj, lcls, lxy, lwh, lr, loss) to be compatible with rbox
+            # mloss=(lbox, lobj, lcls, lxy, lwh, lr, ltt, loss) to be compatible with rbox with tail
+            pbar.set_description(s)
+
+            # Plot
+            if ni < 1:
+                f = rdir+'train_batch%g.jpg' % i  # filename
+                res = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
+                if tb_writer:
+                    tb_writer.add_image(f, res, dataformats='HWC', global_step=epoch)
+                    # tb_writer.add_graph(model, imgs)  # add model to tensorboard
+
+            # end batch ------------------------------------------------------------------------------------------------
+
+        # Update scheduler
+        scheduler.step()
+
+        # Process epoch results
+        ema.update_attr(model)
+        final_epoch = epoch + 1 == epochs
+        if not opt.notest or final_epoch:  # Calculate mAP
+            is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
+            results, maps = test.test(cfg,
+                                      data,
+                                      batch_size=batch_size,
+                                      imgsz=imgsz_test,
+                                      model=ema.ema,
+                                      save_json=final_epoch and is_coco,
+                                      single_cls=opt.single_cls,
+                                      dataloader=testloader,
+                                      multi_label=ni > n_burn, 
+                                      rotated=rotated, 
+                                      conf_thres=0.1, 
+                                      iou_thres=0.2,
+                                      id=epoch, 
+                                      rotated_anchor=rotated_anchor, 
+                                      half_angle=half_angle, 
+                                      bev_dataset=opt.bev_dataset,
+                                      tail=opt.tail, 
+                                      tail_inv=opt.tail_inv, 
+                                      dual_view=dual_view, 
+                                      use_mask=use_mask, 
+                                      giou_loss=opt.giou_loss, 
+                                      riou_eval=opt.riou_eval)
+
+        # Write
+        ### s is from training, as an updated average of the whole epoch
+        with open(results_file, 'a') as f:
+            # f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+            f.write(s + '%10.3g' * 11 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls, lxy, lwh, lr, ltt) to be compatible with rotated case
+        if len(opt.name) and opt.bucket:
+            os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
+
+        # Tensorboard
+        ### mloss is training losses, results are testing quantitative evaluation and losses
+        if tb_writer:
+            tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
+                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/F1',
+                    'val/giou_loss', 'val/obj_loss', 'val/cls_loss']    # tt
+            for x, tag in zip(list(mloss[:-1]) + list(results), tags):
+                tb_writer.add_scalar(tag, x, epoch)
+
+        # Update best mAP
+        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
+        if fi > best_fitness:
+            best_fitness = fi
+
+        # Save model
+        save = (not opt.nosave) or (final_epoch and not opt.evolve)
+        if save:
+            with open(results_file, 'r') as f:  # create checkpoint
+                chkpt = {'epoch': epoch,
+                         'best_fitness': best_fitness,
+                         'training_results': f.read(),
+                         'model': ema.ema.module.state_dict() if hasattr(model, 'module') else ema.ema.state_dict(),
+                         'optimizer': optimizer.state_dict()
+                         }
+                        #  'optimizer': None if final_epoch else optimizer.state_dict()}   
+                        ## changed 09302020: we need to save the optimizer. https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822/5
+                        ## However, since the lr scheduler uses a cosine learning rate decay, 
+                        ## continue training from completely trained weights is not equivalent to traing these later epochs with the previous ones together. 
+
+            # Save last, best and delete
+            torch.save(chkpt, last)
+            print("Model and optimizer saved to:", last)
+            if (best_fitness == fi) and not final_epoch:
+                torch.save(chkpt, best)
+            del chkpt
+        else:
+            print("Model and optimizer not saved:")
+        # end epoch ----------------------------------------------------------------------------------------------------
+    # end training
+
+    n = opt.name
+    if len(n):
+        n = '_' + n if not n.isnumeric() else n
+        fresults, flast, fbest = rdir+'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
+        # for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+        for f1, f2 in zip([last, best, results_file], [flast, fbest, fresults]):
+            if os.path.exists(f1):
+                os.rename(f1, f2)  # rename
+                ispt = f2.endswith('.pt')  # is *.pt
+                # strip_optimizer(f2) if ispt else None  # strip optimizer    ### Minghan: if we want to preserve the optimizer states in the checkpoint, comment this line
+                os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
+
+        print("last.pt, best.pt, results.txt renamed.txt renamed")
+
+    if not opt.evolve:
+        plot_results()  # save as results.png
+    print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+    dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
+    torch.cuda.empty_cache()
+    return results
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=300)  # 500200 batches at bs 16, 117263 COCO images = 273 epochs
+    parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
+    parser.add_argument('--data', type=str, default='data/coco2017.data', help='*.data path')
+    parser.add_argument('--multi-scale', action='store_true', help='adjust (67%% - 150%%) img_size every 10 batches')
+    parser.add_argument('--img-size', nargs='+', type=int, default=[320, 640], help='[min_train, max-train, test]')
+    parser.add_argument('--rect', action='store_true', help='rectangular training')
+    parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
+    parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
+    parser.add_argument('--notest', action='store_true', help='only test final epoch')
+    parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
+    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
+    parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
+    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='initial weights path')
+    parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
+    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--adam', action='store_true', help='use adam optimizer')
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--rotated', action='store_true', help='use rotated bbox instead of axis-aligned ones')
+    parser.add_argument('--rotated-anchor', action='store_true', help='use residual yaw w.r.t. anchors instead of regressing the original angle')
+    parser.add_argument('--half-angle', action='store_true', help='use 180 degree instead of 360 degree in direction estimation (forward-backward equivalent)')
+    parser.add_argument('--bev-dataset', action='store_true', help='use dataset of customized unified structure for bev')
+    parser.add_argument('--tail', action='store_true', help='predict tail along with rbox')
+    parser.add_argument('--tail-inv', action='store_true', help='predict tail along with rbox, with the xy origin at the end of tail')
+    parser.add_argument('--dual-view', action='store_true', help='use both bev and original view as input')
+    parser.add_argument('--use-mask', action='store_true', help='use invalid region mask to mask out some regions (do not want detections there)')
+    parser.add_argument('--giou-loss', action='store_true', help='use giou in loss function')
+    parser.add_argument('--riou-eval', action='store_true', help='use riou threshold in quantitative evaluation')
+    
+    opt = parser.parse_args()
+    opt.weights = last if opt.resume else opt.weights
+    check_git_status()
+    opt = choose_cfg_by_args(opt)
+    opt.cfg = list(glob.iglob('./**/' + opt.cfg, recursive=True))[0]  # find file
+    # opt.data = list(glob.iglob('./**/' + opt.data, recursive=True))[0]  # find file
+    print(opt)
+    opt.img_size.extend([opt.img_size[-1]] * (3 - len(opt.img_size)))  # extend to 3 sizes (min, max, test)
+    device = torch_utils.select_device(opt.device, apex=mixed_precision, batch_size=opt.batch_size)
+    if device.type == 'cpu':
+        mixed_precision = False
+
+    # scale hyp['obj'] by img_size (evolved at 320)
+    # hyp['obj'] *= opt.img_size[0] / 320.
+
+    ### some hyp should change according to the options
+    set_hyp_by_opt(opt)
+    save_cfg(opt, hyp)
+
+    tb_writer = None
+    if not opt.evolve:  # Train normally
+        print('Start Tensorboard with "tensorboard --logdir=runs", view at http://localhost:6006/')
+        tb_writer = SummaryWriter(comment=opt.name)
+        train(hyp)  # train normally
+
+    else:  # Evolve hyperparameters (optional)
+        opt.notest, opt.nosave = True, True  # only test/save final epoch
+        if opt.bucket:
+            os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
+
+        for _ in range(1):  # generations to evolve
+            if os.path.exists('evolve.txt'):  # if evolve.txt exists: select best hyps and mutate
+                # Select parent(s)
+                parent = 'single'  # parent selection method: 'single' or 'weighted'
+                x = np.loadtxt('evolve.txt', ndmin=2)
+                n = min(5, len(x))  # number of previous results to consider
+                x = x[np.argsort(-fitness(x))][:n]  # top n mutations
+                w = fitness(x) - fitness(x).min()  # weights
+                if parent == 'single' or len(x) == 1:
+                    # x = x[random.randint(0, n - 1)]  # random selection
+                    x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
+                elif parent == 'weighted':
+                    x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
+
+                # Mutate
+                method, mp, s = 3, 0.9, 0.2  # method, mutation probability, sigma
+                npr = np.random
+                npr.seed(int(time.time()))
+                g = np.array([1, 1, 1, 1, 1, 1, 1, 0, .1, 1, 0, 1, 1, 1, 1, 1, 1, 1])  # gains
+                ng = len(g)
+                if method == 1:
+                    v = (npr.randn(ng) * npr.random() * g * s + 1) ** 2.0
+                elif method == 2:
+                    v = (npr.randn(ng) * npr.random(ng) * g * s + 1) ** 2.0
+                elif method == 3:
+                    v = np.ones(ng)
+                    while all(v == 1):  # mutate until a change occurs (prevent duplicates)
+                        # v = (g * (npr.random(ng) < mp) * npr.randn(ng) * s + 1) ** 2.0
+                        v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
+                for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
+                    hyp[k] = x[i + 7] * v[i]  # mutate
+
+            # Clip to limits
+            keys = ['lr0', 'iou_t', 'momentum', 'weight_decay', 'hsv_s', 'hsv_v', 'translate', 'scale', 'fl_gamma']
+            limits = [(1e-5, 1e-2), (0.00, 0.70), (0.60, 0.98), (0, 0.001), (0, .9), (0, .9), (0, .9), (0, .9), (0, 3)]
+            for k, v in zip(keys, limits):
+                hyp[k] = np.clip(hyp[k], v[0], v[1])
+
+            # Train mutation
+            results = train(hyp.copy())
+
+            # Write mutation results
+            print_mutation(hyp, results, opt.bucket)
+
+            # Plot results
+            # plot_evolution_results(hyp)

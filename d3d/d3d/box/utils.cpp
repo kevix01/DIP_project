@@ -1,0 +1,48 @@
+#include <vector>
+#include "d3d/box/utils.h"
+#include "dgal/geometry.hpp"
+
+using namespace std;
+using namespace torch;
+using namespace dgal;
+
+template <typename scalar_t>
+void crop_2dr_templated(
+    const _CpuAccessor(2) points_,
+    const _CpuAccessor(2) boxes_,
+    _CpuAccessorT(bool, 2) indicators_
+) {
+    const auto N = points_.size(0);
+    const auto M = boxes_.size(0);
+
+    parallel_for(0, M, 1, [&](int64_t begin, int64_t end)
+    {
+        for (int64_t i = begin; i < end; i++)
+        {
+            Quad2<scalar_t> box = poly2_from_xywhr(boxes_[i][0], boxes_[i][1], boxes_[i][2],
+                boxes_[i][3], boxes_[i][4]);
+            AABox2<scalar_t> aabox = aabox2_from_poly2(box);
+
+            for (int j = 0; j < N; j++)
+            {
+                Point2<scalar_t> p {.x=points_[j][0], .y=points_[j][1]};
+                if (aabox.contains(p) && box.contains(p))
+                    indicators_[i][j] = true;
+                else
+                    indicators_[i][j] = false;
+            }
+        }
+    });
+}
+
+Tensor crop_2dr(const Tensor points, const Tensor boxes)
+{
+    Tensor indicators = torch::empty({boxes.size(0), points.size(0)}, torch::dtype(torch::kBool));
+    AT_DISPATCH_FLOATING_TYPES(points.scalar_type(), "crop_2dr_templated", [&] {
+        crop_2dr_templated<scalar_t>(
+            points._cpu_accessor(2),
+            boxes._cpu_accessor(2),
+            indicators._cpu_accessor_t(bool, 2));
+    });
+    return indicators;
+}
