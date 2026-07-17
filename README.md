@@ -72,7 +72,7 @@ Eseguire il tracking dalla root del progetto:
 ```bash
 cd trafcam_3d
 python -m bev.tool.rbox_tracking_BrnoCompSpeed \
-  --video-root /data \
+  --video-root ./data \
   --video-tag 5_left \
   --fps 25 \
   --no-vis

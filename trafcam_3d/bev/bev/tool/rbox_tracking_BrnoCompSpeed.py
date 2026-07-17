@@ -29,17 +29,17 @@ if __name__ == "__main__":
     no_vis = args.no_vis
     no_vid = args.no_vid
 
-    video_path = os.path.join(video_root, "session"+video_tag, "videos", "bev.avi")
-    pred_path = os.path.join(video_root, "session"+video_tag, "outputs", "bev.txt")
-    video_out_path = os.path.join(video_root, "session"+video_tag, "outputs", "bev_tracking.avi")
-    txt_out_path = os.path.join(video_root, "session"+video_tag, "outputs", "bev_tracking.txt")
+    video_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "videos", "bev.avi")
+    pred_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "outputs", "bev.txt")
+    video_out_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "outputs", "bev_tracking.avi")
+    txt_out_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "outputs", "bev_tracking.txt")
 
-    calib_path = os.path.join(video_root, "session"+video_tag, "calibs", "system_dubska_optimal_calib.json")
-    calib_src_path = os.path.join("/media/sda1/datasets/extracted/BrnoCompSpeed/results", "session"+video_tag, "system_dubska_optimal_calib.json")
+    calib_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "calibs", "system_dubska_optimal_calib.json")
+    calib_src_path = os.path.join("/media/sda1/datasets/extracted/BrnoCompSpeed/results", "BrnoCompSpeed_session"+video_tag, "system_dubska_optimal_calib.json")
     
-    video_ori_path = os.path.join(video_root, "session"+video_tag, "videos", "ori.avi")
-    video_out_ori_path = os.path.join(video_root, "session"+video_tag, "outputs", "ori_tracking.avi")
-    json_out_path = os.path.join(video_root, "session"+video_tag, "outputs", "system_ori_tracking.json")
+    video_ori_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "videos", "ori.avi")
+    video_out_ori_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "outputs", "ori_tracking.avi")
+    json_out_path = os.path.join(video_root, "BrnoCompSpeed_session"+video_tag, "outputs", "system_ori_tracking.json")
 
     print("video_out_path:", video_out_path)
 
