@@ -35,7 +35,8 @@ Note utili:
 
 ## Setup ambiente
 
-Installare i requisiti dai file dei requirements.
+- Creare ambiente virtuale con python 3.8.20 per garantire la compatibilità.
+- Installare i requisiti dai file di requirements.
 
 ## Detection YOLO su BEV
 
@@ -95,17 +96,3 @@ Tipicamente il tracking produce:
 - `outputs/system_ori_tracking.json`: esportazione JSON finale.
 
 Nota: nel video originale `ori_tracking.avi` lo script base disegna soprattutto **punti/circles** proiettati sulle auto, mentre gli ID testuali sono mostrati in modo più esplicito nel video BEV.
-
-## Note operative
-
-- Il tracking usa come input i video `bev.avi` e `ori.avi`, mentre usa `bev.txt` solo come sorgente di detection per frame.
-- Se la detection è stata eseguita solo su una parte del video, i `frame_id` in `bev.txt` devono restare coerenti con i frame letti dal tracker.
-- Se il file AVI di output risulta quasi vuoto, una causa comune è che `VideoWriter.write()` sia stato eseguito solo nel ramo di visualizzazione; conviene tenere separati salvataggio video e `imshow()`.
-- Se OpenCV non supporta bene `x264`, può essere necessario usare un codec più semplice come `MJPG` nel `VideoWriter`.
-
-## Flusso minimo consigliato
-
-1. Preparare `ori.avi`, `bev.avi` e il file di calibrazione.
-2. Lanciare YOLO su `bev.avi` per generare `bev.txt`.
-3. Lanciare il tracking con `rbox_tracking_BrnoCompSpeed`.
-4. Verificare `bev_tracking.avi`, `ori_tracking.avi` e `bev_tracking.txt`.
