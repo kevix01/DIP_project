@@ -1,9 +1,0 @@
-cmake==4.4.0
-Cython==0.29.37
-ninja==1.13.0
-scikit-build==0.19.1
-setuptools==75.3.4
-setuptools-scm==10.2.0
-wheel==0.45.1
-torch==1.13.1
-torchvision==0.14.1

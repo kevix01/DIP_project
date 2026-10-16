@@ -1,3 +1,0 @@
-classes=1
-valid=/media/sda1/datasets/extracted/roadmanship_format/KoPER_onetake/Sequence1a/KAB_SK_1_undist/splits/test.txt
-names=data/bev_network.names
