@@ -653,7 +653,9 @@ class RealtimePipeline:
         if t.time_since_update == 0 and not st["locked"]:
             # Footprint area (normalised; median object ~= 1). Skip degenerate /
             # near-collinear (far, grazing) observations that would corrupt S.
-            qa = 0.5 * abs(np.cross(Q[2] - Q[0], Q[3] - Q[1]))
+            _v1 = Q[2] - Q[0]
+            _v2 = Q[3] - Q[1]
+            qa = 0.5 * abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
             res = Q - posed
             rms = float(np.sqrt((res * res).mean()))
             med = float(np.median(st["rms"])) if len(st["rms"]) >= 5 else None
