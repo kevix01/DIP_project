@@ -199,6 +199,11 @@ def smooth_footprints(states, win: int = 11, poly: int = 2) -> None:
         frames = sorted(fr)
         if len(frames) < max(5, poly + 2):
             continue
+        # Pedestrians (class 0) keep a constant square footprint; their heading
+        # is ill-defined (90-degree symmetry) so smoothing it reintroduces
+        # rotation wobble. Skip them entirely.
+        if fr[frames[0]].cls == 0:
+            continue
         t0, t1 = frames[0], frames[-1]
         L = t1 - t0 + 1
         q = np.full((L, 4, 2), np.nan)
@@ -289,6 +294,11 @@ def smooth_states(states, win: int = 11, poly: int = 2,
             bs = _smooth_channels(b, win, poly)
             for f in frames:
                 fr[f].box_xyxy = bs[f - t0]
+
+        # Pedestrians keep a constant square footprint; their heading is
+        # ill-defined so do not re-smooth it.
+        if fr[frames[0]].cls == 0:
+            continue
 
         # BEV footprint (4, 2) -- rigid pose smoothing
         q = np.full((L, 4, 2), np.nan)

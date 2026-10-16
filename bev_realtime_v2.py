@@ -405,9 +405,9 @@ class V2Pipeline(rt.RealtimePipeline):
         self.labels_meta = dict(cfg.get("labels_meta") or {})
         self.labels_first = int(cfg.get("labels_first", 0) or 0)
         self._last_pose_dets: List[Detection] = []
-        self.labels_first = int(cfg.get("labels_first", 0) or 0)
         self.total_frames = int(cfg.get("total_frames", 0))
-        self._last_pose_dets: List[Detection] = []
+        self._ped_box_ema: dict = {}      # tid -> (w_ema, h_ema) per stabilizzazione box pedoni
+        self._ped_height: dict = {}       # tid -> altezza costante del cubetto pedone
         # Carica l'omografia calibrata
         try:
             self.static_H = np.load("homography_bangkok.npy")
@@ -542,16 +542,86 @@ class V2Pipeline(rt.RealtimePipeline):
                     centroid = np.mean(raw_ground, axis=0)
                     angles = np.arctan2(raw_ground[:, 1] - centroid[1], raw_ground[:, 0] - centroid[0])
                     v.ground = raw_ground[np.argsort(angles)]
-                    
-                    # SBLOCCO DELLA BEV: ricalcola l'impronta usando l'omografia nativa del sistema
+                
+                # SBLOCCO DELLA BEV: ricalcola l'impronta usando l'omografia nativa del sistema.
+                # I pedoni usano un'impronta rigida quadrata per evitare che l'impronta ruoti,
+                # si allarghi o si restringa frame a frame. I veicoli usano la proiezione diretta.
+                if v.cls == 0:
+                    try:
+                        v.bev_quad = self._pedestrian_rigid_footprint(v, state.H, state.bev_unit)
+                    except Exception:
+                        pass
+                else:
                     try:
                         v.bev_quad = apply_homography(v.ground, state.H)
                     except Exception:
                         pass
+            
+            # Pedoni senza keypoint trusted ma con ground valido (tracker coasting):
+            # mantiene comunque l'impronta rigida quadrata invece del raw quad vehicle-style.
+            elif v.cls == 0 and getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
+                try:
+                    v.bev_quad = self._pedestrian_rigid_footprint(v, state.H, state.bev_unit)
+                except Exception:
+                    pass
 
         # Stampa progresso a terminale
         if getattr(self, 'total_frames', 0) > 0:
             print(f"\rElaborazione frame {state.frame_idx}/{self.total_frames} ({(state.frame_idx/self.total_frames)*100:.1f}%)", end="", flush=True)
+
+        # ------------------------------------------------------------------ #
+        # Stabilizzazione pedoni nella vista camera: box 2D + cubetto 3D rigido.
+        # I pedoni hanno keypoints/detector rumorosi: smussiamo causalmente la
+        # 2D box ancorandola al bottom-centre e ricostruiamo il cubetto 3D da un
+        # footprint quadrato rigido + altezza costante, così non ruota né cambia
+        # dimensioni frame a frame.
+        for v in state.tracks:
+            if int(v.cls) != 0:
+                continue
+            box = np.asarray(v.box_xyxy, dtype=np.float64)
+            if box.shape != (4,):
+                continue
+            x1, y1, x2, y2 = box
+            cx = (x1 + x2) * 0.5
+            cy_bottom = y2
+            w = max(x2 - x1, 1.0)
+            h = max(y2 - y1, 1.0)
+            # EMA causale sulle dimensioni (più smussato del tracker alpha-beta).
+            if v.id in self._ped_box_ema:
+                pw, ph = self._ped_box_ema[v.id]
+                w = 0.25 * w + 0.75 * pw
+                h = 0.25 * h + 0.75 * ph
+            self._ped_box_ema[v.id] = (float(w), float(h))
+            # Ricostruisci box attorno al bottom-centre (punto di contatto a terra).
+            v.box_xyxy = np.array([
+                cx - w * 0.5, cy_bottom - h,
+                cx + w * 0.5, cy_bottom,
+            ], dtype=np.float64)
+            # Cubetto 3D rigido: 4 ground corners da rettangolo smussato,
+            # 4 roof corners sollevati di altezza costante (nessuna rotazione).
+            height = self._ped_height.get(v.id, h * 0.85)
+            if v.id not in self._ped_height:
+                self._ped_height[v.id] = height
+            depth = max(w * 0.6, h * 0.4)
+            kp = np.zeros((8, 2), dtype=np.float64)
+            kp[0] = [cx - w * 0.5, cy_bottom]       # ground BL
+            kp[1] = [cx + w * 0.5, cy_bottom]       # ground BR
+            kp[2] = [cx + w * 0.5, cy_bottom - depth]   # ground TR
+            kp[3] = [cx - w * 0.5, cy_bottom - depth]   # ground TL
+            kp[4] = [cx - w * 0.5, cy_bottom - height]  # roof BL
+            kp[5] = [cx + w * 0.5, cy_bottom - height]  # roof BR
+            kp[6] = [cx + w * 0.5, cy_bottom - height - depth]  # roof TR
+            kp[7] = [cx - w * 0.5, cy_bottom - height - depth]  # roof TL
+            v.kpts = kp
+            v.ground = kp[:4].copy()
+            v.kp_ok = True
+            # Coerenza camera|BEV: ricalcola l'impronta BEV dallo stesso
+            # ground sintetico appena costruito, così a sinistra e a destra
+            # il pedone ha la stessa posizione e dimensione.
+            try:
+                v.bev_quad = self._pedestrian_rigid_footprint(v, state.H, state.bev_unit)
+            except Exception:
+                pass
 
         return state
 
@@ -1153,12 +1223,11 @@ def _stabilize_offline_v2(pipe, states, fixed, traj_C, traj_steps, args):
             if getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
                 
                 if v.cls == 0:
-                    # --- PEDONI: Manteniamo la stabilità originale ---
-                    # Lo stabilizzatore di base ha già creato un cuboide 3D
-                    # perfettamente rigido. Non lo modifichiamo, lo proiettiamo 
-                    # semplicemente nella BEV usando la tua matrice di Bangkok.
+                    # --- PEDONI: impronta rigida quadrata con homografia ---
+                    # Applichiamo l'omografia ma mantenendo l'impronta quadrata rigida
+                    # per evitare che ruoti, si allarghi o si restringa frame a frame.
                     try:
-                        v.bev_quad = apply_homography(v.ground, H_mat)
+                        v.bev_quad = pipe._pedestrian_rigid_footprint(v, H_mat, float(s.bev_unit or 0.0))
                     except Exception:
                         pass
                 
@@ -1199,6 +1268,8 @@ def _stabilize_offline_v2(pipe, states, fixed, traj_C, traj_steps, args):
         H_mat = np.asarray(s.H, dtype=np.float64)
         for v in s.tracks:
             if getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
+                if v.cls == 0:
+                    continue  # pedoni: mantengono l'impronta rigida quadrata
                 centroid = np.mean(v.ground, axis=0)
                 angles = np.arctan2(v.ground[:, 1] - centroid[1], v.ground[:, 0] - centroid[0])
                 ordered_ground = v.ground[np.argsort(angles)]
