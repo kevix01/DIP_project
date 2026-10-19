@@ -895,17 +895,15 @@ class V2Pipeline(rt.RealtimePipeline):
                 # SBLOCCO DELLA BEV: ricalcola l'impronta usando l'omografia nativa del sistema.
                 # I pedoni usano un'impronta rigida quadrata per evitare che l'impronta ruoti,
                 # si allarghi o si restringa frame a frame. I veicoli usano la proiezione diretta.
-                if v.cls == 0:
-                    try:
-                        v.bev_quad = self._pedestrian_rigid_footprint(v, state.H, state.bev_unit)
-                    except Exception:
-                        pass
-                else:
+                
+                # Calcola qui solo i veicoli; i pedoni (v.cls == 0) vengono calcolati 
+                # nel blocco successivo dopo la stabilizzazione EMA della loro box 2D.
+                if v.cls != 0:
                     try:
                         v.bev_quad = apply_homography(v.ground, state.H)
                     except Exception:
                         pass
-            
+
             # Pedoni senza keypoint trusted ma con ground valido (tracker coasting):
             # mantiene comunque l'impronta rigida quadrata invece del raw quad vehicle-style.
             elif v.cls == 0 and getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
