@@ -105,6 +105,20 @@ def _mean_kp_visibility(det: Detection) -> float:
     return getattr(det, 'mean_kp_vis', float(det.conf))
 
 
+def _polygon_contains(poly_outer: np.ndarray, poly_inner: np.ndarray) -> bool:
+    """Check if poly_inner is completely inside poly_outer.
+    
+    Both are (4, 2) ground footprints. Uses pointPolygonTest on all vertices.
+    """
+    if poly_outer.shape != (4, 2) or poly_inner.shape != (4, 2):
+        return False
+    hull_outer = cv2.convexHull(poly_outer.astype(np.float32).reshape(-1, 1, 2))
+    for pt in poly_inner:
+        if cv2.pointPolygonTest(hull_outer, tuple(pt.astype(np.float32)), False) < 0:
+            return False
+    return True
+
+
 def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray:
     """Pairwise IoU between two sets of ground quads (4, 2) using convex hull.
     
@@ -133,14 +147,13 @@ def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray
     return iou_mat
 
 
-def _deduplicate_unified(dets: List[Detection]) -> List[Detection]:
+def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) -> List[Detection]:
     """Deduplicate detections by unified class using mean keypoint visibility as quality.
 
-    1. Filter detections: keep only those with ground footprint (4, 2)
-    2. Group by unified class
-    3. Within each group, NMS by IoU on ground footprint, keep highest mean_kp_vis
-    4. Cross-class suppression: bike (1) vs person (0) - suppress person if ground IoU high
-    5. Assign unified class to kept detections
+    1. Separate detections with ground (high quality) and without ground
+    2. For those WITH ground: group by unified class, NMS on ground IoU, cross-class suppression
+    3. For those WITHOUT ground: just assign unified class, pass through for tracker (box-only)
+    4. Combine and return all
     """
     if len(dets) <= 1:
         # Still assign unified class
@@ -148,67 +161,97 @@ def _deduplicate_unified(dets: List[Detection]) -> List[Detection]:
             d.cls = _unified_class(d.cls)
         return dets
 
-    # STRICT: keep only detections with valid ground footprint
+    # Separate detections with and without ground footprint
     with_ground = [d for d in dets if d.ground.shape == (4, 2)]
-    
-    if not with_ground:
-        return []  # no reliable detections
-
-    # Group by unified class
-    groups: Dict[int, List[Detection]] = {}
-    for d in with_ground:
-        ucls = _unified_class(d.cls)
-        groups.setdefault(ucls, []).append(d)
+    without_ground = [d for d in dets if d.ground.shape != (4, 2)]
 
     merged: List[Detection] = []
 
-    # Per-class NMS on ground IoU
-    for ucls, group in groups.items():
-        if len(group) == 1:
-            d = group[0]
-            d.cls = ucls
-            merged.append(d)
-            continue
+    # Process detections WITH ground: high-quality NMS + cross-class suppression
+    if with_ground:
+        # Transform ground footprints to BEV space if homography available
+        if H is not None:
+            def _to_bev(g: np.ndarray) -> np.ndarray:
+                try:
+                    return apply_homography(g, H)
+                except Exception:
+                    return g
+            grounds_bev = np.stack([_to_bev(d.ground) for d in with_ground])
+            for d, g_bev in zip(with_ground, grounds_bev):
+                d.ground_bev = g_bev
+        else:
+            for d in with_ground:
+                d.ground_bev = d.ground.copy()
 
-        qualities = np.array([_mean_kp_visibility(d) for d in group])
-        order = np.argsort(qualities)[::-1]
-        keep = np.ones(len(group), dtype=bool)
+        # Group by unified class
+        groups: Dict[int, List[Detection]] = {}
+        for d in with_ground:
+            ucls = _unified_class(d.cls)
+            groups.setdefault(ucls, []).append(d)
 
-        grounds = np.stack([d.ground for d in group])
-        iou_mat = _ground_iou_matrix(grounds, grounds)
+        merged_with_ground: List[Detection] = []
 
-        for i_idx, i in enumerate(order):
-            if not keep[i]:
+        # Per-class NMS on ground IoU (in BEV space if H available)
+        for ucls, group in groups.items():
+            if len(group) == 1:
+                d = group[0]
+                d.cls = ucls
+                merged_with_ground.append(d)
                 continue
-            for j in order[i_idx + 1:]:
-                if not keep[j]:
+
+            qualities = np.array([_mean_kp_visibility(d) for d in group])
+            order = np.argsort(qualities)[::-1]
+            keep = np.ones(len(group), dtype=bool)
+
+            grounds = np.stack([d.ground_bev for d in group])
+            iou_mat = _ground_iou_matrix(grounds, grounds)
+
+            for i_idx, i in enumerate(order):
+                if not keep[i]:
                     continue
-                if iou_mat[i, j] >= 0.5:
-                    keep[j] = False
+                for j in order[i_idx + 1:]:
+                    if not keep[j]:
+                        continue
+                    if iou_mat[i, j] >= 0.5:
+                        keep[j] = False
 
-        for idx in np.where(keep)[0]:
-            d = group[idx]
-            d.cls = ucls
-            merged.append(d)
+            for idx in np.where(keep)[0]:
+                d = group[idx]
+                d.cls = ucls
+                merged_with_ground.append(d)
 
-    # Cross-class suppression: vehicle (2) vs person (0)
-    # If vehicle and person have overlapping ground footprints, suppress person
-    # This handles cases where a cyclist is detected as both person and bicycle/motorcycle
-    person_indices = [i for i, d in enumerate(merged) if d.cls == 0]
-    vehicle_indices = [i for i, d in enumerate(merged) if d.cls == 2]
-    
-    if person_indices and vehicle_indices:
-        person_grounds = np.stack([merged[i].ground for i in person_indices])
-        vehicle_grounds = np.stack([merged[i].ground for i in vehicle_indices])
-        cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
-        
-        # Suppress person if any vehicle overlaps significantly
-        suppress_person = cross_iou.max(axis=1) >= 0.10
-        keep = np.ones(len(merged), dtype=bool)
-        for idx, p_idx in enumerate(person_indices):
-            if suppress_person[idx]:
-                keep[p_idx] = False
-        merged = [merged[i] for i in range(len(merged)) if keep[i]]
+        # Cross-class suppression: vehicle (2) vs person (0)
+        person_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 0]
+        vehicle_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 2]
+
+        if person_indices and vehicle_indices:
+            person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
+            vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
+            cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
+
+            # Suppress person if any vehicle overlaps significantly
+            suppress_person = cross_iou.max(axis=1) >= 0.05
+
+            # Also suppress if containment (one footprint fully inside the other)
+            for p_idx, p_ground in zip(person_indices, person_grounds):
+                for v_idx, v_ground in zip(vehicle_indices, vehicle_grounds):
+                    if _polygon_contains(v_ground, p_ground) or _polygon_contains(p_ground, v_ground):
+                        suppress_person[person_indices.index(p_idx)] = True
+                        break
+
+            keep = np.ones(len(merged_with_ground), dtype=bool)
+            for idx, p_idx in enumerate(person_indices):
+                if suppress_person[idx]:
+                    keep[p_idx] = False
+            merged_with_ground = [merged_with_ground[i] for i in range(len(merged_with_ground)) if keep[i]]
+
+        merged.extend(merged_with_ground)
+
+    # Process detections WITHOUT ground: assign unified class, pass through for tracker
+    # These have box 2D but no reliable keypoints/ground - tracker will use box for association
+    for d in without_ground:
+        d.cls = _unified_class(d.cls)
+        merged.append(d)
 
     return merged
 
@@ -616,17 +659,18 @@ class V2Pipeline(rt.RealtimePipeline):
                 trusted_kp.append(kp)
 
         # Assign ground footprint BEFORE deduplication (needs ground for IoU)
+        # Only for detections with trusted keypoints (kp_ok=True)
         gi = self.resolver.indices(8)
         # Fallback: if resolver not locked, use default ground indices (0-3 for released models)
         if gi is None:
             gi = [0, 1, 2, 3]
         if gi:
             for d in pose:
-                if d.kpts.shape[0] >= max(gi) + 1:
+                if d.kp_ok and d.kpts.shape[0] >= max(gi) + 1:
                     d.ground = d.kpts[list(gi)].copy()
 
-        # Deduplicate by unified class using ground footprint IoU
-        pose = _deduplicate_unified(pose)
+        # Deduplicate by unified class using ground footprint IoU (in BEV space)
+        pose = _deduplicate_unified(pose, H=getattr(self, 'static_H', None))
         
         if self.suppress_nested > 0:
             gi0 = self.resolver.indices(8) or [0, 1, 2, 3]
@@ -710,6 +754,98 @@ class V2Pipeline(rt.RealtimePipeline):
         """
         return super()._detect_aux_raw(frame) if self.aux_model is not None else []
 
+    def _suppress_person_with_vehicle_tracks(self, state) -> List:
+        """Suppress person detections that overlap with vehicle track predictions.
+        
+        Uses confirmed vehicle tracks (including coasting up to 10 frames) to create
+        virtual ground footprints, then suppresses person detections that overlap
+        or are contained within those vehicle footprints.
+        """
+        # Use actual Track objects from tracker (have confirmed attribute)
+        tracks = self.tracker.tracks
+        
+        # Collect virtual vehicle ground footprints from confirmed tracks
+        vehicle_grounds = []
+        vehicle_ids = []
+        
+        gi = self.resolver.indices(8)
+        if gi is None:
+            gi = [0, 1, 2, 3]
+        
+        for t in tracks:
+            if int(t.cls) != 2:  # only vehicle class
+                continue
+            if not t.confirmed:
+                continue  # only confirmed tracks
+            
+            # Track with valid ground footprint (recent detection with kp_ok)
+            if t.ground.shape == (4, 2) and t.time_since_update == 0:
+                vehicle_grounds.append(t.ground.copy())
+                vehicle_ids.append(t.id)
+            # Coasting track: use predicted keypoints projected to ground (max 10 frames)
+            elif t.time_since_update <= 10 and t.kpts.shape[0] >= 8:
+                pred_state = t.predicted_state()
+                pred_kpts = pred_state[4:].reshape(-1, 2)
+                if pred_kpts.shape[0] >= 8 and gi and pred_kpts.shape[0] >= max(gi) + 1:
+                    pred_ground = pred_kpts[list(gi)].copy()
+                    vehicle_grounds.append(pred_ground)
+                    vehicle_ids.append(t.id)
+        
+        if not vehicle_grounds:
+            return state.tracks  # no vehicle tracks to suppress against
+        
+        # Transform vehicle footprints to BEV space using homography
+        vehicle_grounds_bev = []
+        for vg in vehicle_grounds:
+            try:
+                vg_bev = apply_homography(vg, state.H)
+                vehicle_grounds_bev.append(vg_bev)
+            except Exception:
+                continue
+        
+        if not vehicle_grounds_bev:
+            return state.tracks
+        
+        vehicle_grounds_bev = np.stack(vehicle_grounds_bev)  # (V, 4, 2)
+        
+        # Filter person tracks that overlap with vehicle grounds in BEV space
+        suppress_person_ids = set()
+        
+        for t in tracks:
+            if int(t.cls) != 0:  # only person class
+                continue
+            
+            if t.ground.shape != (4, 2):
+                continue  # no ground, keep (conservative)
+            
+            # Transform person ground to BEV space
+            try:
+                person_ground_bev = apply_homography(t.ground, state.H)
+            except Exception:
+                continue
+            
+            suppress = False
+            
+            for v_ground_bev in vehicle_grounds_bev:
+                # Check IoU in BEV space
+                iou_mat = _ground_iou_matrix(person_ground_bev[None], v_ground_bev[None])
+                if iou_mat[0, 0] >= 0.05:
+                    suppress = True
+                    break
+                # Check containment in BEV space
+                if _polygon_contains(v_ground_bev, person_ground_bev) or _polygon_contains(person_ground_bev, v_ground_bev):
+                    suppress = True
+                    break
+            
+            if suppress:
+                suppress_person_ids.add(t.id)
+        
+        # Filter state.tracks (_TrackView) based on suppress list
+        filtered_tracks = [tv for tv in state.tracks if tv.id not in suppress_person_ids]
+        
+        state.tracks = filtered_tracks
+        return state.tracks
+
     # ------------------------------------------------------------------ #
     def step(self, frame):
         """Core step + per-view annotation of this frame's raw observation.
@@ -724,6 +860,9 @@ class V2Pipeline(rt.RealtimePipeline):
 
         # AGGIUNGI QUESTA RIGA: Forza l'omografia live ad ogni frame
         state.H = getattr(self, 'static_H', np.eye(3))
+
+        # Cross-class suppression using track predictions for vehicles
+        state.tracks = self._suppress_person_with_vehicle_tracks(state)
 
         raw = getattr(self, "_last_pose_dets", []) or []
         gi = self.resolver.indices(8)
