@@ -57,6 +57,178 @@ from uod.tracking import _iou_matrix
 # motorcycle, car, bus, truck. Everything else (traffic lights, etc.) is dropped.
 AUX_CLASSES = (0, 1, 2, 3, 5, 7)
 
+# YOLO COCO class -> unified class mapping
+UNIFIED_CLASS_MAP = {
+    2: 2,   # car -> vehicle
+    5: 2,   # bus -> vehicle
+    7: 2,   # truck -> vehicle
+    1: 2,   # bicycle -> vehicle (unify with vehicles)
+    3: 2,   # motorcycle -> vehicle (unify with vehicles)
+    0: 0,   # person -> person
+}
+
+
+def _unified_class(yolo_cls: int) -> int:
+    """Map YOLO class to unified class."""
+    return UNIFIED_CLASS_MAP.get(yolo_cls, yolo_cls)
+
+
+def _mean_kp_visibility(det: Detection) -> float:
+    """Compute mean keypoint visibility for a detection."""
+    # Use stored mean_kp_vis attribute if available, else fallback to box conf
+    return getattr(det, 'mean_kp_vis', float(det.conf))
+
+
+def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray:
+    """Pairwise IoU between two sets of ground quads (4, 2) using convex hull.
+    
+    Returns (len(ground_a), len(ground_b)) IoU matrix.
+    """
+    if len(ground_a) == 0 or len(ground_b) == 0:
+        return np.zeros((len(ground_a), len(ground_b)))
+    
+    # Convert to convex hulls for polygon intersection
+    hulls_a = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in ground_a]
+    hulls_b = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in ground_b]
+    
+    iou_mat = np.zeros((len(hulls_a), len(hulls_b)))
+    for i, ha in enumerate(hulls_a):
+        area_a = cv2.contourArea(ha)
+        if area_a <= 1e-6:
+            continue
+        for j, hb in enumerate(hulls_b):
+            area_b = cv2.contourArea(hb)
+            if area_b <= 1e-6:
+                continue
+            inter, _ = cv2.intersectConvexConvex(ha, hb)
+            if inter > 0:
+                union = area_a + area_b - inter
+                iou_mat[i, j] = inter / union
+    return iou_mat
+
+
+def _polygon_contains(poly_outer: np.ndarray, poly_inner: np.ndarray) -> bool:
+    """Check if poly_inner is completely inside poly_outer.
+    
+    Both are (4, 2) ground footprints. Uses pointPolygonTest on all vertices.
+    """
+    if poly_outer.shape != (4, 2) or poly_inner.shape != (4, 2):
+        return False
+    hull_outer = cv2.convexHull(poly_outer.astype(np.float32).reshape(-1, 1, 2))
+    for pt in poly_inner:
+        if cv2.pointPolygonTest(hull_outer, tuple(pt.astype(np.float32)), False) < 0:
+            return False
+    return True
+
+
+def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) -> List[Detection]:
+    """Deduplicate detections by unified class using mean keypoint visibility as quality.
+
+    1. Separate detections with ground (high quality) and without ground
+    2. For those WITH ground: group by unified class, NMS on ground IoU, cross-class suppression
+    3. For those WITHOUT ground: just assign unified class, pass through for tracker (box-only)
+    4. Combine and return all
+    """
+    if len(dets) <= 1:
+        # Still assign unified class
+        for d in dets:
+            d.cls = _unified_class(d.cls)
+        return dets
+
+    # Separate detections with and without ground footprint
+    with_ground = [d for d in dets if d.ground.shape == (4, 2)]
+    without_ground = [d for d in dets if d.ground.shape != (4, 2)]
+
+    merged: List[Detection] = []
+
+    # Process detections WITH ground: high-quality NMS + cross-class suppression
+    if with_ground:
+        # Transform ground footprints to BEV space if homography available
+        if H is not None:
+            def _to_bev(g: np.ndarray) -> np.ndarray:
+                try:
+                    return apply_homography(g, H)
+                except Exception:
+                    return g
+            grounds_bev = np.stack([_to_bev(d.ground) for d in with_ground])
+            for d, g_bev in zip(with_ground, grounds_bev):
+                d.ground_bev = g_bev
+        else:
+            for d in with_ground:
+                d.ground_bev = d.ground.copy()
+
+        # Group by unified class
+        groups: Dict[int, List[Detection]] = {}
+        for d in with_ground:
+            ucls = _unified_class(d.cls)
+            groups.setdefault(ucls, []).append(d)
+
+        merged_with_ground: List[Detection] = []
+
+        # Per-class NMS on ground IoU (in BEV space if H available)
+        for ucls, group in groups.items():
+            if len(group) == 1:
+                d = group[0]
+                d.cls = ucls
+                merged_with_ground.append(d)
+                continue
+
+            qualities = np.array([_mean_kp_visibility(d) for d in group])
+            order = np.argsort(qualities)[::-1]
+            keep = np.ones(len(group), dtype=bool)
+
+            grounds = np.stack([d.ground_bev for d in group])
+            iou_mat = _ground_iou_matrix(grounds, grounds)
+
+            for i_idx, i in enumerate(order):
+                if not keep[i]:
+                    continue
+                for j in order[i_idx + 1:]:
+                    if not keep[j]:
+                        continue
+                    if iou_mat[i, j] >= 0.5:
+                        keep[j] = False
+
+            for idx in np.where(keep)[0]:
+                d = group[idx]
+                d.cls = ucls
+                merged_with_ground.append(d)
+
+        # Cross-class suppression: vehicle (2) vs person (0)
+        person_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 0]
+        vehicle_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 2]
+
+        if person_indices and vehicle_indices:
+            person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
+            vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
+            cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
+
+            # Suppress person if any vehicle overlaps significantly
+            suppress_person = cross_iou.max(axis=1) >= 0.05
+
+            # Also suppress if containment (one footprint fully inside the other)
+            for p_idx, p_ground in zip(person_indices, person_grounds):
+                for v_idx, v_ground in zip(vehicle_indices, vehicle_grounds):
+                    if _polygon_contains(v_ground, p_ground) or _polygon_contains(p_ground, v_ground):
+                        suppress_person[person_indices.index(p_idx)] = True
+                        break
+
+            keep = np.ones(len(merged_with_ground), dtype=bool)
+            for idx, p_idx in enumerate(person_indices):
+                if suppress_person[idx]:
+                    keep[p_idx] = False
+            merged_with_ground = [merged_with_ground[i] for i in range(len(merged_with_ground)) if keep[i]]
+
+        merged.extend(merged_with_ground)
+
+    # Process detections WITHOUT ground: assign unified class, pass through for tracker
+    # These have box 2D but no reliable keypoints/ground - tracker will use box for association
+    for d in without_ground:
+        d.cls = _unified_class(d.cls)
+        merged.append(d)
+
+    return merged
+
 
 @dataclass
 class _TrackView:
@@ -197,10 +369,33 @@ class RealtimePipeline:
         res = self.pose_model.predict(frame, imgsz=self.kp_imgsz,
                                       conf=self.kp_conf, device=self.device,
                                       verbose=False)[0]
-        # Observe raw keypoints to resolve ground indices, then parse.
+        # Observe raw keypoints to resolve ground indices
         if res.keypoints is not None and res.keypoints.data is not None:
             self.resolver.observe(res.keypoints.data.cpu().numpy()[:, :, :2])
-        return parse_pose_result(res, self.resolver.indices(8))
+        
+        # Parse with current ground indices (may be None if not locked yet)
+        gi = self.resolver.indices(8)
+        dets = parse_pose_result(res, gi)
+        
+        # Store mean keypoint visibility for quality comparison
+        if res.keypoints is not None and res.keypoints.data is not None:
+            kd = res.keypoints.data.cpu().numpy()
+            if kd.ndim == 3 and kd.shape[2] >= 3:
+                for i, d in enumerate(dets):
+                    if i < len(kd):
+                        d.mean_kp_vis = float(kd[i, :, 2].mean())
+        
+        # If resolver not locked yet, ground may be empty. Re-assign if we have indices.
+        # Fallback: if resolver not locked, use default ground indices (0-3 for released models)
+        # Only assign ground for detections with trusted keypoints (kp_ok=True)
+        if gi is None:
+            gi = [0, 1, 2, 3]
+        if gi:
+            for d in dets:
+                if getattr(d, 'kp_ok', False) and d.kpts.shape[0] >= max(gi) + 1:
+                    d.ground = d.kpts[list(gi)].copy()
+        
+        return _deduplicate_unified(dets)
 
     def _detect_aux_raw(self, frame) -> List[Detection]:
         """Run the auxiliary detector and return all of its boxes (no dedup)."""
@@ -252,6 +447,70 @@ class RealtimePipeline:
         ab = np.array([d.xyxy for d in aux])
         centers = np.stack([(ab[:, 0] + ab[:, 2]) * 0.5, ab[:, 3]], axis=1)
         return aux, centers
+
+    def _deduplicate_detections(self, dets: List[Detection]) -> List[Detection]:
+        """Merge detections of the same physical object, keeping highest-confidence class.
+
+        - Class-agnostic NMS with IoU threshold to merge duplicate boxes
+        - Class preference: for bike(1,3) + person(0) overlaps, prefer bike regardless of confidence
+        - For vehicles (car/truck/bus): lower IoU threshold to catch nested boxes (cab in truck)
+        - For bike(1,3) vs car(2): lower IoU threshold for narrow vehicles detected as both
+        - For other classes: keep higher confidence detection
+        """
+        if len(dets) <= 1:
+            return dets
+
+        boxes = np.array([d.xyxy for d in dets])
+        classes = np.array([d.cls for d in dets])
+        confs = np.array([d.conf for d in dets])
+
+        # Sort by confidence descending
+        order = np.argsort(confs)[::-1]
+        keep = np.ones(len(dets), dtype=bool)
+
+        # Bike classes (COCO: 1=bicycle, 3=motorcycle) both map to "bike"
+        BIKE_CLASSES = {1, 3}
+        VEHICLE_CLASSES = {2, 5, 7}  # car, bus, truck
+
+        for i_idx, i in enumerate(order):
+            if not keep[i]:
+                continue
+            box_i = boxes[i:i+1]
+            cls_i = classes[i]
+            conf_i = confs[i]
+
+            # Compare with lower-confidence detections
+            for j in order[i_idx + 1:]:
+                if not keep[j]:
+                    continue
+                cls_j = classes[j]
+
+                # Dynamic IoU threshold based on class pair
+                if cls_i in VEHICLE_CLASSES and cls_j in VEHICLE_CLASSES:
+                    iou_thresh = 0.5      # vehicle-vehicle: nested boxes (cab in truck)
+                elif (cls_i in BIKE_CLASSES and cls_j in VEHICLE_CLASSES) or \
+                     (cls_j in BIKE_CLASSES and cls_i in VEHICLE_CLASSES):
+                    iou_thresh = 0.5      # bike-vehicle: narrow vehicle detected as both
+                else:
+                    iou_thresh = 0.7      # default
+
+                iou = _iou_matrix(box_i, boxes[j:j+1])[0, 0]
+                if iou < iou_thresh:
+                    continue
+
+                conf_j = confs[j]
+
+                # Special case: bike (1 or 3) vs person (0) -> always prefer bike
+                if cls_i in BIKE_CLASSES and cls_j == 0:
+                    keep[j] = False  # bike wins
+                elif cls_j in BIKE_CLASSES and cls_i == 0:
+                    keep[i] = False  # person loses to bike
+                    break
+                else:
+                    # All other cases: higher confidence wins (already sorted by conf)
+                    keep[j] = False
+
+        return [dets[i] for i in range(len(dets)) if keep[i]]
 
     # ------------------------------------------------------------------ #
     def step(self, frame) -> RenderState:
