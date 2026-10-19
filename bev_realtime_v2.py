@@ -74,6 +74,58 @@ from uod.tracking import _iou_matrix  # noqa: E402
 import refine_v2  # noqa: E402
 from uod.viz import (draw_cuboid, draw_dashed_polyline, draw_ground_quad)  # noqa: E402
 from homography_rt import apply_homography  # noqa: E402
+import threading
+from uod.bev_ocsort import BEVObservation, BEVOCSortTracker, FixedLagBuffer
+
+
+class FrameSource:
+    """Unified frame reader for video files (lossless sequential) and live camera streams (zero-buffer lag)."""
+
+    def __init__(self, spec: str, source_type: str = "auto"):
+        self.spec = spec
+        is_cam = spec.isdigit() or spec.startswith(("rtsp://", "rtmp://", "http://", "https://"))
+        self.is_stream = (source_type == "stream") or (source_type == "auto" and is_cam)
+
+        self.cap = cv2.VideoCapture(int(spec) if spec.isdigit() else spec)
+        if not self.cap.isOpened():
+            raise SystemExit(f"Impossibile aprire la sorgente video: {spec}")
+
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 30.0
+        self.total_frames = 0 if self.is_stream else int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        self._latest_frame = None
+        self._lock = threading.Lock()
+        self._stop = False
+        self._thread = None
+
+        if self.is_stream:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._thread = threading.Thread(target=self._stream_reader, daemon=True)
+            self._thread.start()
+
+    def _stream_reader(self):
+        while not self._stop:
+            ok, frame = self.cap.read()
+            if not ok:
+                break
+            with self._lock:
+                self._latest_frame = frame
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if not self.is_stream:
+            return self.cap.read()
+        with self._lock:
+            if self._latest_frame is None:
+                return True, None  # waiting for next camera frame
+            fr = self._latest_frame
+            self._latest_frame = None
+            return True, fr
+
+    def release(self):
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self.cap.release()
 
 # COCO ids the v2 model may report as road users -> pipeline categories.
 POSE_CATEGORY_V2: Dict[int, str] = {
@@ -184,15 +236,20 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                 d.ground_bev = d.ground.copy()
 
         # Group by unified class
-        groups: Dict[int, List[Detection]] = {}
+        groups: Dict[Tuple[int, int], List[Detection]] = {}
         for d in with_ground:
             ucls = _unified_class(d.cls)
-            groups.setdefault(ucls, []).append(d)
+            raw_cls = int(d.source_cls if d.source_cls is not None else d.cls)
+
+            # Le classi veicolo restano separate durante la deduplicazione.
+            # La classe unificata viene applicata solo per la visualizzazione.
+            group_key = (ucls, raw_cls) if ucls == 2 else (ucls, ucls)
+            groups.setdefault(group_key, []).append(d)  
 
         merged_with_ground: List[Detection] = []
 
         # Per-class NMS on ground IoU (in BEV space if H available)
-        for ucls, group in groups.items():
+        for (ucls, _raw_cls), group in groups.items():
             if len(group) == 1:
                 d = group[0]
                 d.cls = ucls
@@ -554,50 +611,46 @@ def _suppress_nested(dets, thresh, ground_idx):
 
 
 class V2Pipeline(rt.RealtimePipeline):
-    """``RealtimePipeline`` driven by one v2 hybrid forward pass per frame."""
+    """Real-time BEV-tracked pipeline powered by BEVOCSortTracker and FixedLagBuffer."""
 
-    # Filled by ``main`` before ``rt.main`` constructs the pipeline.
-    CONFIG: dict = dict(kp_vis=0.5, class_conf={}, bev_canvas=None, suppress_nested=0.0,
-                        layout="side", caption="", show_coast_mark=False,
-                        label_min_h=0.0, src_fps=30.0, title=(0.0, 0.0, 0.0, 0.0),
-                        labels="", labels_meta=None, labels_first=0)
+    CONFIG: dict = dict(kp_vis=0.5, class_conf={}, bev_canvas=None, suppress_nested=0.85,
+                        layout="side", caption="", label_min_h=26.0, src_fps=30.0,
+                        title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11)
 
     def __init__(self, pose_model, aux_model=None, **kw):
         cfg = dict(V2Pipeline.CONFIG)
         if cfg.get("bev_canvas") is not None and kw.get("bev_canvas") is None:
             kw["bev_canvas"] = tuple(cfg["bev_canvas"])
-        super().__init__(pose_model, aux_model, **kw)
+        super().__init__(pose_model, None, **kw)
         self.kp_vis = float(cfg.get("kp_vis", 0.5))
-        self.suppress_nested = float(cfg.get("suppress_nested", 0.0))
+        self.suppress_nested = float(cfg.get("suppress_nested", 0.85))
         self.class_conf: Dict[int, float] = dict(cfg.get("class_conf") or {})
         self.layout = cfg.get("layout", "side")
         self.caption = cfg.get("caption", "") or ""
-        self.show_coast_mark = bool(cfg.get("show_coast_mark", False))
-        self.label_min_h = float(cfg.get("label_min_h", 0.0))
-        self.camera_tag = ""                  # "static camera" / "moving camera"
+        self.label_min_h = float(cfg.get("label_min_h", 26.0))
+        self.camera_tag = "static camera"
         self.src_fps = float(cfg.get("src_fps", 30.0) or 30.0)
         self.title = tuple(cfg.get("title", (0.0, 0.0, 0.0, 0.0)))
-        self.labels_path = cfg.get("labels", "") or ""
-        self.labels_meta = dict(cfg.get("labels_meta") or {})
-        self.labels_first = int(cfg.get("labels_first", 0) or 0)
-        self._last_pose_dets: List[Detection] = []
         self.total_frames = int(cfg.get("total_frames", 0))
-        self._ped_box_ema: dict = {}      # tid -> (w_ema, h_ema) per stabilizzazione box pedoni
-        self._ped_height: dict = {}       # tid -> altezza costante del cubetto pedone
-        # Carica l'omografia calibrata
+
+        # Carica l'omografia statica calibrata
         try:
-            self.static_H = np.load("homography_bangkok.npy")
+            self.static_H = np.load("homography_bangkok.npy").astype(np.float64)
             print("Omografia statica caricata con successo.")
         except Exception:
-            print("homography_bangkok.npy non trovato. Uso identità.")
+            print("Errore: homography_bangkok.npy non trovato.")
             sys.exit(1)
-        # v2 supplies its own auxiliary (box-only) channel, so the aux tracker
-        # must exist even when no separate aux model is loaded.
-        if self.aux_tracker is None:
-            from uod.tracking import MultiObjectTracker
-            self.aux_tracker = MultiObjectTracker(
-                max_age=10, min_hits=2, conf_thresh=self.aux_conf,
-                cmc=self.tracker.cmc)
+
+        # Inizializza il tracker OC-SORT in BEV e il Buffer Circolare Fixed-Lag
+        min_hits = int((kw.get("tracker_kwargs") or {}).get("min_hits", 3))
+        max_age = int((kw.get("tracker_kwargs") or {}).get("max_age", 25))
+        self.bev_tracker = BEVOCSortTracker(
+            fps=self.src_fps, max_age=max_age, min_hits=min_hits,
+            high_conf=max(self.kp_conf, 0.35))
+        self.lag_buffer = FixedLagBuffer(
+            window=int(cfg.get("smooth_win", 11) or 11),
+            poly=2, fps=self.src_fps, min_hits=min_hits)
+        self._tracker_map: Dict[int, object] = {}
 
     # ------------------------------------------------------------------ #
     def _detect_pose(self, frame) -> List[Detection]:
@@ -647,7 +700,13 @@ class V2Pipeline(rt.RealtimePipeline):
                 ok = bool(np.isfinite(xy).all() and (vis.min() >= self.kp_vis)
                           and inside.all() and nonzero.all())
                 kp = xy.copy()
-            det = Detection(cls=c, conf=float(conf[i]), xyxy=xyxy[i], kpts=kp)
+            det = Detection(
+                cls=c,
+                conf=float(conf[i]),
+                xyxy=xyxy[i],
+                kpts=kp,
+                source_cls=c,
+            )
             det.kp_ok = ok
             # Store mean keypoint visibility for quality comparison
             if kd is not None and kd.shape[2] >= 3:
@@ -847,130 +906,104 @@ class V2Pipeline(rt.RealtimePipeline):
         return state.tracks
 
     # ------------------------------------------------------------------ #
-    def step(self, frame):
-        """Core step + per-view annotation of this frame's raw observation.
+    def step(self, frame) -> rt.RenderState:
+        """Single-pass Detection -> Pre-filter -> BEV Projection -> BEV OC-SORT."""
+        H_img, W_img = frame.shape[:2]
+        img_wh = (W_img, H_img)
+        H_mat = self.static_H
 
-        Records, per track view, whether it was backed by a real detection on
-        this frame and whether that detection's keypoints were trusted, and
-        replaces the tracker's causally-smoothed corners with the raw ones on
-        trusted frames (the offline zero-phase filter smooths them afterwards,
-        which is strictly better than a causal pre-filter here).
-        """
-        state = super().step(frame)
+        self.sw.start()
+        dets = self._detect_pose(frame)
+        self.sw.lap("pose")
 
-        # AGGIUNGI QUESTA RIGA: Forza l'omografia live ad ogni frame
-        state.H = getattr(self, 'static_H', np.eye(3))
+        gi = self.resolver.indices(8) or [0, 1, 2, 3]
 
-        # Cross-class suppression using track predictions for vehicles
-        state.tracks = self._suppress_person_with_vehicle_tracks(state)
+        # 1. Aggiorna la scala di riferimento bev_unit nella gauge di static_H
+        for d in dets:
+            if d.cls != 0 and d.kp_ok and d.ground.shape == (4, 2):
+                self._quad_buffer.append(d.ground)
+                self._cls_buffer.append(d.cls)
 
-        raw = getattr(self, "_last_pose_dets", []) or []
-        gi = self.resolver.indices(8)
-        rb = np.array([d.xyxy for d in raw]) if raw else None
+        if self._bev_unit_locked is not None:
+            bev_unit = self._bev_unit_locked
+        elif len(self._quad_buffer) > 0:
+            _, bev_unit_cur = self._class_footprint_dims(
+                list(self._quad_buffer), list(self._cls_buffer), H_mat)
+            if bev_unit_cur > 1e-9 and len(self._quad_buffer) >= min(128, self._quad_buffer.maxlen or 128):
+                self._bev_unit_locked = bev_unit_cur
+            bev_unit = bev_unit_cur if bev_unit_cur > 1e-9 else 0.15
+        else:
+            bev_unit = 0.15
 
-        for v in state.tracks:
-            v.obs = False
-            v.kp_ok = False
-            v.interp = False
-            if rb is None or v.time_since_update != 0:
-                continue
-            iou = _iou_matrix(np.asarray(v.box_xyxy, dtype=np.float64)[None], rb)[0]
-            j = int(np.argmax(iou))
-            if float(iou[j]) < 0.5:
-                continue
-            d = raw[j]
-            v.obs = True
-            v.kp_ok = bool(getattr(d, "kp_ok", False))
-            
-            if v.kp_ok and d.kpts.shape[0] >= 8:
-                v.kpts = d.kpts.copy()
-                if gi and v.kpts.shape[0] >= max(gi) + 1:
-                    raw_ground = v.kpts[list(gi)].copy()
-                    
-                    # Riordino angolare per evitare i poligoni auto-intersecanti (farfalle)
-                    centroid = np.mean(raw_ground, axis=0)
-                    angles = np.arctan2(raw_ground[:, 1] - centroid[1], raw_ground[:, 0] - centroid[0])
-                    v.ground = raw_ground[np.argsort(angles)]
-                
-                # SBLOCCO DELLA BEV: ricalcola l'impronta usando l'omografia nativa del sistema.
-                # I pedoni usano un'impronta rigida quadrata per evitare che l'impronta ruoti,
-                # si allarghi o si restringa frame a frame. I veicoli usano la proiezione diretta.
-                
-                # Calcola qui solo i veicoli; i pedoni (v.cls == 0) vengono calcolati 
-                # nel blocco successivo dopo la stabilizzazione EMA della loro box 2D.
-                if v.cls != 0:
-                    try:
-                        v.bev_quad = apply_homography(v.ground, state.H)
-                    except Exception:
-                        pass
+        # 2. Costruisci le osservazioni filtrate e proiettale subito in BEV
+        bev_obs_list: List[BEVObservation] = []
+        for d in dets:
+            if d.cls == 0:
+                # REGOLA PEDONI: usa il bottom-center della 2D box (ignora kp_ok rumoroso)
+                x1, y1, x2, y2 = d.xyxy
+                cx = (x1 + x2) * 0.5
+                cy_bottom = float(y2)
+                w_2d = max(x2 - x1, 1.0)
 
-            # Pedoni senza keypoint trusted ma con ground valido (tracker coasting):
-            # mantiene comunque l'impronta rigida quadrata invece del raw quad vehicle-style.
-            elif v.cls == 0 and getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
-                try:
-                    v.bev_quad = self._pedestrian_rigid_footprint(v, state.H, state.bev_unit)
-                except Exception:
-                    pass
+                cP_s = apply_homography(np.array([[cx, cy_bottom]], dtype=np.float64), H_mat)
+                if not np.all(np.isfinite(cP_s)):
+                    continue
+                cP = cP_s[0] / bev_unit
+                p_l = apply_homography(np.array([[cx - w_2d * 0.5, cy_bottom]]), H_mat)[0] / bev_unit
+                p_r = apply_homography(np.array([[cx + w_2d * 0.5, cy_bottom]]), H_mat)[0] / bev_unit
+                obs_scale = float(np.linalg.norm(p_r - p_l))
+                h = 0.5 * obs_scale
+                q_raw = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64) + cP
 
-        # Stampa progresso a terminale
-        if getattr(self, 'total_frames', 0) > 0:
-            print(f"\rElaborazione frame {state.frame_idx}/{self.total_frames} ({(state.frame_idx/self.total_frames)*100:.1f}%)", end="", flush=True)
+                bev_obs_list.append(BEVObservation(
+                    cls=0, source_cls=int(d.source_cls if d.source_cls is not None else 0), conf=d.conf, box_xyxy=d.xyxy.copy(),
+                    kpts=d.kpts.copy(), ground=d.ground.copy(), kp_ok=True,
+                    bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale))
+            else:
+                # REGOLA VEICOLI: invia al tracker SOLO oggetti con keypoint affidabili (kp_ok == True)
+                if not d.kp_ok or d.kpts.shape[0] < 8:
+                    continue
+                raw_ground = d.kpts[list(gi)].copy() #rimosso l'ordinamento per angolo
 
-        # ------------------------------------------------------------------ #
-        # Stabilizzazione pedoni nella vista camera: box 2D + cubetto 3D rigido.
-        # I pedoni hanno keypoints/detector rumorosi: smussiamo causalmente la
-        # 2D box ancorandola al bottom-centre e ricostruiamo il cubetto 3D da un
-        # footprint quadrato rigido + altezza costante, così non ruota né cambia
-        # dimensioni frame a frame.
-        for v in state.tracks:
-            if int(v.cls) != 0:
-                continue
-            box = np.asarray(v.box_xyxy, dtype=np.float64)
-            if box.shape != (4,):
-                continue
-            x1, y1, x2, y2 = box
-            cx = (x1 + x2) * 0.5
-            cy_bottom = y2
-            w = max(x2 - x1, 1.0)
-            h = max(y2 - y1, 1.0)
-            # EMA causale sulle dimensioni (più smussato del tracker alpha-beta).
-            if v.id in self._ped_box_ema:
-                pw, ph = self._ped_box_ema[v.id]
-                w = 0.25 * w + 0.75 * pw
-                h = 0.25 * h + 0.75 * ph
-            self._ped_box_ema[v.id] = (float(w), float(h))
-            # Ricostruisci box attorno al bottom-centre (punto di contatto a terra).
-            v.box_xyxy = np.array([
-                cx - w * 0.5, cy_bottom - h,
-                cx + w * 0.5, cy_bottom,
-            ], dtype=np.float64)
-            # Cubetto 3D rigido: 4 ground corners da rettangolo smussato,
-            # 4 roof corners sollevati di altezza costante (nessuna rotazione).
-            height = self._ped_height.get(v.id, h * 0.85)
-            if v.id not in self._ped_height:
-                self._ped_height[v.id] = height
-            depth = max(w * 0.6, h * 0.4)
-            kp = np.zeros((8, 2), dtype=np.float64)
-            kp[0] = [cx - w * 0.5, cy_bottom]       # ground BL
-            kp[1] = [cx + w * 0.5, cy_bottom]       # ground BR
-            kp[2] = [cx + w * 0.5, cy_bottom - depth]   # ground TR
-            kp[3] = [cx - w * 0.5, cy_bottom - depth]   # ground TL
-            kp[4] = [cx - w * 0.5, cy_bottom - height]  # roof BL
-            kp[5] = [cx + w * 0.5, cy_bottom - height]  # roof BR
-            kp[6] = [cx + w * 0.5, cy_bottom - height - depth]  # roof TR
-            kp[7] = [cx - w * 0.5, cy_bottom - height - depth]  # roof TL
-            v.kpts = kp
-            v.ground = kp[:4].copy()
-            v.kp_ok = True
-            # Coerenza camera|BEV: ricalcola l'impronta BEV dallo stesso
-            # ground sintetico appena costruito, così a sinistra e a destra
-            # il pedone ha la stessa posizione e dimensione.
-            try:
-                v.bev_quad = self._pedestrian_rigid_footprint(v, state.H, state.bev_unit)
-            except Exception:
-                pass
+                P_bev = apply_homography(raw_ground, H_mat)
+                if not np.all(np.isfinite(P_bev)):
+                    continue
+                Pn = P_bev / bev_unit
+                cP = Pn.mean(axis=0)
+                _dv1, _dv2 = Pn[2] - Pn[0], Pn[3] - Pn[1]
+                obs_scale = float(np.sqrt(abs(_dv1[0] * _dv2[1] - _dv1[1] * _dv2[0]) * 0.5))
 
-        return state
+                bev_obs_list.append(BEVObservation(
+                    cls=int(d.cls), source_cls=int(d.source_cls if d.source_cls is not None else d.cls), conf=d.conf, box_xyxy=d.xyxy.copy(),
+                    kpts=d.kpts.copy(), ground=raw_ground, kp_ok=True,
+                    bev_center=cP, bev_quad_raw=Pn, obs_scale=obs_scale))
+
+        # 3. Aggiorna OC-SORT direttamente in BEV
+        active_tracks = self.bev_tracker.update(bev_obs_list, self.frame_idx, img_wh)
+        self._tracker_map = {t.id: t for t in active_tracks}
+        self.sw.lap("track_bev")
+
+        # 4. Crea lo snapshot _TrackView per il FixedLagBuffer
+        views = []
+        for t in active_tracks:
+            v = rt._TrackView(
+                id=t.id, cls=t.cls, kpts=t.kpts.copy(), ground=t.ground.copy(),
+                box_xyxy=t.box_xyxy.copy(), time_since_update=t.time_since_update,
+                bev_quad=t.get_bev_footprint(bev_unit))
+            v.bev_pos = (t.ped_center_ema.copy() if t.cls == 0 else t.pos.copy())
+            v.bev_vel = t.vel.copy()
+            v.hits = t.hits
+            views.append(v)
+
+        self.frame_idx += 1
+        if self.total_frames > 0:
+            print(f"\rElaborazione frame {self.frame_idx}/{self.total_frames} "
+                  f"({(self.frame_idx / self.total_frames) * 100:.1f}%)", end="", flush=True)
+
+        return rt.RenderState(
+            frame=frame, tracks=views, aux_dets=[], aux_centers=np.zeros((0, 2)),
+            H=H_mat, info=None, gi=gi, img_wh=img_wh, timing=dict(self.sw.t),
+            frame_idx=self.frame_idx, n_gated=0, bev_unit=bev_unit, class_dims={})
 
     # ------------------------------------------------------------------ #
     # Rendering: dashboard layout (landscape sources) or the v1 side-by-side.
@@ -1578,19 +1611,9 @@ def _stabilize_offline_v2(pipe, states, fixed, traj_C, traj_steps, args):
                     except Exception:
                         pass
                 
-                else:
-                    # --- VEICOLI: Sblocco dinamico e Anti-Farfalla ---
-                    # Applichiamo il nostro fix solo per i veicoli, riordinando 
-                    # gli angoli ad ogni frame per evitare poligoni intrecciati.
-                    centroid = np.mean(v.ground, axis=0)
-                    angles = np.arctan2(v.ground[:, 1] - centroid[1], v.ground[:, 0] - centroid[0])
-                    ordered_ground = v.ground[np.argsort(angles)]
-                    
-                    # Aggiorniamo l'impronta anche per la vista prospettica
-                    v.ground = ordered_ground
-                    
+                else: # --- ALTRI VEICOLI: applica l'omografia normalmente ---                   
                     try:
-                        v.bev_quad = apply_homography(ordered_ground, H_mat)
+                        v.bev_quad = apply_homography(v.ground, H_mat)
                     except Exception:
                         pass
     # ====================================================================
@@ -1617,11 +1640,8 @@ def _stabilize_offline_v2(pipe, states, fixed, traj_C, traj_steps, args):
             if getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
                 if v.cls == 0:
                     continue  # pedoni: mantengono l'impronta rigida quadrata
-                centroid = np.mean(v.ground, axis=0)
-                angles = np.arctan2(v.ground[:, 1] - centroid[1], v.ground[:, 0] - centroid[0])
-                ordered_ground = v.ground[np.argsort(angles)]
                 try:
-                    v.bev_quad = apply_homography(ordered_ground, H_mat)
+                    v.bev_quad = apply_homography(v.ground, H_mat)
                 except Exception:
                     pass
     if POST["bev_fit"] and states:
@@ -1717,89 +1737,121 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                         "label file so coordinates can be mapped back to it")
     p.add_argument("--coast-mark", action="store_true",
                    help="append '?' to the label of a coasting track (v1 look)")
+    p.add_argument("--source-type", choices=["auto", "video", "stream"], default="auto",
+                   help="'video' per file .mp4 sequenziali; 'stream' per telecamere live RTSP/USB")
     return p
 
 
 def main(argv=None):
+    import time
     argv = list(sys.argv[1:] if argv is None else argv)
     v2args, rest = build_v2_argparser().parse_known_args(argv)
-    # Probe the source once: the refinement is configured in seconds so it needs
-    # the frame rate, and the dashboard gives the footage as many pixels as it
-    # has, fitting the bird's-eye column into whatever is left.
-    fps, src_w = 30.0, 0
-    try:
-        cap = cv2.VideoCapture(next(a for i, a in enumerate(rest)
-                                    if rest[i - 1] == "--input"))
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-        cap.release()
-    except Exception:
-        pass
+
+    # Disabilita di default il modello ausiliario esterno in v2
+    if not any(a.startswith("--aux-model") for a in rest):
+        rest += ["--aux-model", "none"]
+
+    # Parsing degli argomenti base (input, kp-model, smooth, device, ecc.)
+    args = rt.build_argparser().parse_args(rest)
+
+    # 1. Apre la sorgente (File Video oppure Stream Camera Live) una sola volta
+    src = FrameSource(args.input, source_type=getattr(v2args, "source_type", "auto"))
+    fps = float(v2args.refine_fps) or src.fps
+    src_w = int(src.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+
+    # 2. Configura le dimensioni del pannello BEV e lo zoom (--object-px)
     canvas = None
     if v2args.bev_canvas:
         w, h = v2args.bev_canvas.lower().split("x")
         canvas = (int(w), int(h))
     elif v2args.layout == "dashboard":
         canvas = (max(360, FINAL_W - src_w) if src_w else 640, FINAL_H)
-    # Provenance for the label file: which clip, which checkpoint, and the
-    # factor that maps processed pixels back to the original footage.
-    inp = next((a for i, a in enumerate(rest) if rest[i - 1] == "--input"), "")
-    ckpt = next((a for i, a in enumerate(rest) if rest[i - 1] == "--kp-model"), "")
-    meta = dict(path=os.path.abspath(v2args.labels_source or inp) if (inp or v2args.labels_source) else None,
-                name=os.path.basename(v2args.labels_source or inp) or None,
-                checkpoint=os.path.basename(ckpt) or None, scale=1.0)
-    if v2args.labels_source:
-        try:
-            c = cv2.VideoCapture(v2args.labels_source)
-            ow = int(c.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-            oh = int(c.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
-            c.release()
-            if ow and src_w:
-                meta.update(width=ow, height=oh, scale=round(ow / float(src_w), 6))
-        except Exception:
-            pass
+
     V2Viewport.DEFAULT_OBJECT_PX = float(v2args.object_px)
 
-    try:
-        cap = cv2.VideoCapture(next(a for i, a in enumerate(rest)
-                                    if rest[i - 1] == "--input"))
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        cap.release()
-    except Exception:
-        total_frames = 0
+    # 3. Finestra del buffer circolare Fixed-Lag (default 11 frame se --smooth è 0 o assente)
+    smooth_win = int(args.smooth) if (args.smooth and args.smooth >= 3) else 11
 
-    V2Pipeline.CONFIG = dict(total_frames=total_frames,kp_vis=v2args.kp_vis, suppress_nested=v2args.suppress_nested,
-                             class_conf=_parse_class_conf(v2args.class_conf),
-                             bev_canvas=canvas, layout=v2args.layout,
-                             caption=v2args.caption,
-                             labels=v2args.labels, labels_meta=meta,
-                             labels_first=int(v2args.labels_from),
-                             show_coast_mark=v2args.coast_mark,
-                             label_min_h=v2args.label_min_h,
-                             title=tuple(float(x) for x in v2args.title.split(","))
-                             if v2args.title else (0.0, 0.0, 0.0, 0.0))
-    POST.update(refine=v2args.refine, min_track=v2args.min_track,
-                coast_tail=v2args.coast_tail, merge_gap=v2args.merge_gap,
-                bev_fit=v2args.bev_fit, fit_max_px=float(v2args.object_px),
-                fit_min_px=float(v2args.bev_fit_min_px), fit_pct=float(v2args.bev_fit_pct),
-                max_gap=int(v2args.max_gap), min_fill=float(v2args.min_fill),
-                fill_box=bool(v2args.fill_box), vel_heading=bool(v2args.vel_heading),
-                hold_still=bool(v2args.hold_still),
-                world_lock=bool(v2args.world_lock),
-                shape_smooth=bool(v2args.shape_smooth), shape_win=int(v2args.shape_win),
-                dedupe=bool(v2args.dedupe), speed_ratio=float(v2args.speed_ratio),
-                rigid_cuboids=bool(v2args.rigid_cuboids),
-                max_reproj=float(v2args.max_reproj))
-    # v2 is its own auxiliary detector: default to none unless given explicitly.
-    if not any(a.startswith("--aux-model") for a in rest):
-        rest += ["--aux-model", "none"]
-    if "--smooth" not in " ".join(rest) and (v2args.refine or v2args.bev_fit):
-        print("[warn] --track-cleanup/--bev-fit are offline features; pass --smooth N")
-    V2Pipeline.CONFIG["src_fps"] = float(v2args.refine_fps) or fps
-    rt.RealtimePipeline = V2Pipeline          # rt.main() looks the name up at call time
-    return rt.main(rest)
+    # 4. Configura V2Pipeline
+    V2Pipeline.CONFIG = dict(
+        total_frames=src.total_frames,
+        kp_vis=v2args.kp_vis,
+        suppress_nested=v2args.suppress_nested,
+        class_conf=_parse_class_conf(v2args.class_conf),
+        bev_canvas=canvas,
+        layout=v2args.layout,
+        caption=v2args.caption,
+        show_coast_mark=v2args.coast_mark,
+        label_min_h=v2args.label_min_h,
+        src_fps=fps,
+        smooth_win=smooth_win,
+        title=tuple(float(x) for x in v2args.title.split(","))
+        if v2args.title else (0.0, 0.0, 0.0, 0.0),
+    )
+
+    # 5. Carica il modello Pose26 (PyTorch o TensorRT) e istanzia la pipeline V2
+    gi = ([int(x) for x in args.ground_indices.split(",")]
+          if args.ground_indices else None)
+    pose = rt.load_detector(args.kp_model, device=args.device, imgsz=args.kp_imgsz,
+                            export=args.export, half=args.half, task="pose")
+
+    pipe = V2Pipeline(
+        pose, None,
+        kp_imgsz=args.kp_imgsz,
+        kp_conf=args.kp_conf,
+        device=args.device,
+        ground_indices=gi,
+        use_homography=(args.homography != "none"),
+        show_3d=not args.no_3d,
+        snap_rect=not args.no_snap_rect,
+        trails=not args.no_trails,
+        trail_len=args.trail_len,
+        stabilize=not args.no_stabilize,
+        bev_window=args.bev_window,
+        show_fov=not args.no_fov,
+        tracker_kwargs=dict(max_age=args.max_age, min_hits=args.min_hits),
+    )
+
+    # 6. Loop Real-Time con Fixed-Lag Circular Buffer
+    sink = _FFSink(args, fps)
+    n_out = 0
+    try:
+        while True:
+            ok, frame = src.read()
+            if not ok:
+                break
+            if frame is None:
+                time.sleep(0.001)  # In modalità stream attende il frame successivo
+                continue
+
+            t0 = time.perf_counter()
+            raw_state = pipe.step(frame)
+            ready_state = pipe.lag_buffer.push(raw_state, pipe._tracker_map)
+
+            if ready_state is not None:
+                out_img = pipe.render(ready_state)
+                dt = time.perf_counter() - t0
+                pipe.fps_core = pipe.fps_render = rt._ema(pipe.fps_core, dt)
+                n_out += 1
+                if not sink.emit(out_img) or (args.max_frames and n_out >= args.max_frames):
+                    break
+
+        # 7. Se la sorgente è un file video, svuota gli ultimi frame nel buffer circolare
+        if not src.is_stream and not (args.max_frames and n_out >= args.max_frames):
+            for tail_state in pipe.lag_buffer.flush_remaining(pipe._tracker_map):
+                if tail_state is not None:
+                    out_img = pipe.render(tail_state)
+                    n_out += 1
+                    if not sink.emit(out_img):
+                        break
+    finally:
+        src.release()
+        sink.close()
+        if args.display:
+            cv2.destroyAllWindows()
+
+    print(f"\nCompletato: {n_out} frame renderizzati ({pipe.fps_core:.1f} fps)")
+    return n_out
 
 
 if __name__ == "__main__":

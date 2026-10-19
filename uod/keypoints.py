@@ -40,6 +40,7 @@ class Detection:
         default_factory=lambda: np.zeros((0, 2)))
     track_id: int = -1
     is_aux: bool = False             # came from the auxiliary box-only detector
+    source_cls: Optional[int] = None  # classe COCO originale, prima dell'unificazione
 
     @property
     def center(self) -> np.ndarray:

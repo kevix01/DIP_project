@@ -16,7 +16,7 @@ def main():
     model = YOLO("checkpoints/urbanomnidetect_v2_x_640.pt")
     
     print("Avvio esportazione TensorRT (potrebbe richiedere alcuni minuti)...")
-    model.export(format="engine", imgsz=640, half=True, device=0)
+    model.export(format="engine", imgsz=960, half=True, device=0)
     print("Esportazione completata!")
 
 if __name__ == "__main__":
