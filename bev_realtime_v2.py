@@ -54,7 +54,7 @@ import os
 import subprocess
 import sys
 from collections import Counter, deque
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np

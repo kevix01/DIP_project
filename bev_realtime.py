@@ -676,90 +676,79 @@ class RealtimePipeline:
         """Estimate a CONSTANT SQUARE footprint for a pedestrian.
 
         A pedestrian's ground-contact footprint is essentially square (aspect
-        ratio ~1) and its keypoints are noisy (articulated body, weak detector
-        response). Estimating a per-frame rotation by Kabsch is numerically
-        unstable here: a near-square shape has no identifiable length axis, so
-        small noise flips the length/width assignment and the rotation can jump
-        by 90 degrees between frames. Instead we:
-
-        * estimate a constant square size S from the median scale of the first
-          ~12 matched observations,
-        * hold orientation fixed after lock (square heading is meaningless),
-        * smooth the centre causally so sudden detector jumps do not teleport
-          the BEV footprint.
+        ratio ~1). To prevent the projection from distorting the shape or causing
+        90-degree flips, we:
+        * Project ONLY the bottom-center of the 2D bounding box to find the BEV center.
+        * Use a two-phase scale estimation: 
+          - Burn-in (~12 obs): learns the scale from the projected 2D width.
+          - Regime (locked): smooths the scale towards a physical prior (0.122 bev_units).
+        * Smooth the centre causally so sudden detector jumps do not teleport the footprint.
 
         Returns the posed footprint in rectified coords (or None).
         """
         if bev_unit <= 1e-9:
             return None
-        P = apply_homography(t.ground, H)
-        if not np.all(np.isfinite(P)):
+
+        # 1. Ricava il punto in basso al centro e calcola la larghezza 2D
+        box = np.asarray(t.box_xyxy, dtype=np.float64)
+        cx = (box[0] + box[2]) * 0.5
+        cy_bottom = float(box[3])
+        w_2d = max(box[2] - box[0], 1.0)
+
+        # 2. Proietta SOLO il centro e calcola la scala osservata orizzontale
+        point_2d = np.array([[cx, cy_bottom]], dtype=np.float64)
+        cP_scaled = apply_homography(point_2d, H)
+        if not np.all(np.isfinite(cP_scaled)):
             return None
-        Pn = P / bev_unit
-        cP = Pn.mean(axis=0)
-        Q = Pn - cP
+        cP = cP_scaled[0] / bev_unit
+
+        p_left = apply_homography(np.array([[cx - w_2d * 0.5, cy_bottom]]), H)[0] / bev_unit
+        p_right = apply_homography(np.array([[cx + w_2d * 0.5, cy_bottom]]), H)[0] / bev_unit
+        obs_scale = float(np.linalg.norm(p_right - p_left))
+
+        # 3. Inizializza lo stato se è una nuova traccia
         st = self._rigid_ped.get(t.id)
-        if st is None or st["cls"] != t.cls:
-            # New track: initialise with the current observation's scale.
-            _dv1 = Q[2] - Q[0]
-            _dv2 = Q[3] - Q[1]
-            _cross2d = abs(_dv1[0] * _dv2[1] - _dv1[1] * _dv2[0])
-            scale = float(np.sqrt(_cross2d * 0.5))
-            self._rigid_ped[t.id] = {"scale": max(scale, 1e-6), "W": 1.0,
-                                     "locked": False, "cls": t.cls,
-                                     "rms": deque(maxlen=30),
-                                     "center": cP.copy()}
-            # Render a square centred at the observation centroid.
-            h = 0.5 * self._rigid_ped[t.id]["scale"]
-            S0 = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64)
-            return (S0 + cP) * bev_unit
-        scale = st["scale"]
-        h = 0.5 * scale
-        S0 = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64)
-        # Pose the square with the previous frame's heading (held constant).
-        # For the first posed frame we estimate heading from Q once; after lock
-        # it never changes, so no 90-degree flips can occur.
-        if st["locked"]:
-            R = st.get("R", np.eye(2))
-        else:
-            # Estimate heading from the current observation, using a canonical
-            # square template. Kabsch alignment is well-defined because S0 is
-            # a perfect square and Q is matched corner-to-corner in cyclic order.
-            C = Q.T @ S0
-            U, _, Vt = np.linalg.svd(C)
-            dsign = 1.0 if np.linalg.det(U @ Vt) >= 0 else -1.0
-            R = U @ np.array([[1.0, 0.0], [0.0, dsign]]) @ Vt
-        posed = S0 @ R.T
-        # Causal EMA on the centre: after lock we use a stronger smoothing so
-        # sudden detector jumps do not teleport the BEV footprint. The centre
-        # keeps moving (so walking pedestrians still travel across the radar)
-        # but with bounded lag.
-        prev_center = st.get("center", cP.copy())
-        center_alpha = 0.2 if st["locked"] else 0.4
+        if st is None or st.get("cls") != t.cls:
+            self._rigid_ped[t.id] = {
+                "center": cP.copy(),
+                "scale": 0.19,  # Prior fisico iniziale
+                "W": 1.0,
+                "locked": False,
+                "cls": t.cls
+            }
+            st = self._rigid_ped[t.id]
+
+        # 4. EMA sul Centro
+        prev_center = st["center"]
+        center_alpha = 0.15 if st["locked"] else 0.4
         center_ema = center_alpha * cP + (1.0 - center_alpha) * prev_center
         st["center"] = center_ema.copy()
-        # Update the scale estimate on matched, in-lier frames (before lock only).
-        if t.time_since_update == 0 and not st["locked"]:
-            _v1 = Q[2] - Q[0]
-            _v2 = Q[3] - Q[1]
-            qa = 0.5 * abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
-            res = Q - posed
-            rms = float(np.sqrt((res * res).mean()))
-            med = float(np.median(st["rms"])) if len(st["rms"]) >= 5 else None
-            if qa > 0.05 and (med is None or rms <= 4.0 * med):
-                # Observation scale in S0's frame: mean half-diagonal.
-                Qc = Q @ R
-                obs_scale = float(np.mean(np.linalg.norm(Qc, axis=1)))
-                w = st["W"]
-                st["scale"] = scale + (obs_scale - scale) / (w + 1.0)
-                st["W"] = w + 1.0
-                st["rms"].append(rms)
-                st["R"] = R
-                if st["W"] >= self._rigid_lock_after_ped:
-                    st["locked"] = True
-                    st["R"] = R
-        return (posed + center_ema) * bev_unit               # constant square, smoothed centre
 
+        # 5. Gestione a due fasi della Scala
+        phys_scale = 0.19  # Prior fisico per un pedone adulto (in bev_units)
+        
+        if t.time_since_update == 0 and not st["locked"]:
+            # Fase di Burn-in
+            w = st["W"]
+            st["scale"] = st["scale"] + (obs_scale - st["scale"]) / (w + 1.0)
+            st["W"] = w + 1.0
+            
+            if st["W"] >= getattr(self, "_rigid_lock_after_ped", 12):
+                st["locked"] = True
+        else:
+            # Fase a Regime
+            if st["locked"]:
+                #target_scale = (0.3 * obs_scale) + (0.7 * phys_scale)
+                target_scale = (0.5 * obs_scale) + (0.5 * phys_scale) # per dare più peso all'osservazione recente
+                scale_alpha = 0.30 # per minore rigidezza (prima 0.1) 
+                st["scale"] = (scale_alpha * target_scale) + ((1.0 - scale_alpha) * st["scale"])
+
+        # 6. Costruzione del quadrato perfetto stabilizzato
+        h = 0.5 * st["scale"]
+        S0 = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64)
+        
+        return (S0 + center_ema) * bev_unit
+    
     # ------------------------------------------------------------------ #
     def _draw_trails(self, bev, cls_of):
         """Draw fading per-track motion trails directly on the BEV canvas.
