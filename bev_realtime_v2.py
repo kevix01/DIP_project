@@ -615,7 +615,9 @@ class V2Pipeline(rt.RealtimePipeline):
 
     CONFIG: dict = dict(kp_vis=0.5, class_conf={}, bev_canvas=None, suppress_nested=0.85,
                         layout="side", caption="", label_min_h=26.0, src_fps=30.0,
-                        title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11)
+                        title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11, 
+                        track_high_conf=None, track_ocm_weight=0.25,
+                        bev_unit=None)
 
     def __init__(self, pose_model, aux_model=None, **kw):
         cfg = dict(V2Pipeline.CONFIG)
@@ -632,6 +634,12 @@ class V2Pipeline(rt.RealtimePipeline):
         self.src_fps = float(cfg.get("src_fps", 30.0) or 30.0)
         self.title = tuple(cfg.get("title", (0.0, 0.0, 0.0, 0.0)))
         self.total_frames = int(cfg.get("total_frames", 0))
+        configured_bev_unit = cfg.get("bev_unit")
+        if configured_bev_unit is not None:
+            configured_bev_unit = float(configured_bev_unit)
+            if not np.isfinite(configured_bev_unit) or configured_bev_unit <= 1e-9:
+                raise ValueError("--bev-unit deve essere un numero finito maggiore di zero")
+            self._bev_unit_locked = configured_bev_unit
 
         # Carica l'omografia statica calibrata
         try:
@@ -642,11 +650,20 @@ class V2Pipeline(rt.RealtimePipeline):
             sys.exit(1)
 
         # Inizializza il tracker OC-SORT in BEV e il Buffer Circolare Fixed-Lag
+        configured_high = cfg.get("track_high_conf")
+        track_high = (
+            max(self.kp_conf, 0.35)
+            if configured_high is None
+            else max(self.kp_conf, float(configured_high))
+        )
         min_hits = int((kw.get("tracker_kwargs") or {}).get("min_hits", 3))
         max_age = int((kw.get("tracker_kwargs") or {}).get("max_age", 25))
         self.bev_tracker = BEVOCSortTracker(
             fps=self.src_fps, max_age=max_age, min_hits=min_hits,
-            high_conf=max(self.kp_conf, 0.35))
+            high_conf=track_high,
+            ocm_weight=float(cfg.get("track_ocm_weight", 0.25)),
+        )
+
         self.lag_buffer = FixedLagBuffer(
             window=int(cfg.get("smooth_win", 11) or 11),
             poly=2, fps=self.src_fps, min_hits=min_hits)
@@ -919,10 +936,11 @@ class V2Pipeline(rt.RealtimePipeline):
         gi = self.resolver.indices(8) or [0, 1, 2, 3]
 
         # 1. Aggiorna la scala di riferimento bev_unit nella gauge di static_H
-        for d in dets:
-            if d.cls != 0 and d.kp_ok and d.ground.shape == (4, 2):
-                self._quad_buffer.append(d.ground)
-                self._cls_buffer.append(d.cls)
+        if self._bev_unit_locked is None:    
+            for d in dets:
+                if d.cls != 0 and d.kp_ok and d.ground.shape == (4, 2):
+                    self._quad_buffer.append(d.ground)
+                    self._cls_buffer.append(d.cls)
 
         if self._bev_unit_locked is not None:
             bev_unit = self._bev_unit_locked
@@ -1739,6 +1757,16 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="append '?' to the label of a coasting track (v1 look)")
     p.add_argument("--source-type", choices=["auto", "video", "stream"], default="auto",
                    help="'video' per file .mp4 sequenziali; 'stream' per telecamere live RTSP/USB")
+    p.add_argument("--track-high-conf", type=float, default=None,
+                   help="confidenza minima per avviare una nuova traccia; "
+                   "default max(--kp-conf, 0.35)",
+    )
+    p.add_argument("--track-ocm-weight", type=float, default=0.25,
+                   help="peso della direzione di moto nell'associazione dei pedoni",
+    )
+    p.add_argument("--bev-unit", type=float, default=None,
+                   help="bev_unit calibrato per la telecamera; evita la stima iniziale",
+    )
     return p
 
 
@@ -1787,6 +1815,9 @@ def main(argv=None):
         smooth_win=smooth_win,
         title=tuple(float(x) for x in v2args.title.split(","))
         if v2args.title else (0.0, 0.0, 0.0, 0.0),
+        track_high_conf=v2args.track_high_conf,
+        track_ocm_weight=v2args.track_ocm_weight,
+        bev_unit=v2args.bev_unit
     )
 
     # 5. Carica il modello Pose26 (PyTorch o TensorRT) e istanzia la pipeline V2
@@ -1811,6 +1842,9 @@ def main(argv=None):
         show_fov=not args.no_fov,
         tracker_kwargs=dict(max_age=args.max_age, min_hits=args.min_hits),
     )
+
+    if v2args.bev_unit is not None:
+        print(f"bev_unit fisso in uso: {pipe._bev_unit_locked:.12g}")
 
     # 6. Loop Real-Time con Fixed-Lag Circular Buffer
     sink = _FFSink(args, fps)
