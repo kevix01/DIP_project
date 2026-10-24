@@ -99,6 +99,25 @@ def main():
             break
     
     if H_matrix is not None and np.all(np.isfinite(H_matrix)):
+        # estrazione della bev_unit
+        bev_unit = pipe._bev_unit_locked
+        if bev_unit is None or not np.isfinite(bev_unit) or bev_unit <= 1e-9:
+            raise SystemExit(
+                "bev_unit non calibrato: servono almeno 128 footprint "
+                "veicolo valide nel video."
+            )
+
+        bev_unit = float(bev_unit)
+        unit_output = os.path.splitext(args.output)[0] + "_bev_unit.txt"
+
+        # salvataggio su file della bev_unit
+        with open(unit_output, "w", encoding="utf-8") as f:
+            f.write(f"{bev_unit:.12g}\n")
+
+        print(f"[SUCCESSO] bev_unit: {bev_unit:.12g}")
+        print(f"[SUCCESSO] Valore salvato in: {unit_output}")
+
+        # salvataggio matrice di omografia
         np.save(args.output, H_matrix)
         
         # Genera anche un file testuale comodamente leggibile da umano per verifiche veloci
