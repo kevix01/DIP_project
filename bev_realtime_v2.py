@@ -640,6 +640,7 @@ class V2Pipeline(rt.RealtimePipeline):
             if not np.isfinite(configured_bev_unit) or configured_bev_unit <= 1e-9:
                 raise ValueError("--bev-unit deve essere un numero finito maggiore di zero")
             self._bev_unit_locked = configured_bev_unit
+        self.show_bev_ids = bool(cfg.get("show_bev_ids", False))
 
         # Carica l'omografia statica calibrata
         try:
@@ -1270,6 +1271,16 @@ class V2Pipeline(rt.RealtimePipeline):
         ui.text(bev_x + 22, Hc - 20, "Bird's-eye view", size=14,
                 color=T["faint_text"], anchor="ld", shadow=False)
         self._track_chips(ui, src_labels, head + 18)
+        if self.show_bev_ids:
+            for (cx, cy, tid) in bev_labels:
+                ui.chip(bev_x + cx, cy, str(tid),
+                    size=30,
+                    fg=(255, 255, 255),
+                    bg=(20, 20, 20),
+                    alpha=0.92,
+                    pad=(5, 3),
+                    radius=5,
+                    anchor="mm")
 
     def _ui_dashboard(self, ui, canvas, state, present, src_labels, bev_labels,
                       bev_x, src_wh):
@@ -1325,6 +1336,16 @@ class V2Pipeline(rt.RealtimePipeline):
         ui.text(bev_x + 22, Hc - 20, "Bird's-eye view", size=14,
                 color=T["faint_text"], anchor="ld", shadow=False, alpha=o)
         self._track_chips(ui, src_labels, 18, opacity=o)
+        if self.show_bev_ids:
+            for (cx, cy, tid) in bev_labels:
+                ui.chip(bev_x + cx, cy, str(tid),
+                    size=30,
+                    fg=(255, 255, 255),
+                    bg=(20, 20, 20),
+                    alpha=0.92,
+                    pad=(5, 3),
+                    radius=5,
+                    anchor="mm")
 
 
 # --------------------------------------------------------------------------- #
@@ -1767,6 +1788,8 @@ def build_v2_argparser() -> argparse.ArgumentParser:
     p.add_argument("--bev-unit", type=float, default=None,
                    help="bev_unit calibrato per la telecamera; evita la stima iniziale",
     )
+    p.add_argument("--show-bev-ids", action="store_true",
+                   help="mostra gli ID delle tracce al centro delle footprint BEV")
     return p
 
 
@@ -1817,7 +1840,8 @@ def main(argv=None):
         if v2args.title else (0.0, 0.0, 0.0, 0.0),
         track_high_conf=v2args.track_high_conf,
         track_ocm_weight=v2args.track_ocm_weight,
-        bev_unit=v2args.bev_unit
+        bev_unit=v2args.bev_unit,
+        show_bev_ids=v2args.show_bev_ids
     )
 
     # 5. Carica il modello Pose26 (PyTorch o TensorRT) e istanzia la pipeline V2

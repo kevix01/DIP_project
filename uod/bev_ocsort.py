@@ -577,7 +577,7 @@ class BEVOCSortTracker:
             if self._check_border_exit(t, img_wh):
                 continue
             # Drop tentative tracks that missed their second observation immediately
-            if t.hits < self.min_hits and t.time_since_update > 2:
+            if t.hits < self.min_hits and t.time_since_update > 4:
                 continue
             kept.append(t)
         self.tracks = kept
