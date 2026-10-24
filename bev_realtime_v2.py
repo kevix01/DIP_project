@@ -255,10 +255,12 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             iou_thresh = 0.3
 
             # Overlap-fraction helper: fraction of the SMALLER footprint covered
-            # by the larger one. Catches duplicates whose quads differ a lot in
-            # size (partial/large cuboid of the same vehicle): IoU = inter/union
-            # stays low and full containment may fail by a few pixels, but the
-            # smaller footprint is almost entirely swallowed by the larger one.
+            # by the larger one. This single criterion subsumes both IoU and
+            # containment: IoU >= 0.5 mathematically implies frac >= 2/3, and
+            # containment implies frac = 1. So the edge condition is just
+            # frac >= 0.65. Unlike IoU (= inter/union), the fraction stays HIGH
+            # for duplicates with very different footprint sizes (partial vs
+            # full cuboid of the same vehicle), where IoU collapses.
             def _overlap_frac(pa: np.ndarray, pb: np.ndarray) -> float:
                 ha = cv2.convexHull(pa.astype(np.float32).reshape(-1, 1, 2))
                 hb = cv2.convexHull(pb.astype(np.float32).reshape(-1, 1, 2))
@@ -270,21 +272,13 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                 inter, _ = cv2.intersectConvexConvex(ha, hb)
                 return float(inter) / smaller
 
-            # Build overlap graph: edge if IoU >= threshold OR containment OR
-            # the smaller footprint is mostly covered by the larger one.
+            # Build overlap graph: edge iff the smaller footprint is mostly
+            # covered by the larger one (duplicate/partial cuboid of one object).
             n = len(group)
             overlap = np.zeros((n, n), dtype=bool)
             for a in range(n):
                 for b in range(a + 1, n):
-                    # Selective edges: high IoU (true duplicates), full
-                    # containment, or the smaller footprint mostly covered.
-                    # A moderate IoU alone (e.g. 0.3-0.5 for two real close
-                    # vehicles in a queue) must NOT merge them.
-                    iou_high = iou_mat[a, b] >= 0.5
-                    contains = (_polygon_contains(grounds[a], grounds[b]) or
-                               _polygon_contains(grounds[b], grounds[a]))
-                    mostly_covered = _overlap_frac(grounds[a], grounds[b]) >= 0.65
-                    if iou_high or contains or mostly_covered:
+                    if _overlap_frac(grounds[a], grounds[b]) >= 0.65:
                         overlap[a, b] = True
                         overlap[b, a] = True
 
