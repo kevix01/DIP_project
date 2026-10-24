@@ -182,26 +182,38 @@ def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray
     return iou_mat
 
 
-def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) -> List[Detection]:
-    """Deduplicate detections by unified class using mean keypoint visibility as quality.
+def _box_overlap_metrics(box_a: np.ndarray, box_b: np.ndarray) -> Tuple[float, float]:
+    """Restituisce (iou_2d, min_area_coverage) tra due box 2D [x1, y1, x2, y2]."""
+    ix = max(0.0, min(float(box_a[2]), float(box_b[2])) - max(float(box_a[0]), float(box_b[0])))
+    iy = max(0.0, min(float(box_a[3]), float(box_b[3])) - max(float(box_a[1]), float(box_b[1])))
+    inter = ix * iy
+    if inter <= 0.0:
+        return 0.0, 0.0
+    area_a = max(float(box_a[2] - box_a[0]) * float(box_a[3] - box_a[1]), 1.0)
+    area_b = max(float(box_b[2] - box_b[0]) * float(box_b[3] - box_b[1]), 1.0)
+    union = area_a + area_b - inter
+    iou = float(inter / union) if union > 0.0 else 0.0
+    cov = float(inter / min(area_a, area_b))
+    return iou, cov
 
-    1. Separate detections with ground (high quality) and without ground
-    2. For those WITH ground: group by unified class, NMS on ground IoU, cross-class suppression
-    3. For those WITHOUT ground: just assign unified class, pass through for tracker (box-only)
-    4. Combine and return all
+
+def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) -> List[Detection]:
+    """Deduplica le detection usando la classe unificata (0=pedone, 2=veicolo).
+    1. Raggruppa per classe unificata (così moto/bici/auto dello stesso veicolo fisico
+       finiscono nello stesso gruppo e non generano doppie detection).
+    2. Deduplica le detection CON ground sia in BEV sia in 2D.
+    3. Deduplica le detection SENZA ground (kp_ok=False) contro quelle CON ground e
+       al proprio interno tramite IoU 2D e contenimento (elimina le doppie detection sui pedoni).
     """
     if len(dets) <= 1:
         return dets
 
-    # Separate detections with and without ground footprint
     with_ground = [d for d in dets if d.ground.shape == (4, 2)]
     without_ground = [d for d in dets if d.ground.shape != (4, 2)]
 
-    merged: List[Detection] = []
+    merged_with_ground: List[Detection] = []
 
-    # Process detections WITH ground: high-quality NMS + cross-class suppression
     if with_ground:
-        # Transform ground footprints to BEV space if homography available
         if H is not None:
             def _to_bev(g: np.ndarray) -> np.ndarray:
                 try:
@@ -212,28 +224,20 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             for d, g_bev in zip(with_ground, grounds_bev):
                 d.ground_bev = g_bev
         else:
-            for d in with_ground:
+            for d, _ in zip(with_ground, with_ground):
                 d.ground_bev = d.ground.copy()
 
-        # Group by unified class (cls is already unified in Detection)
+        # Raggruppa per CLASSE UNIFICATA (0=pedestrian, 2=vehicle)
         groups: Dict[int, List[Detection]] = {}
         for d in with_ground:
-            ucls = d.cls
+            ucls = int(d.cls)
             groups.setdefault(ucls, []).append(d)
 
-        merged_with_ground: List[Detection] = []
-
-        # Per-class deduplication: keep detections with largest BEV footprint area
-        # This handles the case where the same object is detected multiple times
-        # (e.g., same vehicle as car/truck/bus, or same pedestrian with multiple detections)
-        # We keep the one with largest BEV footprint and suppress overlapping ones.
-        # Uses connected components to handle chain overlaps (A overlaps B, B overlaps C => A~C).
         for ucls, group in groups.items():
             if len(group) == 1:
                 merged_with_ground.append(group[0])
                 continue
 
-            # Compute BEV footprint area for each detection
             bev_areas = []
             for d in group:
                 g = d.ground_bev
@@ -244,21 +248,10 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                     area = 0.0
                 bev_areas.append(area)
 
-            # Sort by BEV area descending (keep largest footprints)
-            order = np.argsort(bev_areas)[::-1]
             keep = np.ones(len(group), dtype=bool)
-
             grounds = np.stack([d.ground_bev for d in group])
             iou_mat = _ground_iou_matrix(grounds, grounds)
 
-            # Single IoU threshold for all unified classes
-            iou_thresh = 0.3
-
-            # Overlap-fraction helper: fraction of the SMALLER footprint covered
-            # by the larger one. Catches duplicates whose quads differ a lot in
-            # size (partial/large cuboid of the same vehicle): IoU = inter/union
-            # stays low and full containment may fail by a few pixels, but the
-            # smaller footprint is almost entirely swallowed by the larger one.
             def _overlap_frac(pa: np.ndarray, pb: np.ndarray) -> float:
                 ha = cv2.convexHull(pa.astype(np.float32).reshape(-1, 1, 2))
                 hb = cv2.convexHull(pb.astype(np.float32).reshape(-1, 1, 2))
@@ -270,30 +263,31 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                 inter, _ = cv2.intersectConvexConvex(ha, hb)
                 return float(inter) / smaller
 
-            # Build overlap graph: edge if IoU >= threshold OR containment OR
-            # the smaller footprint is mostly covered by the larger one.
             n = len(group)
             overlap = np.zeros((n, n), dtype=bool)
             for a in range(n):
                 for b in range(a + 1, n):
-                    # Selective edges: high IoU (true duplicates), full
-                    # containment, or the smaller footprint mostly covered.
-                    # A moderate IoU alone (e.g. 0.3-0.5 for two real close
-                    # vehicles in a queue) must NOT merge them.
-                    iou_high = iou_mat[a, b] >= 0.5
+                    iou_high = iou_mat[a, b] >= (0.35 if ucls == 0 else 0.50)
                     contains = (_polygon_contains(grounds[a], grounds[b]) or
-                               _polygon_contains(grounds[b], grounds[a]))
+                                _polygon_contains(grounds[b], grounds[a]))
                     mostly_covered = _overlap_frac(grounds[a], grounds[b]) >= 0.65
-                    if iou_high or contains or mostly_covered:
+
+                    # Controllo aggiuntivo 2D per catturare doppie detection sullo stesso oggetto
+                    # i cui keypoint 3D rumorosi non si sovrappongono perfettamente in BEV
+                    iou_2d, cov_2d = _box_overlap_metrics(group[a].xyxy, group[b].xyxy)
+                    if ucls == 0:
+                        dup_2d = (iou_2d >= 0.35) or (cov_2d >= 0.70)
+                    else:
+                        dup_2d = (iou_2d >= 0.55) or (cov_2d >= 0.80)
+
+                    if iou_high or contains or mostly_covered or dup_2d:
                         overlap[a, b] = True
                         overlap[b, a] = True
 
-            # Find connected components via BFS
             visited = np.zeros(n, dtype=bool)
             for a in range(n):
                 if visited[a]:
                     continue
-                # BFS to find all nodes in this component
                 component = []
                 queue = [a]
                 visited[a] = True
@@ -304,9 +298,13 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                         if not visited[b] and overlap[cur, b]:
                             visited[b] = True
                             queue.append(b)
-                # Keep only the largest footprint in this component
+
                 if len(component) > 1:
-                    best = max(component, key=lambda idx: bev_areas[idx])
+                    # Per i pedoni privilegia la confidenza; per i veicoli la footprint BEV più grande
+                    if ucls == 0:
+                        best = max(component, key=lambda idx: float(group[idx].conf))
+                    else:
+                        best = max(component, key=lambda idx: bev_areas[idx])
                     for idx in component:
                         if idx != best:
                             keep[idx] = False
@@ -317,34 +315,59 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
         # Cross-class suppression: vehicle (2) vs person (0)
         person_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 0]
         vehicle_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 2]
-
         if person_indices and vehicle_indices:
             person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
             vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
-            cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
-
-            # Suppress person if any vehicle overlaps significantly
+            cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)
             suppress_person = cross_iou.max(axis=1) >= 0.05
-
-            # Also suppress if containment (one footprint fully inside the other)
             for p_idx, p_ground in zip(person_indices, person_grounds):
                 for v_idx, v_ground in zip(vehicle_indices, vehicle_grounds):
                     if _polygon_contains(v_ground, p_ground) or _polygon_contains(p_ground, v_ground):
                         suppress_person[person_indices.index(p_idx)] = True
                         break
-
             keep = np.ones(len(merged_with_ground), dtype=bool)
             for idx, p_idx in enumerate(person_indices):
                 if suppress_person[idx]:
                     keep[p_idx] = False
             merged_with_ground = [merged_with_ground[i] for i in range(len(merged_with_ground)) if keep[i]]
 
-        merged.extend(merged_with_ground)
+    merged: List[Detection] = list(merged_with_ground)
 
-    # Process detections WITHOUT ground: pass through for tracker
-    # These have box 2D but no reliable keypoints/ground - tracker will use box for association
-    for d in without_ground:
-        merged.append(d)
+    # Deduplica le detection SENZA ground (kp_ok=False):
+    # Prima scarta quelle già coperte da una detection CON ground, poi esegue NMS 2D tra le rimanenti.
+    if without_ground:
+        order_no_g = np.argsort([float(d.conf) for d in without_ground])[::-1]
+        kept_without_ground: List[Detection] = []
+        for idx in order_no_g:
+            d_cand = without_ground[idx]
+            ucls = int(d_cand.cls)
+            iou_thr = 0.35 if ucls == 0 else 0.45
+            cov_thr = 0.65 if ucls == 0 else 0.75
+
+            is_dup = False
+            # 1) Confronta con tutte le detection with_ground già accettate della stessa classe unificata
+            for d_kept in merged_with_ground:
+                if int(d_kept.cls) != ucls:
+                    continue
+                iou_2d, cov_2d = _box_overlap_metrics(d_cand.xyxy, d_kept.xyxy)
+                if iou_2d >= iou_thr or cov_2d >= cov_thr:
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+
+            # 2) Confronta con le detection without_ground a confidenza più alta già accettate
+            for d_kept in kept_without_ground:
+                if int(d_kept.cls) != ucls:
+                    continue
+                iou_2d, cov_2d = _box_overlap_metrics(d_cand.xyxy, d_kept.xyxy)
+                if iou_2d >= iou_thr or cov_2d >= cov_thr:
+                    is_dup = True
+                    break
+            if not is_dup:
+                kept_without_ground.append(d_cand)
+
+        merged.extend(kept_without_ground)
 
     return merged
 
@@ -735,12 +758,20 @@ class V2Pipeline(rt.RealtimePipeline):
 
         pose: List[Detection] = []
         trusted_kp = []
+        gi = self.resolver.indices(8) or [0, 1, 2, 3]
+
         for i in range(len(xyxy)):
             c = int(cls[i])
             if c not in POSE_CATEGORY_V2:
                 continue                                   # not a road user
-            if conf[i] < self.class_conf.get(c, 0.0):
+            # Permetti alle detection a confidenza intermedia (>= 0.20) di arrivare
+            # allo Stage 2 del tracker per mantenere vive le tracce esistenti, ma
+            # richiedi class_conf per lo Stage 1 e per creare nuove tracce!
+            c_min_high = self.class_conf.get(c, 0.0)
+            c_min_low = max(self.kp_conf, min(0.20, 0.5 * c_min_high) if c_min_high > 0 else self.kp_conf)
+            if conf[i] < c_min_low:
                 continue
+
             kp = np.zeros((0, 2))
             ok = False
             if kd is not None and kd.shape[1] >= 8:
@@ -751,40 +782,70 @@ class V2Pipeline(rt.RealtimePipeline):
                 inside = ((xy[:, 0] >= x1 - 0.75 * bw) & (xy[:, 0] <= x2 + 0.75 * bw)
                           & (xy[:, 1] >= y1 - 0.75 * bh) & (xy[:, 1] <= y2 + 0.75 * bh))
                 nonzero = (np.abs(xy).sum(axis=1) > 1e-6)
-                ok = bool(np.isfinite(xy).all() and (vis.min() >= self.kp_vis)
-                          and inside.all() and nonzero.all())
+                vis_g = vis[list(gi)] if len(vis) >= max(gi) + 1 else vis
+                # Tollerante a 1 vertice del tetto leggermente meno visibile sui motorini
+                # purché la media sia >= kp_vis e i 4 vertici a terra siano solidi
+                vis_ok = bool(
+                    (vis.min() >= self.kp_vis)
+                    or (vis.mean() >= self.kp_vis and vis_g.min() >= self.kp_vis * 0.85
+                        and vis.min() >= max(0.35, self.kp_vis - 0.25))
+                )
+                ok = bool(np.isfinite(xy).all() and vis_ok and inside.all() and nonzero.all())
+                # --- NOVITÀ: Test di Convessità per i Veicoli ---
+                # Se i 4 punti a terra formano una "farfalla" (si intersecano, tipico al bordo frame), 
+                # scartiamo subito il cuboide e forziamo il fallback 2D!
+                if ok and c != 0 and len(gi) >= 4:
+                    raw_g = xy[list(gi)]
+                    c_prods = []
+                    for j in range(4):
+                        dx1 = raw_g[(j+1)%4, 0] - raw_g[j, 0]
+                        dy1 = raw_g[(j+1)%4, 1] - raw_g[j, 1]
+                        dx2 = raw_g[(j+2)%4, 0] - raw_g[(j+1)%4, 0]
+                        dy2 = raw_g[(j+2)%4, 1] - raw_g[(j+1)%4, 1]
+                        c_prods.append(dx1 * dy2 - dy1 * dx2)
+                    pos = sum(cp > 0.1 for cp in c_prods)
+                    neg = sum(cp < -0.1 for cp in c_prods)
+                    if pos > 0 and neg > 0:
+                        ok = False  # Il poligono è concavo o auto-intersecante!
+    
                 kp = xy.copy()
+
             det = Detection(
-                cls=to_unified(c),   # unified class (0=pedestrian, 2=vehicle):
-                                     # bike/car/truck/... of the SAME object must
-                                     # land in the same dedup group, otherwise a
-                                     # vehicle detected as both bike and car
-                                     # survives dedup as two boxes
+                cls=to_unified(c),
                 conf=float(conf[i]),
                 xyxy=xyxy[i],
                 kpts=kp,
                 source_cls=c,
             )
             det.kp_ok = ok
-            # Store mean keypoint visibility for quality comparison
+            det.high_conf_ok = bool(conf[i] >= c_min_high)
             if kd is not None and kd.shape[2] >= 3:
                 det.mean_kp_vis = float(vis.mean())
             else:
                 det.mean_kp_vis = float(conf[i])
             pose.append(det)
-            if ok:
+            if ok and c != 0:
                 trusted_kp.append(kp)
 
-        # Assign ground footprint BEFORE deduplication (needs ground for IoU)
-        # Only for detections with trusted keypoints (kp_ok=True)
-        gi = self.resolver.indices(8)
-        # Fallback: if resolver not locked, use default ground indices (0-3 for released models)
-        if gi is None:
-            gi = [0, 1, 2, 3]
-        if gi:
-            for d in pose:
-                if d.kp_ok and d.kpts.shape[0] >= max(gi) + 1:
-                    d.ground = d.kpts[list(gi)].copy()
+        # Assegna ground footprint PRIMA della deduplicazione:
+        # - Per i pedoni (cls == 0): usa SEMPRE un quad sintetico ancorato al bottom-center 2D
+        #   (ignora i keypoint 3D ruotati che causavano soppressioni spurie in _deduplicate_unified).
+        # - Per i veicoli (cls == 2): usa i 4 keypoint a terra se kp_ok == True.
+        for d in pose:
+            if d.cls == 0:
+                x1, y1, x2, y2 = d.xyxy
+                cx = (x1 + x2) * 0.5
+                cy = float(y2)
+                hw = max((x2 - x1) * 0.35, 2.0)
+                hh = max((x2 - x1) * 0.18, 1.5)
+                d.ground = np.array([
+                    [cx - hw, cy - hh],
+                    [cx + hw, cy - hh],
+                    [cx + hw, cy + hh],
+                    [cx - hw, cy + hh],
+                ], dtype=np.float64)
+            elif d.kp_ok and d.kpts.shape[0] >= max(gi) + 1:
+                d.ground = d.kpts[list(gi)].copy()
 
         # Deduplicate by unified class using ground footprint IoU (in BEV space)
         pose = _deduplicate_unified(pose, H=getattr(self, 'static_H', None))
@@ -997,13 +1058,19 @@ class V2Pipeline(rt.RealtimePipeline):
         # 2. Costruisci le osservazioni filtrate e proiettale subito in BEV
         bev_obs_list: List[BEVObservation] = []
         for d in dets:
+            # Se la detection è sotto --class-conf ma sopra c_min_low, limita eff_conf
+            # sotto high_conf così viene usata solo nello Stage 2 (recupero tracce esistenti)
+            eff_conf = (
+                float(d.conf)
+                if getattr(d, "high_conf_ok", True)
+                else min(float(d.conf), self.bev_tracker.high_conf - 1e-4)
+            )
             if d.cls == 0:
-                # REGOLA PEDONI: usa il bottom-center della 2D box (ignora kp_ok rumoroso)
+                # REGOLA PEDONI: usa il bottom-center della 2D box (ignora kp_ok e kpts 3D rumorosi)
                 x1, y1, x2, y2 = d.xyxy
                 cx = (x1 + x2) * 0.5
                 cy_bottom = float(y2)
                 w_2d = max(x2 - x1, 1.0)
-
                 cP_s = apply_homography(np.array([[cx, cy_bottom]], dtype=np.float64), H_mat)
                 if not np.all(np.isfinite(cP_s)):
                     continue
@@ -1013,31 +1080,69 @@ class V2Pipeline(rt.RealtimePipeline):
                 obs_scale = float(np.linalg.norm(p_r - p_l))
                 h = 0.5 * obs_scale
                 q_raw = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64) + cP
-
                 bev_obs_list.append(BEVObservation(
-                    cls=0, source_cls=int(d.source_cls if d.source_cls is not None else 0), conf=d.conf, box_xyxy=d.xyxy.copy(),
-                    kpts=d.kpts.copy(), ground=d.ground.copy(), kp_ok=True,
-                    bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale,
-                    ground_indices=list(gi)))
+                    cls=0,
+                    source_cls=int(d.source_cls if d.source_cls is not None else 0),
+                    conf=eff_conf,
+                    box_xyxy=d.xyxy.copy(),
+                    kpts=d.kpts.copy(),
+                    ground=d.ground.copy(),
+                    kp_ok=True,
+                    bev_center=cP,
+                    bev_quad_raw=q_raw,
+                    obs_scale=obs_scale,
+                    box_bottom_bev=cP.copy(),
+                ))
             else:
-                # REGOLA VEICOLI: invia al tracker SOLO oggetti con keypoint affidabili (kp_ok == True)
-                if not d.kp_ok or d.kpts.shape[0] < 8:
+                x1, y1, x2, y2 = d.xyxy
+                bc_s = apply_homography(
+                    np.array([[(x1 + x2) * 0.5, float(y2)]], dtype=np.float64), H_mat
+                )
+                if not np.all(np.isfinite(bc_s)):
                     continue
-                raw_ground = d.kpts[list(gi)].copy() #rimosso l'ordinamento per angolo
+                box_bottom_bev = bc_s[0] / bev_unit
 
-                P_bev = apply_homography(raw_ground, H_mat)
-                if not np.all(np.isfinite(P_bev)):
-                    continue
-                Pn = P_bev / bev_unit
-                cP = Pn.mean(axis=0)
-                _dv1, _dv2 = Pn[2] - Pn[0], Pn[3] - Pn[1]
-                obs_scale = float(np.sqrt(abs(_dv1[0] * _dv2[1] - _dv1[1] * _dv2[0]) * 0.5))
+                use_3d = False
+                if d.kp_ok and d.kpts.shape[0] >= 8:
+                    raw_ground = d.kpts[list(gi)].copy()
+                    P_bev = apply_homography(raw_ground, H_mat)
+                    if np.all(np.isfinite(P_bev)):
+                        Pn = P_bev / bev_unit
+                        cP = Pn.mean(axis=0)
+                        _dv1, _dv2 = Pn[2] - Pn[0], Pn[3] - Pn[1]
+                        obs_scale = float(np.sqrt(abs(_dv1[0] * _dv2[1] - _dv1[1] * _dv2[0]) * 0.5))
+                        # Rifiuta le proiezioni che esplodono per stiramento vicino all'orizzonte
+                        if 0.15 <= obs_scale <= 4.5:
+                            use_3d = True
 
-                bev_obs_list.append(BEVObservation(
-                    cls=int(d.cls), source_cls=int(d.source_cls if d.source_cls is not None else d.cls), conf=d.conf, box_xyxy=d.xyxy.copy(),
-                    kpts=d.kpts.copy(), ground=raw_ground, kp_ok=True,
-                    bev_center=cP, bev_quad_raw=Pn, obs_scale=obs_scale,
-                    ground_indices=list(gi)))
+                if use_3d:
+                    bev_obs_list.append(BEVObservation(
+                        cls=int(d.cls),
+                        source_cls=int(d.source_cls) if d.source_cls is not None else -1,
+                        conf=eff_conf,
+                        box_xyxy=d.xyxy.copy(),
+                        kpts=d.kpts.copy(),
+                        ground=raw_ground,
+                        kp_ok=True,
+                        bev_center=cP,
+                        bev_quad_raw=Pn,
+                        obs_scale=obs_scale,
+                        box_bottom_bev=box_bottom_bev,
+                    ))
+                else:
+                    bev_obs_list.append(BEVObservation(
+                        cls=int(d.cls),
+                        source_cls=int(d.source_cls) if d.source_cls is not None else -1,
+                        conf=eff_conf,
+                        box_xyxy=d.xyxy.copy(),
+                        kpts=np.zeros((0, 2), dtype=np.float64),
+                        ground=np.zeros((0, 2), dtype=np.float64),
+                        kp_ok=False,
+                        bev_center=box_bottom_bev,
+                        bev_quad_raw=np.zeros((0, 2), dtype=np.float64),
+                        obs_scale=0.0,
+                        box_bottom_bev=box_bottom_bev,
+                    ))
 
         # 3. Aggiorna OC-SORT direttamente in BEV
         active_tracks = self.bev_tracker.update(bev_obs_list, self.frame_idx, img_wh)
@@ -1825,7 +1930,8 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    "default max(--kp-conf, 0.35)",
     )
     p.add_argument("--track-ocm-weight", type=float, default=0.25,
-                   help="peso della direzione di moto nell'associazione dei pedoni",
+                   help="peso della direzione di moto; valori >=1 rifiutano anche "
+                   "associazioni chiaramente controcorrente",
     )
     p.add_argument("--bev-unit", type=float, default=None,
                    help="bev_unit calibrato per la telecamera; evita la stima iniziale",
