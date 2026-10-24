@@ -254,15 +254,37 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             # Single IoU threshold for all unified classes
             iou_thresh = 0.3
 
-            # Build overlap graph: edge if IoU >= threshold OR containment
+            # Overlap-fraction helper: fraction of the SMALLER footprint covered
+            # by the larger one. Catches duplicates whose quads differ a lot in
+            # size (partial/large cuboid of the same vehicle): IoU = inter/union
+            # stays low and full containment may fail by a few pixels, but the
+            # smaller footprint is almost entirely swallowed by the larger one.
+            def _overlap_frac(pa: np.ndarray, pb: np.ndarray) -> float:
+                ha = cv2.convexHull(pa.astype(np.float32).reshape(-1, 1, 2))
+                hb = cv2.convexHull(pb.astype(np.float32).reshape(-1, 1, 2))
+                area_a = cv2.contourArea(ha)
+                area_b = cv2.contourArea(hb)
+                smaller = min(area_a, area_b)
+                if smaller <= 1e-6:
+                    return 0.0
+                inter, _ = cv2.intersectConvexConvex(ha, hb)
+                return float(inter) / smaller
+
+            # Build overlap graph: edge if IoU >= threshold OR containment OR
+            # the smaller footprint is mostly covered by the larger one.
             n = len(group)
             overlap = np.zeros((n, n), dtype=bool)
             for a in range(n):
                 for b in range(a + 1, n):
-                    iou_high = iou_mat[a, b] >= iou_thresh
+                    # Selective edges: high IoU (true duplicates), full
+                    # containment, or the smaller footprint mostly covered.
+                    # A moderate IoU alone (e.g. 0.3-0.5 for two real close
+                    # vehicles in a queue) must NOT merge them.
+                    iou_high = iou_mat[a, b] >= 0.5
                     contains = (_polygon_contains(grounds[a], grounds[b]) or
                                _polygon_contains(grounds[b], grounds[a]))
-                    if iou_high or contains:
+                    mostly_covered = _overlap_frac(grounds[a], grounds[b]) >= 0.65
+                    if iou_high or contains or mostly_covered:
                         overlap[a, b] = True
                         overlap[b, a] = True
 
@@ -574,7 +596,7 @@ def _parse_class_conf(spec: Optional[str]) -> Dict[int, float]:
 
 
 # --------------------------------------------------------------------------- #
-VEHICLES_V2 = (2, 5, 7)   # car, bus, truck
+VEHICLES_V2 = (2,)   # unified vehicle class (all COCO vehicles -> 2)
 
 
 def _ground_overlap(qa, qb):
@@ -715,7 +737,11 @@ class V2Pipeline(rt.RealtimePipeline):
                           and inside.all() and nonzero.all())
                 kp = xy.copy()
             det = Detection(
-                cls=c,
+                cls=to_unified(c),   # unified class (0=pedestrian, 2=vehicle):
+                                     # bike/car/truck/... of the SAME object must
+                                     # land in the same dedup group, otherwise a
+                                     # vehicle detected as both bike and car
+                                     # survives dedup as two boxes
                 conf=float(conf[i]),
                 xyxy=xyxy[i],
                 kpts=kp,
