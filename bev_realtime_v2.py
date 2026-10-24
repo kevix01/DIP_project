@@ -71,6 +71,7 @@ from uod.bev import BEVViewport  # noqa: E402
 from uod.keypoints import Detection  # noqa: E402
 from uod.textdraw import UILayer  # noqa: E402
 from uod.tracking import _iou_matrix  # noqa: E402
+from uod.classes import to_unified, is_vehicle
 import refine_v2  # noqa: E402
 from uod.viz import (draw_cuboid, draw_dashed_polyline, draw_ground_quad)  # noqa: E402
 from homography_rt import apply_homography  # noqa: E402
@@ -132,24 +133,6 @@ POSE_CATEGORY_V2: Dict[int, str] = {
     0: "person", 1: "bike", 2: "car", 3: "bike", 5: "bus", 7: "truck",
 }
 
-# YOLO COCO class -> unified class mapping
-UNIFIED_CLASS_MAP = {
-    2: 2,   # car -> vehicle
-    5: 2,   # bus -> vehicle
-    7: 2,   # truck -> vehicle
-    1: 2,   # bicycle -> vehicle (unify with vehicles)
-    3: 2,   # motorcycle -> vehicle (unify with vehicles)
-    0: 0,   # person -> person
-}
-
-# Reverse mapping: unified class -> representative YOLO class (for display)
-UNIFIED_TO_YOLO = {2: 2, 0: 0}
-
-
-def _unified_class(yolo_cls: int) -> int:
-    """Map YOLO class to unified class."""
-    return UNIFIED_CLASS_MAP.get(yolo_cls, yolo_cls)
-
 
 def _mean_kp_visibility(det: Detection) -> float:
     """Compute mean keypoint visibility for a detection."""
@@ -208,9 +191,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
     4. Combine and return all
     """
     if len(dets) <= 1:
-        # Still assign unified class
-        for d in dets:
-            d.cls = _unified_class(d.cls)
         return dets
 
     # Separate detections with and without ground footprint
@@ -235,47 +215,82 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             for d in with_ground:
                 d.ground_bev = d.ground.copy()
 
-        # Group by unified class
-        groups: Dict[Tuple[int, int], List[Detection]] = {}
+        # Group by unified class (cls is already unified in Detection)
+        groups: Dict[int, List[Detection]] = {}
         for d in with_ground:
-            ucls = _unified_class(d.cls)
-            raw_cls = int(d.source_cls if d.source_cls is not None else d.cls)
-
-            # Le classi veicolo restano separate durante la deduplicazione.
-            # La classe unificata viene applicata solo per la visualizzazione.
-            group_key = (ucls, raw_cls) if ucls == 2 else (ucls, ucls)
-            groups.setdefault(group_key, []).append(d)  
+            ucls = d.cls
+            groups.setdefault(ucls, []).append(d)
 
         merged_with_ground: List[Detection] = []
 
-        # Per-class NMS on ground IoU (in BEV space if H available)
-        for (ucls, _raw_cls), group in groups.items():
+        # Per-class deduplication: keep detections with largest BEV footprint area
+        # This handles the case where the same object is detected multiple times
+        # (e.g., same vehicle as car/truck/bus, or same pedestrian with multiple detections)
+        # We keep the one with largest BEV footprint and suppress overlapping ones.
+        # Uses connected components to handle chain overlaps (A overlaps B, B overlaps C => A~C).
+        for ucls, group in groups.items():
             if len(group) == 1:
-                d = group[0]
-                d.cls = ucls
-                merged_with_ground.append(d)
+                merged_with_ground.append(group[0])
                 continue
 
-            qualities = np.array([_mean_kp_visibility(d) for d in group])
-            order = np.argsort(qualities)[::-1]
+            # Compute BEV footprint area for each detection
+            bev_areas = []
+            for d in group:
+                g = d.ground_bev
+                if g.shape == (4, 2):
+                    x, y = g[:, 0], g[:, 1]
+                    area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+                else:
+                    area = 0.0
+                bev_areas.append(area)
+
+            # Sort by BEV area descending (keep largest footprints)
+            order = np.argsort(bev_areas)[::-1]
             keep = np.ones(len(group), dtype=bool)
 
             grounds = np.stack([d.ground_bev for d in group])
             iou_mat = _ground_iou_matrix(grounds, grounds)
 
-            for i_idx, i in enumerate(order):
-                if not keep[i]:
+            # Single IoU threshold for all unified classes
+            iou_thresh = 0.3
+
+            # Build overlap graph: edge if IoU >= threshold OR containment
+            n = len(group)
+            overlap = np.zeros((n, n), dtype=bool)
+            for a in range(n):
+                for b in range(a + 1, n):
+                    iou_high = iou_mat[a, b] >= iou_thresh
+                    contains = (_polygon_contains(grounds[a], grounds[b]) or
+                               _polygon_contains(grounds[b], grounds[a]))
+                    if iou_high or contains:
+                        overlap[a, b] = True
+                        overlap[b, a] = True
+
+            # Find connected components via BFS
+            visited = np.zeros(n, dtype=bool)
+            for a in range(n):
+                if visited[a]:
                     continue
-                for j in order[i_idx + 1:]:
-                    if not keep[j]:
-                        continue
-                    if iou_mat[i, j] >= 0.5:
-                        keep[j] = False
+                # BFS to find all nodes in this component
+                component = []
+                queue = [a]
+                visited[a] = True
+                while queue:
+                    cur = queue.pop(0)
+                    component.append(cur)
+                    for b in range(n):
+                        if not visited[b] and overlap[cur, b]:
+                            visited[b] = True
+                            queue.append(b)
+                # Keep only the largest footprint in this component
+                if len(component) > 1:
+                    best = max(component, key=lambda idx: bev_areas[idx])
+                    for idx in component:
+                        if idx != best:
+                            keep[idx] = False
 
             for idx in np.where(keep)[0]:
-                d = group[idx]
-                d.cls = ucls
-                merged_with_ground.append(d)
+                merged_with_ground.append(group[idx])
 
         # Cross-class suppression: vehicle (2) vs person (0)
         person_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 0]
@@ -304,10 +319,9 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
 
         merged.extend(merged_with_ground)
 
-    # Process detections WITHOUT ground: assign unified class, pass through for tracker
+    # Process detections WITHOUT ground: pass through for tracker
     # These have box 2D but no reliable keypoints/ground - tracker will use box for association
     for d in without_ground:
-        d.cls = _unified_class(d.cls)
         merged.append(d)
 
     return merged
@@ -958,7 +972,8 @@ class V2Pipeline(rt.RealtimePipeline):
                 bev_obs_list.append(BEVObservation(
                     cls=0, source_cls=int(d.source_cls if d.source_cls is not None else 0), conf=d.conf, box_xyxy=d.xyxy.copy(),
                     kpts=d.kpts.copy(), ground=d.ground.copy(), kp_ok=True,
-                    bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale))
+                    bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale,
+                    ground_indices=list(gi)))
             else:
                 # REGOLA VEICOLI: invia al tracker SOLO oggetti con keypoint affidabili (kp_ok == True)
                 if not d.kp_ok or d.kpts.shape[0] < 8:
@@ -976,7 +991,8 @@ class V2Pipeline(rt.RealtimePipeline):
                 bev_obs_list.append(BEVObservation(
                     cls=int(d.cls), source_cls=int(d.source_cls if d.source_cls is not None else d.cls), conf=d.conf, box_xyxy=d.xyxy.copy(),
                     kpts=d.kpts.copy(), ground=raw_ground, kp_ok=True,
-                    bev_center=cP, bev_quad_raw=Pn, obs_scale=obs_scale))
+                    bev_center=cP, bev_quad_raw=Pn, obs_scale=obs_scale,
+                    ground_indices=list(gi)))
 
         # 3. Aggiorna OC-SORT direttamente in BEV
         active_tracks = self.bev_tracker.update(bev_obs_list, self.frame_idx, img_wh)

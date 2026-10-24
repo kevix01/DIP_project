@@ -52,26 +52,11 @@ from uod.tracking import MultiObjectTracker
 from uod.viz import (draw_box, draw_cuboid, draw_dashed_polyline,
                      draw_ground_quad, rounded_contour, stack_side_by_side)
 from uod.tracking import _iou_matrix
+from uod.classes import to_unified, is_vehicle
 
 # COCO ids the auxiliary detector is allowed to report: pedestrian, bicycle,
 # motorcycle, car, bus, truck. Everything else (traffic lights, etc.) is dropped.
 AUX_CLASSES = (0, 1, 2, 3, 5, 7)
-
-# YOLO COCO class -> unified class mapping
-UNIFIED_CLASS_MAP = {
-    2: 2,   # car -> vehicle
-    5: 2,   # bus -> vehicle
-    7: 2,   # truck -> vehicle
-    1: 2,   # bicycle -> vehicle (unify with vehicles)
-    3: 2,   # motorcycle -> vehicle (unify with vehicles)
-    0: 0,   # person -> person
-}
-
-
-def _unified_class(yolo_cls: int) -> int:
-    """Map YOLO class to unified class."""
-    return UNIFIED_CLASS_MAP.get(yolo_cls, yolo_cls)
-
 
 def _mean_kp_visibility(det: Detection) -> float:
     """Compute mean keypoint visibility for a detection."""
@@ -130,9 +115,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
     4. Combine and return all
     """
     if len(dets) <= 1:
-        # Still assign unified class
-        for d in dets:
-            d.cls = _unified_class(d.cls)
         return dets
 
     # Separate detections with and without ground footprint
@@ -157,42 +139,82 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             for d in with_ground:
                 d.ground_bev = d.ground.copy()
 
-        # Group by unified class
+        # Group by unified class (cls is already unified)
         groups: Dict[int, List[Detection]] = {}
         for d in with_ground:
-            ucls = _unified_class(d.cls)
+            ucls = d.cls
             groups.setdefault(ucls, []).append(d)
 
         merged_with_ground: List[Detection] = []
 
-        # Per-class NMS on ground IoU (in BEV space if H available)
+        # Per-class deduplication: keep detections with largest BEV footprint area
+        # This handles the case where the same object is detected multiple times
+        # (e.g., same vehicle as car/truck/bus, or same pedestrian with multiple detections)
+        # We keep the one with largest BEV footprint and suppress overlapping ones.
+        # Uses connected components to handle chain overlaps (A overlaps B, B overlaps C => A~C).
         for ucls, group in groups.items():
             if len(group) == 1:
-                d = group[0]
-                d.cls = ucls
-                merged_with_ground.append(d)
+                merged_with_ground.append(group[0])
                 continue
 
-            qualities = np.array([_mean_kp_visibility(d) for d in group])
-            order = np.argsort(qualities)[::-1]
+            # Compute BEV footprint area for each detection
+            bev_areas = []
+            for d in group:
+                g = d.ground_bev
+                if g.shape == (4, 2):
+                    x, y = g[:, 0], g[:, 1]
+                    area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+                else:
+                    area = 0.0
+                bev_areas.append(area)
+
+            # Sort by BEV area descending (keep largest footprints)
+            order = np.argsort(bev_areas)[::-1]
             keep = np.ones(len(group), dtype=bool)
 
             grounds = np.stack([d.ground_bev for d in group])
             iou_mat = _ground_iou_matrix(grounds, grounds)
 
-            for i_idx, i in enumerate(order):
-                if not keep[i]:
+            # Single IoU threshold for all unified classes
+            iou_thresh = 0.3
+
+            # Build overlap graph: edge if IoU >= threshold OR containment
+            n = len(group)
+            overlap = np.zeros((n, n), dtype=bool)
+            for a in range(n):
+                for b in range(a + 1, n):
+                    iou_high = iou_mat[a, b] >= iou_thresh
+                    contains = (_polygon_contains(grounds[a], grounds[b]) or
+                               _polygon_contains(grounds[b], grounds[a]))
+                    if iou_high or contains:
+                        overlap[a, b] = True
+                        overlap[b, a] = True
+
+            # Find connected components via BFS
+            visited = np.zeros(n, dtype=bool)
+            for a in range(n):
+                if visited[a]:
                     continue
-                for j in order[i_idx + 1:]:
-                    if not keep[j]:
-                        continue
-                    if iou_mat[i, j] >= 0.5:
-                        keep[j] = False
+                # BFS to find all nodes in this component
+                component = []
+                queue = [a]
+                visited[a] = True
+                while queue:
+                    cur = queue.pop(0)
+                    component.append(cur)
+                    for b in range(n):
+                        if not visited[b] and overlap[cur, b]:
+                            visited[b] = True
+                            queue.append(b)
+                # Keep only the largest footprint in this component
+                if len(component) > 1:
+                    best = max(component, key=lambda idx: bev_areas[idx])
+                    for idx in component:
+                        if idx != best:
+                            keep[idx] = False
 
             for idx in np.where(keep)[0]:
-                d = group[idx]
-                d.cls = ucls
-                merged_with_ground.append(d)
+                merged_with_ground.append(group[idx])
 
         # Cross-class suppression: vehicle (2) vs person (0)
         person_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 0]
@@ -221,10 +243,9 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
 
         merged.extend(merged_with_ground)
 
-    # Process detections WITHOUT ground: assign unified class, pass through for tracker
+    # Process detections WITHOUT ground: pass through for tracker
     # These have box 2D but no reliable keypoints/ground - tracker will use box for association
     for d in without_ground:
-        d.cls = _unified_class(d.cls)
         merged.append(d)
 
     return merged
@@ -461,16 +482,15 @@ class RealtimePipeline:
             return dets
 
         boxes = np.array([d.xyxy for d in dets])
-        classes = np.array([d.cls for d in dets])
+        classes = np.array([d.cls for d in dets])  # Already unified
         confs = np.array([d.conf for d in dets])
 
         # Sort by confidence descending
         order = np.argsort(confs)[::-1]
         keep = np.ones(len(dets), dtype=bool)
 
-        # Bike classes (COCO: 1=bicycle, 3=motorcycle) both map to "bike"
-        BIKE_CLASSES = {1, 3}
-        VEHICLE_CLASSES = {2, 5, 7}  # car, bus, truck
+        # Unified classes: 0=pedestrian, 2=vehicle
+        # source_cls preserves original COCO class
 
         for i_idx, i in enumerate(order):
             if not keep[i]:
@@ -478,18 +498,19 @@ class RealtimePipeline:
             box_i = boxes[i:i+1]
             cls_i = classes[i]
             conf_i = confs[i]
+            src_i = dets[i].source_cls if dets[i].source_cls is not None else cls_i
 
             # Compare with lower-confidence detections
             for j in order[i_idx + 1:]:
                 if not keep[j]:
                     continue
                 cls_j = classes[j]
+                src_j = dets[j].source_cls if dets[j].source_cls is not None else cls_j
 
                 # Dynamic IoU threshold based on class pair
-                if cls_i in VEHICLE_CLASSES and cls_j in VEHICLE_CLASSES:
+                if cls_i == 2 and cls_j == 2:
                     iou_thresh = 0.5      # vehicle-vehicle: nested boxes (cab in truck)
-                elif (cls_i in BIKE_CLASSES and cls_j in VEHICLE_CLASSES) or \
-                     (cls_j in BIKE_CLASSES and cls_i in VEHICLE_CLASSES):
+                elif (is_vehicle(src_i) and cls_j == 2) or (cls_i == 2 and is_vehicle(src_j)):
                     iou_thresh = 0.5      # bike-vehicle: narrow vehicle detected as both
                 else:
                     iou_thresh = 0.7      # default
@@ -500,10 +521,10 @@ class RealtimePipeline:
 
                 conf_j = confs[j]
 
-                # Special case: bike (1 or 3) vs person (0) -> always prefer bike
-                if cls_i in BIKE_CLASSES and cls_j == 0:
+                # Special case: bike (source_cls 1 or 3) vs person (0) -> always prefer bike
+                if is_vehicle(src_i) and src_i in (1, 3) and cls_j == 0:
                     keep[j] = False  # bike wins
-                elif cls_j in BIKE_CLASSES and cls_i == 0:
+                elif is_vehicle(src_j) and src_j in (1, 3) and cls_i == 0:
                     keep[i] = False  # person loses to bike
                     break
                 else:

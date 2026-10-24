@@ -5,7 +5,7 @@ projected corners of the object's 3D cuboid. Four of those eight are the
 *ground-contact* corners that the BEV head consumes.
 
 Ground-corner convention
--------------------------
+------------------------
 The paper text states indices 4-7 are ground; however the *released*
 ``urbanomnidetect_*`` checkpoints emit keypoints with the opposite ordering
 (indices 0-3 are the ground corners, verified empirically: they sit ~25 px
@@ -15,6 +15,12 @@ auto-detects which half is the ground by majority vote over the first frames
 (the ground corners are lower in the image, i.e. larger ``y``, than their
 matching top corners) and then *locks* the choice for temporal stability. The
 choice can also be forced explicitly.
+
+Class unification
+-----------------
+Only two unified classes exist: 0=pedestrian, 2=vehicle.
+All vehicle COCO classes (1,2,3,5,7) map to vehicle (2).
+The original COCO class is preserved in `source_cls`.
 """
 
 from __future__ import annotations
@@ -24,13 +30,19 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
+from .classes import to_unified
+
 __all__ = ["Detection", "GroundIndexResolver", "parse_pose_result",
            "parse_boxes_result"]
 
 
 @dataclass
 class Detection:
-    """A single detected object in full-image pixel coordinates."""
+    """A single detected object in full-image pixel coordinates.
+
+    cls: unified class (0=pedestrian, 2=vehicle)
+    source_cls: original COCO class (preserved for debugging/analysis)
+    """
     cls: int
     conf: float
     xyxy: np.ndarray                  # (4,) [x1, y1, x2, y2]
@@ -40,7 +52,7 @@ class Detection:
         default_factory=lambda: np.zeros((0, 2)))
     track_id: int = -1
     is_aux: bool = False             # came from the auxiliary box-only detector
-    source_cls: Optional[int] = None  # classe COCO originale, prima dell'unificazione
+    source_cls: Optional[int] = None  # original COCO class before unification
 
     @property
     def center(self) -> np.ndarray:
@@ -128,6 +140,9 @@ def parse_pose_result(result, ground_indices: Optional[Sequence[int]],
 
     ``ground_indices`` selects the ground keypoints; if ``None`` the per-object
     ground footprint is left empty (used while the resolver is still voting).
+    
+    The detection cls is set to unified class (0=pedestrian, 2=vehicle).
+    The original COCO class is preserved in source_cls.
     """
     dets: List[Detection] = []
     if result is None or result.boxes is None or len(result.boxes) == 0:
@@ -148,8 +163,11 @@ def parse_pose_result(result, ground_indices: Optional[Sequence[int]],
             ground = kp[gi].copy()
             if reorder:
                 ground = _order_ground_quad(ground)
-        dets.append(Detection(cls=int(cls[i]), conf=float(conf[i]),
-                              xyxy=xyxy[i], kpts=kp, ground=ground))
+        source_cls = int(cls[i])
+        unified_cls = to_unified(source_cls)
+        dets.append(Detection(cls=unified_cls, conf=float(conf[i]),
+                              xyxy=xyxy[i], kpts=kp, ground=ground,
+                              source_cls=source_cls))
     return dets
 
 
@@ -169,6 +187,8 @@ def parse_boxes_result(result, conf_thresh: float = 0.0,
             continue
         if cf is not None and int(cls[i]) not in cf:
             continue
-        dets.append(Detection(cls=int(cls[i]), conf=float(conf[i]),
-                              xyxy=xyxy[i], is_aux=True))
+        source_cls = int(cls[i])
+        unified_cls = to_unified(source_cls)
+        dets.append(Detection(cls=unified_cls, conf=float(conf[i]),
+                              xyxy=xyxy[i], is_aux=True, source_cls=source_cls))
     return dets

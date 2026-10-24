@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from uod.keypoints import Detection, GroundIndexResolver, parse_pose_result
 from uod.model import DEFAULT_AUX_MODEL, load_detector
 from uod.tracking import _iou_matrix
+from uod.classes import UNIFIED_VEHICLE, UNIFIED_PEDESTRIAN
 
 
 def compute_slices(w: int, h: int, slice_wh: Tuple[int, int],
@@ -62,12 +63,16 @@ def compute_slices(w: int, h: int, slice_wh: Tuple[int, int],
 
 
 def _greedy_nms(dets: List[Detection], iou_thresh: float) -> List[Detection]:
-    """Class-aware greedy NMS keeping the highest-confidence detection."""
+    """Class-aware greedy NMS keeping the highest-confidence detection.
+    
+    Uses unified class (0=pedestrian, 2=vehicle) so all vehicle subclasses
+    (bike, car, truck, bus) are treated as the same class for NMS.
+    """
     if len(dets) <= 1:
         return dets
     order = sorted(range(len(dets)), key=lambda i: dets[i].conf, reverse=True)
     boxes = np.array([dets[i].xyxy for i in order])
-    cls = np.array([dets[i].cls for i in order])
+    cls = np.array([dets[i].cls for i in order])  # Already unified
     keep, suppressed = [], np.zeros(len(order), dtype=bool)
     for a in range(len(order)):
         if suppressed[a]:

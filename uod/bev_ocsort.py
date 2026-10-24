@@ -17,15 +17,32 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from homography_rt import apply_homography
+from .classes import is_vehicle, UNIFIED_VEHICLE, UNIFIED_PEDESTRIAN
 
-def _vehicle_family(cls: int) -> int:
-    """0 = pedone; 1 = bici/moto; 2 = auto/bus/camion."""
-    cls = int(cls)
-    if cls in (1, 3):
-        return 1
-    if cls in (2, 5, 7):
-        return 2
-    return cls
+# --------------------------------------------------------------------------- #
+# Vehicle family classification for association gating
+# --------------------------------------------------------------------------- #
+
+def _vehicle_family(unified_cls: int, source_cls: int) -> int:
+    """Return vehicle family based on unified class and source class.
+    
+    Args:
+        unified_cls: 0=pedestrian, 2=vehicle
+        source_cls: original COCO class
+        
+    Returns:
+        0 = pedestrian
+        1 = bicycle/motorcycle
+        2 = car/bus/truck
+    """
+    if unified_cls == UNIFIED_PEDESTRIAN:
+        return 0
+    if is_vehicle(source_cls):
+        # For unified vehicles, check original COCO class to distinguish families
+        if source_cls in (1, 3):  # bicycle, motorcycle
+            return 1
+        return 2  # car, bus, truck
+    return unified_cls
 
 # --------------------------------------------------------------------------- #
 # Precomputed O(1) Savitzky-Golay Filter (Position + Analytical Velocity)
@@ -86,6 +103,7 @@ class BEVObservation:
     bev_center: np.ndarray      # (2,) in bev_unit coordinates
     bev_quad_raw: np.ndarray    # (4, 2) in bev_unit coordinates (centered or posed)
     obs_scale: float            # observed scale in bev_unit
+    ground_indices: Optional[List[int]] = None   # which 4 of the 8 kpts are ground
 
 
 # --------------------------------------------------------------------------- #
@@ -105,9 +123,7 @@ class BEVKalmanTrack:
         self.cls = int(obs.cls)
         self.class_votes: Dict[int, int] = {self.cls: 1}
         self.source_cls = int(obs.source_cls)
-        self.vehicle_family = (
-            _vehicle_family(self.source_cls) if self.cls != 0 else 0
-        )
+        self.vehicle_family = _vehicle_family(self.cls, self.source_cls)
         self.veh_scale = (
             max(float(obs.obs_scale), 1e-6) if self.cls != 0 else 0.0
         )
@@ -142,6 +158,8 @@ class BEVKalmanTrack:
         self.kpts = obs.kpts.copy()
         self.ground = obs.ground.copy()
         self.kp_ok = bool(obs.kp_ok)
+        self.ground_indices = (list(obs.ground_indices)
+                               if obs.ground_indices is not None else [0, 1, 2, 3])
 
         # Pedestrian 2D box & 3D height state
         w2d = max(obs.box_xyxy[2] - obs.box_xyxy[0], 1.0)
@@ -165,6 +183,9 @@ class BEVKalmanTrack:
         self.veh_locked = False
         self.veh_rms: deque = deque(maxlen=30)
         self.veh_heading = self._estimate_kabsch_angle(Q0, self.veh_S)
+        
+        # Store BEV ground footprint for largest-footprint selection
+        self._bev_ground = obs.bev_quad_raw.copy() if obs.bev_quad_raw.shape == (4, 2) else None
 
     # ------------------------------------------------------------------ #
     def _kf_predict_step(self):
@@ -240,10 +261,8 @@ class BEVKalmanTrack:
         self.time_since_update = 0
         self.hits += 1
 
-        # 3. Majority class voting
-        c = int(obs.cls)
-        self.class_votes[c] = self.class_votes.get(c, 0) + 1
-        self.cls = max(self.class_votes.items(), key=lambda kv: kv[1])[0]
+        # cls is LOCKED at track creation (unified class: 0=pedestrian, 2=vehicle)
+        # No class voting - prevents ID switches when detector alternates subclasses
 
         # 4. Update 2D/3D visual geometry & footprint shape
         if self.cls == 0:
@@ -299,9 +318,19 @@ class BEVKalmanTrack:
             self.ped_scale = scale_alpha * target_scale + (1.0 - scale_alpha) * self.ped_scale
 
     def _update_vehicle(self, obs: BEVObservation):
+        # Visual payload: ALWAYS the model's own predicted cuboid for the
+        # detection associated with this track. No artificial re-posing,
+        # rotation or reconstruction of stored geometry -- that is what made
+        # the camera-view cuboids look distorted. The "largest footprint"
+        # selection happens upstream at detection level (dedup keeps the
+        # detection with the largest BEV footprint per object per frame), so
+        # the cuboid drawn on the camera panel is exactly the model's output.
+
         self.box_xyxy = obs.box_xyxy.copy()
         self.kpts = obs.kpts.copy()
         self.ground = obs.ground.copy()
+        if obs.bev_quad_raw is not None and obs.bev_quad_raw.shape == (4, 2):
+            self._bev_ground = obs.bev_quad_raw.copy()
 
         obs_scale = max(float(obs.obs_scale), 1e-6)
         old_scale = max(float(self.veh_scale), 1e-6)
@@ -444,38 +473,41 @@ class BEVOCSortTracker:
 
             # Class compatibility: pedestrians (0) never match vehicles (!= 0)
             if t.cls == 0:
-                # I pedoni restano associabili solo ad altri pedoni.
+                # Pedestrians only associate with other pedestrians.
                 valid = (obs_cls == 0) & (dists <= gate)
                 c_row = dists / max(gate, 1e-6)
             else:
-                # Non associare una traccia auto/bus/camion a bici o moto.
-                family_ok = np.array([
-                    _vehicle_family(c) == t.vehicle_family
-                    for c in obs_source_cls
-                ], dtype=bool)
-
+                # All vehicle subclasses (car, truck, bus, bicycle, motorcycle)
+                # associate with each other since they share unified class.
+                # No family-based gating - any vehicle can match any vehicle track.
                 track_scale = max(float(t.veh_scale), 1e-6)
 
-                # obs_scale è la radice dell'area della footprint in BEV.
-                # 1.8 è una soglia iniziale: impedisce salti tra impronte
-                # molto diverse, lasciando margine alle variazioni dei keypoint.
+                # obs_scale is the sqrt of footprint area in BEV.
+                # Relaxed for vehicles: same physical object can appear as
+                # different subclasses with different footprint sizes.
+                track_scale = max(float(t.veh_scale), 1e-6)
                 scale_ratio = np.maximum(
                     obs_scales / track_scale,
                     track_scale / obs_scales,
                 )
-                scale_ok = scale_ratio <= 1.8
+                # Soft scale penalty: penalize different sizes but don't hard-reject,
+                # so tracks don't get stranded when the detector alternates subclasses.
+                scale_thresh = 3.0 if t.cls == 2 else 1.8
+                scale_ok = scale_ratio <= scale_thresh
+                scale_penalty = np.where(scale_ok, 0.0, 0.5 * np.minimum(np.log(scale_ratio), 1.0))
 
+                # Spatial gate remains hard (must be within reasonable distance)
                 valid = (
                     (obs_cls != 0)
-                    & family_ok
-                    & scale_ok
                     & (dists <= gate)
                 )
                 c_row = dists / max(gate, 1e-6)
 
-                # Tra candidati compatibili, preferisci la footprint di scala simile.
-                scale_penalty = np.abs(np.log(obs_scales / track_scale))
-                c_row += 0.15 * np.minimum(scale_penalty, 1.0)
+                # Add scale penalty to cost
+                c_row += scale_penalty
+
+                # Prefer footprint with similar scale
+                c_row += 0.15 * np.minimum(np.abs(np.log(obs_scales / track_scale)), 1.0)
 
             # Add OC-SORT OCM (Observation-Centric Momentum) angular penalty
             if not use_last_obs:

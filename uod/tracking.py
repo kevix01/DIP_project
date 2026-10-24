@@ -44,6 +44,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .keypoints import Detection
+from .classes import is_vehicle
 
 __all__ = ["Track", "MultiObjectTracker"]
 
@@ -271,14 +272,56 @@ class Track:
 
     def correct(self, det: Detection, alpha: float, beta: float,
                 min_hits: int) -> None:
-        """Fuse a matched measurement into the (already predicted) state."""
-        meas = np.concatenate([_xyxy_to_cxcywh(det.xyxy),
-                               det.kpts.reshape(-1) if self.n_kpts else np.zeros(0)])
+        """Fuse a matched measurement into the (already predicted) state.
+
+        Note: cls is NOT updated - it's set at track creation and locked.
+        This prevents ID switches when the detector alternates between vehicle subclasses
+        (e.g., truck -> car -> truck).
+
+        Keeps the largest keypoint ground footprint seen for this track to avoid
+        shrinking when detector alternates between vehicle subclasses.
+        Box position ALWAYS comes from current detection; keypoints may be kept
+        from track if current detection footprint is smaller.
+        """
+        # Compute ground footprint area from current state keypoints
+        curr_kpts = self.state[4:].reshape(self.n_kpts, 2) if self.n_kpts else np.zeros((0, 2))
+        curr_ground_area = 0.0
+        if self.ground_indices and len(curr_kpts) > max(self.ground_indices):
+            curr_ground = curr_kpts[self.ground_indices]
+            if curr_ground.shape == (4, 2):
+                x = curr_ground[:, 0]
+                y = curr_ground[:, 1]
+                curr_ground_area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+
+        # Compute ground footprint area from new detection
+        det_ground_area = 0.0
+        if det.ground.shape == (4, 2):
+            x = det.ground[:, 0]
+            y = det.ground[:, 1]
+            det_ground_area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+
+        # BOX POSITION: ALWAYS from current detection (object moves!)
+        meas_box = _xyxy_to_cxcywh(det.xyxy)
+
+        # KEYPOINTS: use detection's if its footprint is larger, else keep track's
+        if det_ground_area > curr_ground_area and det.kpts.shape[0] >= self.n_kpts:
+            meas_kpts = det.kpts.reshape(-1)
+        else:
+            meas_kpts = self.state[4:] if self.n_kpts else np.zeros(0)
+            # Translate track keypoints by box-center delta so they follow movement
+            # even when we keep the older (larger) footprint shape.
+            if self.n_kpts:
+                old_center = self.state[:2].copy()
+                new_center = meas_box[:2].copy()
+                delta = new_center - old_center
+                meas_kpts = (meas_kpts.reshape(self.n_kpts, 2) + delta).reshape(-1)
+
+        meas = np.concatenate([meas_box, meas_kpts])
         residual = meas - self.state
         self.state = self.state + alpha * residual
         self.vel = self.vel + beta * residual
         self.conf = 0.7 * self.conf + 0.3 * det.conf
-        self.cls = det.cls
+        # self.cls = det.cls  # LOCKED: never update class after creation
         self.hits += 1
         self.time_since_update = 0
         self.last_obs = self.state[:2].copy()
@@ -424,8 +467,14 @@ class MultiObjectTracker:
         matches = []
         m1, un_t1, un_d1 = self._associate(track_idx, hi, dets, stage=1)
         matches += m1
-        # Stage 2 recovers still-unmatched tracks from low-confidence boxes.
-        m2, un_t2, un_d2 = self._associate(un_t1, lo, dets, stage=2)
+        # Stage 2 recovers still-unmatched tracks from ALL remaining detections
+        # (both low-conf and high-conf that didn't match in stage 1).
+        # This is critical for vehicles that change subclass with different box sizes.
+        remaining_dets = list(un_d1) + lo
+        # Remove duplicates preserving order
+        seen = set()
+        remaining_dets = [i for i in remaining_dets if not (i in seen or seen.add(i))]
+        m2, un_t2, un_d2 = self._associate(un_t1, remaining_dets, dets, stage=2)
         matches += m2
 
         matched_t = {ti for ti, _ in matches}
@@ -438,6 +487,8 @@ class MultiObjectTracker:
                 self.tracks[ti].coast(self.vel_decay)
 
         # 4) Spawn tracks only from unmatched HIGH-confidence detections.
+        # Detection.cls is already unified (0=pedestrian, 2=vehicle)
+        # Track will lock this class at creation and never change it
         for di in un_d1:
             self.tracks.append(
                 Track(self._next_id, dets[di], (self.alpha, self.beta),
@@ -516,37 +567,75 @@ class MultiObjectTracker:
         tcls = np.array([t.cls for t in tracks])[:, None]
         dcls = np.array([d.cls for d in ds])[None, :]
         # Anti-steal / anti-swap plausibility. A detection may only match a track
-        # if it falls inside a velocity-aligned ellipse around the track's LAST
-        # OBSERVATION (not its drifted prediction): generous ALONG the heading
-        # (the object may have travelled), tight ACROSS it (it stays in its
-        # lane), and tight isotropically when (near-)stationary. Tolerances scale
-        # with the object's box size, so adjacent same-size cars in stopped
-        # traffic -- one box-width apart -- can no longer swap IDs, while a
-        # coasting track still cannot capture a different (cross-lane / far)
-        # object -- that object keeps or gets its own ID instead.
-        last_obs = np.array([t.last_obs for t in tracks])          # (T, 2)
-        vel = np.array([t.vel[:2] for t in tracks])                # (T, 2)
-        spd = np.linalg.norm(vel, axis=1)                          # (T,)
-        scale = np.sqrt(np.maximum(tw * th, 1.0))                  # (T,) box size, px
-        disp = dc[None, :, :] - last_obs[:, None, :]               # (T, D, 2)
-        dn = np.linalg.norm(disp, axis=2)                          # (T, D)
-        tsuf = tsu.astype(float)                                   # (T, 1)
-        moving = (spd > 1.5)[:, None]                              # (T, 1)
-        vh = vel / np.maximum(spd[:, None], 1e-6)                  # (T, 2)
-        along = np.abs(np.einsum('td,tnd->tn', vh, disp))          # (T, D)
-        cross = np.sqrt(np.maximum(dn ** 2 - along ** 2, 0.0))     # (T, D)
+        # if it falls inside a velocity-aligned ellipse around the track's position.
+        # Use the PREDICTED centre (after predict()) rather than last_obs, so that
+        # coasting tracks can still capture detections that moved during the gap.
+        # Generous ALONG the heading, tight ACROSS it, and tight isotropically when
+        # (near-)stationary. Tolerances scale with the object's box size.
+        tc_pred = np.array([t.center for t in tracks])          # (T, 2) predicted centre
+        vel = np.array([t.vel[:2] for t in tracks])             # (T, 2)
+        spd = np.linalg.norm(vel, axis=1)                       # (T,)
+        scale = np.sqrt(np.maximum(tw * th, 1.0))               # (T,) box size, px
+        disp = dc[None, :, :] - tc_pred[:, None, :]             # (T, D, 2)
+        dn = np.linalg.norm(disp, axis=2)                       # (T, D)
+        tsuf = tsu.astype(float)                                # (T, 1)
+        moving = (spd > 1.5)[:, None]                           # (T, 1)
+        vh = vel / np.maximum(spd[:, None], 1e-6)               # (T, 2)
+        along = np.abs(np.einsum('td,tnd->tn', vh, disp))       # (T, D)
+        cross = np.sqrt(np.maximum(dn ** 2 - along ** 2, 0.0))  # (T, D)
         sc = scale[:, None]
-        along_tol = 0.6 * sc + 1.3 * spd[:, None] * tsuf + 0.15 * sc * tsuf
-        cross_tol = 0.6 * sc + 0.15 * sc * tsuf
-        iso_tol = 0.7 * sc + 0.2 * sc * tsuf
+        
+        # Relaxed tolerances for vehicles: same object can appear with different
+        # box sizes when detected as different subclasses.
+        tcls_arr = tcls.ravel()
+        is_veh = (tcls_arr == 2)[:, None]
+        veh_factor = 2.0
+        along_tol = (0.6 * sc + 1.3 * spd[:, None] * tsuf + 0.15 * sc * tsuf) * np.where(is_veh, veh_factor, 1.0)
+        cross_tol = (0.6 * sc + 0.15 * sc * tsuf) * np.where(is_veh, veh_factor, 1.0)
+        iso_tol = (0.7 * sc + 0.2 * sc * tsuf) * np.where(is_veh, veh_factor, 1.0)
+        # Minimum isotropic tolerance so stationary vehicles are not stranded
+        iso_tol = np.maximum(iso_tol, 0.5 * sc * np.where(is_veh, 2.0, 1.0))
+        
         plausible = np.where(moving,
                              (along <= along_tol) & (cross <= cross_tol),
                              dn <= iso_tol)
-        loc_ok = (diou >= self.diou_gate) | (dist <= self.dist_gate)
-        shape_ok = (d_area <= self.size_gate) & (d_aspect <= self.aspect_gate)
-        if stage == 2:                       # low-conf recovery: require overlap
-            loc_ok = diou >= max(self.diou_gate, 0.1)
-        forbidden = (tcls != dcls) | (~loc_ok) | (~shape_ok) | (~plausible)
+        
+        # Location gate: for vehicles, use ONLY distance to predicted centre
+        # (like BEV tracker does) - no DIoU overlap required, because the same
+        # vehicle can move without box overlap between frames, especially when
+        # detected as different subclasses with different box sizes.
+        # Pedestrians keep the stricter DIoU-or-distance gate.
+        tcls_arr = tcls.ravel()
+        is_veh = (tcls_arr == 2)[:, None]
+        # Vehicle distance gate: 25% of image diagonal (generous, like BEV tracker)
+        veh_dist_gate = 0.25 * self._diag
+        ped_dist_gate = self.dist_gate * self._diag
+        dist_gate_eff = np.where(is_veh, veh_dist_gate, ped_dist_gate)
+        loc_ok = dist <= dist_gate_eff
+        
+        # Relax shape gates for vehicles: same physical object can appear as
+        # different subclasses (car/truck/bus/bike) with different box size/aspect.
+        # Pedestrians keep strict gates.
+        effective_size_gate = np.where(tcls_arr == 2, self.size_gate * 3.0, self.size_gate)
+        effective_aspect_gate = np.where(tcls_arr == 2, self.aspect_gate * 3.0, self.aspect_gate)
+        shape_ok = (d_area <= effective_size_gate[:, None]) & (d_aspect <= effective_aspect_gate[:, None])
+        
+        # Class gating: use unified class (track.cls is already unified, detection.cls is unified)
+        # Pedestrian (0) never matches vehicle (2) and vice versa
+        class_ok = (tcls == dcls)
+        
+        # Soft penalties: plausibility (motion consistency) and shape similarity.
+        # These are NOT hard constraints anymore - they just penalize unlikely matches,
+        # so a track never gets stranded/coasting-frozen when the detector alternates
+        # between vehicle subclasses (car/truck/bus/bike) with slightly different boxes.
+        plausible_penalty = np.where(plausible, 0.0, 0.5)   # high penalty if motion implausible
+        shape_penalty = np.where(shape_ok, 0.0, 0.3)         # penalty if size/aspect differs
+        
+        # Hard constraints only: same unified class, and within distance gate
+        forbidden = (~class_ok) | (~loc_ok)
+        
+        # Add soft penalties to cost
+        cost = cost + plausible_penalty + shape_penalty
 
         BIG = 1e6
         cost = np.where(forbidden, BIG, cost)
