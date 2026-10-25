@@ -1,6 +1,9 @@
 # Changelog: Ottimizzazione e Stabilizzazione del Tracking BEV OC-SORT
 
-Questo documento illustra le modifiche architetturali apportate al meccanismo di tracking (`uod/bev_ocsort.py`) e alla pipeline di deduplicazione (`bev_realtime_v2.py`) per risolvere criticità legate a scambi di identità (ID switch), sdoppiamento delle tracce e instabilità geometriche dei bounding box 3D. Lo script va eseguito con i seguenti argomenti:
+Questo documento illustra le modifiche architetturali apportate al meccanismo di tracking (`uod/bev_ocsort.py`) e alla pipeline di deduplicazione (`bev_realtime_v2.py`) per risolvere criticità legate a scambi di identità (ID switch), sdoppiamento delle tracce e instabilità geometriche dei bounding box 3D. 
+
+**Lo script va eseguito con i seguenti argomenti**:
+
 python bev_realtime_v2.py --input ..\Dataset_bangkok\videos\video_018_tagliato.avi --source-type video --kp-model ..\omnidetect_v2\checkpoints\urbanomnidetect_v2_x_640.engine --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 --suppress-nested 0.85 --object-px 80 --smooth 11 --device cuda:0 --output output_videos\out_018_stabilize_7_.avi --track-ocm-weight 2 --bev-unit 0.31147524796 --show-bev-ids --track-high-conf 0.45 
 
 ## 🎯 Problemi Risolti
