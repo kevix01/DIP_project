@@ -2378,6 +2378,10 @@ def main(argv=None):
         smooth_win=smooth_win,
         title=tuple(float(x) for x in v2args.title.split(","))
         if v2args.title else (0.0, 0.0, 0.0, 0.0),
+        track_high_conf=v2args.track_high_conf,
+        track_ocm_weight=v2args.track_ocm_weight,
+        bev_unit=v2args.bev_unit,
+        show_bev_ids=v2args.show_bev_ids
     )
 
     # 5. Carica il modello Pose26 (PyTorch o TensorRT) e istanzia la pipeline V2
@@ -2402,6 +2406,9 @@ def main(argv=None):
         show_fov=not args.no_fov,
         tracker_kwargs=dict(max_age=args.max_age, min_hits=args.min_hits),
     )
+
+    if v2args.bev_unit is not None:
+        print(f"bev_unit fisso in uso: {pipe._bev_unit_locked:.12g}")
 
     # 6. Loop Real-Time con Fixed-Lag Circular Buffer
     sink = _FFSink(args, fps)
