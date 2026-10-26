@@ -545,6 +545,39 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                        if hasattr(d, 'ground_bev') and d.ground_bev.shape == (4, 2)]
         veh_boxes = [d.xyxy for d in final_vehicles if d.xyxy is not None]
 
+        # Case D: veicolo coasting nel tracker (non rilevato nel frame corrente
+        # ma presente con una traccia attiva). Costruiamo un footprint BEV
+        # predetto dalla posizione nota del track (+ velocità se disponibile),
+        # cosi' un pedone falso che appare sopra il veicolo "scomparso" viene
+        # comunque soppresso.
+        coasting_veh_grounds = []
+        if vehicle_tracks:
+            for t in vehicle_tracks:
+                if hasattr(t, 'cls') and t.cls == 2:
+                    tsu = getattr(t, 'time_since_update', 0)
+                    if tsu >= 1 and tsu < 15 and hasattr(t, 'box_xyxy') and t.box_xyxy is not None:
+                        # Predici la posizione attuale dal box ultimo noto + velocita'
+                        box = np.asarray(t.box_xyxy, dtype=np.float64).copy()
+                        vel = getattr(t, 'vel_2d', None)
+                        if vel is not None and tsu > 0:
+                            shift = np.asarray(vel, dtype=np.float64) * float(tsu)
+                            box = box + np.array([shift[0], shift[1], shift[0], shift[1]], dtype=np.float64)
+                        # Proietta bottom-center del box in BEV come proxy del footprint
+                        cx = (box[0] + box[2]) * 0.5
+                        cy_bottom = float(box[3])
+                        try:
+                            center_bev = apply_homography(np.array([[cx, cy_bottom]], dtype=np.float64), H)
+                            if np.all(np.isfinite(center_bev)):
+                                # Usa la scala del veicolo dal track se disponibile
+                                scale = getattr(t, 'veh_scale', None)
+                                if scale is None or scale <= 1e-6:
+                                    scale = 0.3  # default bev_unit
+                                h = 0.5 * scale
+                                quad = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64) + center_bev[0]
+                                coasting_veh_grounds.append(quad)
+                        except Exception:
+                            pass
+
         survivors = []
         for d in merged:
             if d.cls != 0:
@@ -554,11 +587,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             suppressed = False
 
             # --- case A: pedone con ground vs veicolo con ground (BEV) ---
-            # Usiamo solo overlap frazione alto (>= 0.5): indica che il pedone
-            # e' quasi interamente dentro il veicolo (falso positivo). Il criterio
-            # "centroide dentro footprint" e' troppo aggressivo e colpirebbe
-            # pedoni veri a lato del veicolo (il footprint BEV del veicolo e'
-            # ampio e copre chi gli sta accanto).
             if (hasattr(d, 'ground_bev') and d.ground_bev.shape == (4, 2) and veh_grounds):
                 for vg in veh_grounds:
                     if _ofpv(d.ground_bev, vg) >= 0.5:
@@ -595,6 +623,24 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                                     break
                     except Exception:
                         pass
+
+            # --- case D: pedone sopra veicolo coasting (track predetto) ---
+            if not suppressed and coasting_veh_grounds and d.xyxy is not None:
+                x1, y1, x2, y2 = d.xyxy
+                cx = (x1 + x2) * 0.5
+                cy_bottom = float(y2)
+                center_pt = np.array([[cx, cy_bottom]], dtype=np.float64)
+                try:
+                    center_bev = apply_homography(center_pt, H)
+                    if np.all(np.isfinite(center_bev)):
+                        pt = tuple(center_bev[0].astype(np.float32))
+                        for cvg in coasting_veh_grounds:
+                            if cv2.pointPolygonTest(
+                                    cvg.astype(np.float32).reshape(-1, 1, 2), pt, False) >= 0:
+                                suppressed = True
+                                break
+                except Exception:
+                    pass
 
             if not suppressed:
                 survivors.append(d)
