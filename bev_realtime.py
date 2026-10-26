@@ -267,7 +267,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                 if suppress_person[p_idx]:
                     continue
                 for v_ground in vehicle_grounds:
-                    if _overlap_frac_ped_veh(p_ground, v_ground) >= 0.25:
+                    if _overlap_frac_ped_veh(p_ground, v_ground) >= 0.05:
                         suppress_person[p_idx] = True
                         break
 
@@ -285,7 +285,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
     # keypoints (kp_ok=False -> no ground), so it bypasses the BEV dedup above
     # and survives as a ghost pedestrian on top of the vehicle. The 2D box is
     # the only available proxy in that case: suppress the pedestrian if its
-            # box is mostly (>= 0.25) covered by a deduplicated vehicle box.
+            # box is mostly (>= 0.05) covered by a deduplicated vehicle box.
     if without_ground:
         veh_boxes_2d = [d.xyxy for d in merged if d.cls == 2 and d.xyxy is not None]
         for d in without_ground:
@@ -297,7 +297,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                     ix = max(0.0, min(x2, vb[2]) - max(x1, vb[0]))
                     iy = max(0.0, min(y2, vb[3]) - max(y1, vb[1]))
                     area_v = max((vb[2] - vb[0]) * (vb[3] - vb[1]), 1e-6)
-                    if (ix * iy) / min(area_p, area_v) >= 0.25:
+                    if (ix * iy) / min(area_p, area_v) >= 0.05:
                         covered = True
                         break
                 if covered:

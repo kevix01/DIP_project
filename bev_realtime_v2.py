@@ -201,7 +201,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                         Each track should have: id, cls (should be 2 for vehicle),
                         box_xyxy, time_since_update, and optionally ground/pos attributes.
     """
-    if len(dets) <= 1:
+    if len(dets) <= 1 and not vehicle_tracks:
         return dets
 
     # Separate detections with and without ground footprint
@@ -356,7 +356,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                 for v_ground in vehicle_grounds:
                     # Criterio 1: overlap frazione >= 0.65 (cattura quando il veicolo
                     # copre la maggior parte del pedone, o viceversa).
-                    if _overlap_frac_ped_veh(p_ground, v_ground) >= 0.25:
+                    if _overlap_frac_ped_veh(p_ground, v_ground) >= 0.05:
                         suppress_person[p_idx] = True
                         break
                     # Criterio 2: il punto di contatto col terreno del pedone
@@ -389,7 +389,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
     # keypoints (kp_ok=False -> no ground), so it bypasses the BEV dedup above
     # and survives as a ghost pedestrian on top of the vehicle. The 2D box is
     # the only available proxy in that case: suppress the pedestrian if its
-            # box is mostly (>= 0.25) covered by a deduplicated vehicle box.
+            # box is mostly (>= 0.05) covered by a deduplicated vehicle box.
     # 
     # NEW: If the pedestrian overlaps a RECENT vehicle track (from tracker),
     # instead of suppressing, we "promote" the detection to vehicle class.
@@ -406,17 +406,30 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             if d.cls == 2 and d.xyxy is not None:
                 veh_boxes_2d.append(d.xyxy)
         
-        # Build list of vehicle track boxes (recent tracks with time_since_update < threshold)
-        # A recent track is one that was updated within the last few frames
-        track_vehicle_boxes = []
+        # Build list of vehicle track info (recent tracks with time_since_update < threshold)
+        # Each entry: (box_xyxy, predicted_box_xyxy, cls) where predicted_box accounts
+        # for the track's velocity over time_since_update frames, so a vehicle that
+        # was missed for 2-3 frames and re-detected as a pedestrian at its new position
+        # can still be promoted instead of suppressed as a ghost pedestrian.
+        track_vehicle_infos = []
         if vehicle_tracks:
-            max_track_age = 10  # frames - if track hasn't been updated in 10 frames, consider it stale
+            max_track_age = 15  # frames - keep track alive for longer gaps
             for t in vehicle_tracks:
-                # Check if track is a vehicle (cls == 2) and recently updated
+                # Check if track is a vehicle (cls == 2) and not too stale
                 if hasattr(t, 'cls') and t.cls == 2:
                     time_since_update = getattr(t, 'time_since_update', 0)
                     if time_since_update < max_track_age and hasattr(t, 'box_xyxy') and t.box_xyxy is not None:
-                        track_vehicle_boxes.append(t.box_xyxy)
+                        box = np.asarray(t.box_xyxy, dtype=np.float64).copy()
+                        # Predict where the track would be now from its last known box + velocity
+                        vel = getattr(t, 'vel_2d', None)
+                        last_box = getattr(t, 'last_obs_box', None)
+                        if vel is not None and last_box is not None and time_since_update > 0:
+                            last_box = np.asarray(last_box, dtype=np.float64)
+                            shift = vel * float(time_since_update)
+                            pred_box = box + np.array([shift[0], shift[1], shift[0], shift[1]], dtype=np.float64)
+                        else:
+                            pred_box = box.copy()
+                        track_vehicle_infos.append((box, pred_box))
         
         for d in without_ground:
             if d.cls == 0:
@@ -431,7 +444,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                         ix = max(0.0, min(x2, vb[2]) - max(x1, vb[0]))
                         iy = max(0.0, min(y2, vb[3]) - max(y1, vb[1]))
                         smaller = min(area_p, area_v)
-                        if (ix * iy) / smaller >= 0.25:  # Lowered from 0.35 for better detection
+                        if (ix * iy) / smaller >= 0.05:
                             covered_by_detection = True
                             break
                 
@@ -439,18 +452,33 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                     continue  # false pedestrian on a vehicle: drop
                 
                 # Second check: is this pedestrian overlapping a recent vehicle track?
-                # If yes, PROMOTE to vehicle instead of suppressing
+                #   - Overlap with CURRENT vehicle box -> false pedestrian on vehicle: DROP
+                #   - Overlap only with VELOCITY-PREDICTED box (vehicle moved while missed)
+                #     -> promote to vehicle instead of suppressing
                 promoted_to_vehicle = False
-                if track_vehicle_boxes:
-                    for tb in track_vehicle_boxes:
-                        ix = max(0.0, min(x2, tb[2]) - max(x1, tb[0]))
-                        iy = max(0.0, min(y2, tb[3]) - max(y1, tb[1]))
-                        if (ix * iy) / area_p >= 0.35:  # Lowered from 0.50 for better track matching
-                            # PROMOTION: change class from person (0) to vehicle (2)
-                            d.cls = 2
-                            d.promoted_from_track = True  # Mark for debugging/visualization
-                            promoted_to_vehicle = True
-                            break
+                if track_vehicle_infos:
+                    overlaps_current_box = False
+                    overlaps_predicted_box = False
+                    for box, pred_box in track_vehicle_infos:
+                        # Overlap with current box (stale position if vehicle moved)
+                        ix = max(0.0, min(x2, box[2]) - max(x1, box[0]))
+                        iy = max(0.0, min(y2, box[3]) - max(y1, box[1]))
+                        if (ix * iy) / area_p >= 0.05:
+                            overlaps_current_box = True
+                        # Overlap with predicted box (anticipated new position)
+                        ix_p = max(0.0, min(x2, pred_box[2]) - max(x1, pred_box[0]))
+                        iy_p = max(0.0, min(y2, pred_box[3]) - max(y1, pred_box[1]))
+                        if (ix_p * iy_p) / area_p >= 0.05:
+                            overlaps_predicted_box = True
+                    
+                    if overlaps_current_box:
+                        # Pedestrian is on top of a vehicle's current box -> false pedestrian: drop
+                        continue
+                    elif overlaps_predicted_box and not overlaps_current_box:
+                        # Pedestrian is where the vehicle SHOULD be (moved while missed) -> promote
+                        d.cls = 2
+                        d.promoted_from_track = True
+                        promoted_to_vehicle = True
                 
                 if promoted_to_vehicle:
                     # Keep the detection but now as a vehicle
@@ -489,6 +517,89 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                     continue  # false pedestrian on a vehicle: drop
                     
             merged.append(d)
+
+    # ------------------------------------------------------------------ #
+    # Passata finale di soppressione su TUTTE le detection deduplicate,
+    # per coprire i casi misti dove il veicolo ha ground ma il pedone no
+    # (o viceversa): il veicolo è presente solo in uno dei due rami e non
+    # viene mai confrontato con il pedone nell'altro ramo.
+    #   - se entrambi hanno ground_bev: overlap frazione >= 0.05 o centroide
+    #     del pedone dentro footprint veicolo in BEV
+    #   - se il veicolo ha solo 2D box: copertura della 2D box del pedone >= 0.05
+    #   - se il pedone ha solo 2D box: centro-bottom proiettato in BEV dentro
+    #     footprint veicolo (se il veicolo ha ground_bev)
+    def _ofpv(p_ground: np.ndarray, v_ground: np.ndarray) -> float:
+        ha = cv2.convexHull(p_ground.astype(np.float32).reshape(-1, 1, 2))
+        hb = cv2.convexHull(v_ground.astype(np.float32).reshape(-1, 1, 2))
+        area_p = cv2.contourArea(ha)
+        area_v = cv2.contourArea(hb)
+        smaller = min(area_p, area_v)
+        if smaller <= 1e-6:
+            return 0.0
+        inter, _ = cv2.intersectConvexConvex(ha, hb)
+        return float(inter) / smaller
+
+    final_vehicles = [d for d in merged if d.cls == 2]
+    if final_vehicles and H is not None:
+        veh_grounds = [d.ground_bev for d in final_vehicles
+                       if hasattr(d, 'ground_bev') and d.ground_bev.shape == (4, 2)]
+        veh_boxes = [d.xyxy for d in final_vehicles if d.xyxy is not None]
+
+        survivors = []
+        for d in merged:
+            if d.cls != 0:
+                survivors.append(d)
+                continue
+
+            suppressed = False
+
+            # --- case A: pedone con ground vs veicolo con ground (BEV) ---
+            # Usiamo solo overlap frazione alto (>= 0.5): indica che il pedone
+            # e' quasi interamente dentro il veicolo (falso positivo). Il criterio
+            # "centroide dentro footprint" e' troppo aggressivo e colpirebbe
+            # pedoni veri a lato del veicolo (il footprint BEV del veicolo e'
+            # ampio e copre chi gli sta accanto).
+            if (hasattr(d, 'ground_bev') and d.ground_bev.shape == (4, 2) and veh_grounds):
+                for vg in veh_grounds:
+                    if _ofpv(d.ground_bev, vg) >= 0.5:
+                        suppressed = True
+                        break
+
+            # --- case B: pedone con 2D box vs veicolo con 2D box ---
+            if not suppressed and veh_boxes and d.xyxy is not None:
+                x1, y1, x2, y2 = d.xyxy
+                area_p = max((x2 - x1) * (y2 - y1), 1e-6)
+                for vb in veh_boxes:
+                    ix = max(0.0, min(x2, vb[2]) - max(x1, vb[0]))
+                    iy = max(0.0, min(y2, vb[3]) - max(y1, vb[1]))
+                    area_v = max((vb[2] - vb[0]) * (vb[3] - vb[1]), 1e-6)
+                    if (ix * iy) / min(area_p, area_v) >= 0.05:
+                        suppressed = True
+                        break
+
+            # --- case C: pedone senza ground (2D box) vs veicolo con ground BEV ---
+            if not suppressed and veh_grounds and d.xyxy is not None:
+                if not hasattr(d, 'ground_bev') or d.ground_bev.shape != (4, 2):
+                    x1, y1, x2, y2 = d.xyxy
+                    cx = (x1 + x2) * 0.5
+                    cy_bottom = float(y2)
+                    center_pt = np.array([[cx, cy_bottom]], dtype=np.float64)
+                    try:
+                        center_bev = apply_homography(center_pt, H)
+                        if np.all(np.isfinite(center_bev)):
+                            pt = tuple(center_bev[0].astype(np.float32))
+                            for vg in veh_grounds:
+                                if cv2.pointPolygonTest(
+                                        vg.astype(np.float32).reshape(-1, 1, 2), pt, False) >= 0:
+                                    suppressed = True
+                                    break
+                    except Exception:
+                        pass
+
+            if not suppressed:
+                survivors.append(d)
+
+        merged = survivors
 
     return merged
 
