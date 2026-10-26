@@ -73,7 +73,7 @@ from uod.textdraw import UILayer  # noqa: E402
 from uod.tracking import _iou_matrix  # noqa: E402
 from uod.classes import to_unified, is_vehicle
 import refine_v2  # noqa: E402
-from uod.viz import (draw_cuboid, draw_dashed_polyline, draw_ground_quad)  # noqa: E402
+from uod.viz import draw_cuboid, draw_dashed_polyline  # noqa: E402
 from homography_rt import apply_homography  # noqa: E402
 import threading
 from uod.bev_ocsort import BEVObservation, BEVOCSortTracker, FixedLagBuffer
@@ -183,7 +183,8 @@ def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray
 
 
 def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
-                         vehicle_tracks: Optional[List] = None) -> List[Detection]:
+                         vehicle_tracks: Optional[List] = None,
+                         bev_unit: Optional[float] = None) -> List[Detection]:
     """Deduplicate detections by unified class using mean keypoint visibility as quality.
 
     1. Separate detections with ground (high quality) and without ground
@@ -200,6 +201,8 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
         vehicle_tracks: Optional list of active vehicle tracks from the tracker.
                         Each track should have: id, cls (should be 2 for vehicle),
                         box_xyxy, time_since_update, and optionally ground/pos attributes.
+        bev_unit: BEV unit scale (meters per pixel). If provided, ground_bev is
+                  normalized by dividing by bev_unit so footprints are in BEU.
     """
     if len(dets) <= 1 and not vehicle_tracks:
         return dets
@@ -221,7 +224,10 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                     return g
             grounds_bev = np.stack([_to_bev(d.ground) for d in with_ground])
             for d, g_bev in zip(with_ground, grounds_bev):
-                d.ground_bev = g_bev
+                if bev_unit is not None and bev_unit > 1e-9:
+                    d.ground_bev = g_bev / bev_unit
+                else:
+                    d.ground_bev = g_bev
         else:
             for d in with_ground:
                 d.ground_bev = d.ground.copy()
@@ -396,6 +402,22 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
     # This handles the case where a vehicle was tracked in previous frames
     # but the current frame only detects keypoints for a "person" (model flicker).
     if without_ground:
+        # Ensure without_ground detections that DO have a ground quad get
+        # ground_bev (normalized by bev_unit) so they participate in BEV
+        # suppression and rendering instead of being silently dropped.
+        if H is not None:
+            for d in without_ground:
+                if d.ground.shape == (4, 2):
+                    try:
+                        g_bev = apply_homography(d.ground, H)
+                        if np.all(np.isfinite(g_bev)):
+                            if bev_unit is not None and bev_unit > 1e-9:
+                                d.ground_bev = g_bev / bev_unit
+                            else:
+                                d.ground_bev = g_bev
+                    except Exception:
+                        pass
+
         # FIX: Include vehicles from BOTH merged (with ground) AND without_ground (no ground)
         # This handles the case where a vehicle has unreliable keypoints (kp_ok=False)
         # and doesn't have ground, so it's in without_ground, not merged
@@ -938,7 +960,9 @@ def _suppress_nested(dets, thresh, ground_idx):
             ih = max(0.0, min(ay2, by2) - max(ay1, by1))
             if iw * ih / area_a < thresh:
                 continue
-            if a.kpts.shape[0] < 8 or b.kpts.shape[0] < 8:
+            if (not getattr(a, "geom_ok", False)
+                    or not getattr(b, "geom_ok", False)
+                    or a.kpts.shape[0] < 8 or b.kpts.shape[0] < 8):
                 continue                       # no cuboids to compare: keep both
             if _ground_overlap(a.kpts[gi], b.kpts[gi]) < 0.3:
                 continue                       # nested in the image, elsewhere on the ground
@@ -952,7 +976,9 @@ class V2Pipeline(rt.RealtimePipeline):
 
     CONFIG: dict = dict(kp_vis=0.5, class_conf={}, bev_canvas=None, suppress_nested=0.85,
                         layout="side", caption="", label_min_h=26.0, src_fps=30.0,
-                        title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11)
+                        title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11,
+                        track_high_conf=None, track_ocm_weight=0.25,
+                        bev_unit=None)
 
     def __init__(self, pose_model, aux_model=None, **kw):
         cfg = dict(V2Pipeline.CONFIG)
@@ -970,6 +996,14 @@ class V2Pipeline(rt.RealtimePipeline):
         self.title = tuple(cfg.get("title", (0.0, 0.0, 0.0, 0.0)))
         self.total_frames = int(cfg.get("total_frames", 0))
 
+        configured_bev_unit = cfg.get("bev_unit")
+        if configured_bev_unit is not None:
+            configured_bev_unit = float(configured_bev_unit)
+            if not np.isfinite(configured_bev_unit) or configured_bev_unit <= 1e-9:
+                raise ValueError("--bev-unit deve essere un numero finito maggiore di zero")
+            self._bev_unit_locked = configured_bev_unit
+        self.show_bev_ids = bool(cfg.get("show_bev_ids", False))
+
         # Carica l'omografia statica calibrata
         try:
             self.static_H = np.load("homography_bangkok.npy").astype(np.float64)
@@ -981,9 +1015,17 @@ class V2Pipeline(rt.RealtimePipeline):
         # Inizializza il tracker OC-SORT in BEV e il Buffer Circolare Fixed-Lag
         min_hits = int((kw.get("tracker_kwargs") or {}).get("min_hits", 3))
         max_age = int((kw.get("tracker_kwargs") or {}).get("max_age", 25))
+        configured_high = cfg.get("track_high_conf")
+        track_high = (
+            max(self.kp_conf, 0.35)
+            if configured_high is None
+            else max(self.kp_conf, float(configured_high))
+        )
         self.bev_tracker = BEVOCSortTracker(
             fps=self.src_fps, max_age=max_age, min_hits=min_hits,
-            high_conf=max(self.kp_conf, 0.35))
+            high_conf=track_high,
+            ocm_weight=float(cfg.get("track_ocm_weight", 0.25)),
+        )
         self.lag_buffer = FixedLagBuffer(
             window=int(cfg.get("smooth_win", 11) or 11),
             poly=2, fps=self.src_fps, min_hits=min_hits)
@@ -1001,6 +1043,8 @@ class V2Pipeline(rt.RealtimePipeline):
         corners produce a ground quad, so the homography solver never sees a
         degenerate footprint.
         """
+        img_h, img_w = frame.shape[:2]
+        border_margin = max(15.0, 0.01 * float(np.hypot(img_w, img_h)))
         res = self.pose_model.predict(frame, imgsz=self.kp_imgsz,
                                       conf=self.kp_conf, device=self.device,
                                       verbose=False)[0]
@@ -1018,24 +1062,83 @@ class V2Pipeline(rt.RealtimePipeline):
 
         pose: List[Detection] = []
         trusted_kp = []
+        gi = self.resolver.indices(8) or [0, 1, 2, 3]
         for i in range(len(xyxy)):
             c = int(cls[i])
             if c not in POSE_CATEGORY_V2:
                 continue                                   # not a road user
-            if conf[i] < self.class_conf.get(c, 0.0):
+            c_min_high = self.class_conf.get(c, 0.0)
+            c_min_low = max(self.kp_conf, min(0.20, 0.5 * c_min_high) if c_min_high > 0 else self.kp_conf)
+            if conf[i] < c_min_low:
                 continue
             kp = np.zeros((0, 2))
             ok = False
+            geom_ok = False
+            x1, y1, x2, y2 = xyxy[i]
+            bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
+            touches_border = bool(
+                x1 <= border_margin or y1 <= border_margin
+                or x2 >= img_w - border_margin
+                or y2 >= img_h - border_margin
+            )
             if kd is not None and kd.shape[1] >= 8:
                 xy = kd[i, :, :2]
                 vis = kd[i, :, 2] if kd.shape[2] >= 3 else np.ones(kd.shape[1])
-                x1, y1, x2, y2 = xyxy[i]
-                bw, bh = max(x2 - x1, 1.0), max(y2 - y1, 1.0)
                 inside = ((xy[:, 0] >= x1 - 0.75 * bw) & (xy[:, 0] <= x2 + 0.75 * bw)
                           & (xy[:, 1] >= y1 - 0.75 * bh) & (xy[:, 1] <= y2 + 0.75 * bh))
                 nonzero = (np.abs(xy).sum(axis=1) > 1e-6)
-                ok = bool(np.isfinite(xy).all() and (vis.min() >= self.kp_vis)
-                          and inside.all() and nonzero.all())
+                vis_g = vis[list(gi)] if len(vis) >= max(gi) + 1 else vis
+                # Tollerante a 1 vertice del tetto leggermente meno visibile sui motorini
+                # purché la media sia >= kp_vis e i 4 vertici a terra siano solidi
+                vis_ok = bool(
+                    (vis.min() >= self.kp_vis)
+                    or (vis.mean() >= self.kp_vis and vis_g.min() >= self.kp_vis * 0.85
+                        and vis.min() >= max(0.35, self.kp_vis - 0.25))
+                )
+                ok = bool(np.isfinite(xy).all() and vis_ok and inside.all() and nonzero.all())
+                # Test di convessità: una footprint che si interseca non è
+                # affidabile per la BEV, ma i keypoint grezzi restano disponibili
+                # per disegnare cuboide e punti sulla vista prospettica.
+                if ok and c != 0 and len(gi) >= 4:
+                    raw_g = xy[list(gi)]
+                    c_prods = []
+                    for j in range(4):
+                        dx1 = raw_g[(j+1)%4, 0] - raw_g[j, 0]
+                        dy1 = raw_g[(j+1)%4, 1] - raw_g[j, 1]
+                        dx2 = raw_g[(j+2)%4, 0] - raw_g[(j+1)%4, 0]
+                        dy2 = raw_g[(j+2)%4, 1] - raw_g[(j+1)%4, 1]
+                        c_prods.append(dx1 * dy2 - dy1 * dx2)
+                    pos = sum(cp > 0.1 for cp in c_prods)
+                    neg = sum(cp < -0.1 for cp in c_prods)
+                    if pos > 0 and neg > 0:
+                        ok = False  # Il poligono è concavo o auto-intersecante!
+                    else:
+                        # Un quad quasi collassato può essere convesso e avere
+                        # keypoint visibili, ma non descrive una footprint utile.
+                        ground_area = abs(float(cv2.contourArea(
+                            raw_g.astype(np.float32).reshape(-1, 1, 2))))
+                        geom_ok = ground_area >= max(16.0, 0.003 * bw * bh)
+
+                # Il detector può estrapolare vertici oltre il frame quando
+                # l'oggetto è tagliato. Non usiamo quei punti per inizializzare
+                # o aggiornare la forma rigida della footprint BEV; i keypoint
+                # restano invece disponibili per il cuboide grezzo in prospettiva.
+                in_frame = bool(
+                    (xy[:, 0] >= 0.0).all() and (xy[:, 0] <= img_w - 1.0).all()
+                    and (xy[:, 1] >= 0.0).all() and (xy[:, 1] <= img_h - 1.0).all()
+                )
+                kp_lo, kp_hi = xy.min(axis=0), xy.max(axis=0)
+                kp_area = max(float(kp_hi[0] - kp_lo[0]), 0.0) * max(
+                    float(kp_hi[1] - kp_lo[1]), 0.0)
+                extent_ratio = kp_area / max(bw * bh, 1.0)
+                box_center = np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5])
+                kp_center = 0.5 * (kp_lo + kp_hi)
+                center_offset = float(np.linalg.norm(kp_center - box_center))
+                box_diag = max(float(np.hypot(bw, bh)), 1.0)
+                extent_ok = bool(0.12 <= extent_ratio <= 2.5
+                                 and center_offset <= 0.5 * box_diag)
+                geom_ok = bool(ok and geom_ok and in_frame and not touches_border)
+                geom_ok = bool(geom_ok and extent_ok)
                 kp = xy.copy()
             det = Detection(
                 cls=to_unified(c),   # unified class (0=pedestrian, 2=vehicle):
@@ -1049,25 +1152,51 @@ class V2Pipeline(rt.RealtimePipeline):
                 source_cls=c,
             )
             det.kp_ok = ok
-            # Store mean keypoint visibility for quality comparison
+            det.geom_ok = geom_ok
+            det.border_truncated = touches_border
+            det.high_conf_ok = bool(conf[i] >= c_min_high)
             if kd is not None and kd.shape[2] >= 3:
                 det.mean_kp_vis = float(vis.mean())
             else:
                 det.mean_kp_vis = float(conf[i])
             pose.append(det)
-            if ok:
+            if geom_ok and c != 0:
                 trusted_kp.append(kp)
 
-        # Assign ground footprint BEFORE deduplication (needs ground for IoU)
-        # Only for detections with trusted keypoints (kp_ok=True)
-        gi = self.resolver.indices(8)
-        # Fallback: if resolver not locked, use default ground indices (0-3 for released models)
-        if gi is None:
-            gi = [0, 1, 2, 3]
-        if gi:
-            for d in pose:
-                if d.kp_ok and d.kpts.shape[0] >= max(gi) + 1:
-                    d.ground = d.kpts[list(gi)].copy()
+        # Assegna ground footprint PRIMA della deduplicazione:
+        # - Per i pedoni (cls == 0): usa SEMPRE un quad sintetico ancorato al bottom-center 2D
+        #   (ignora i keypoint 3D ruotati che causavano soppressioni spurie in _deduplicate_unified).
+        # - Per i veicoli (cls == 2): usa i 4 keypoint a terra se kp_ok == True.
+        for d in pose:
+            if d.cls == 0:
+                x1, y1, x2, y2 = d.xyxy
+                cx = (x1 + x2) * 0.5
+                cy = float(y2)
+                hw = max((x2 - x1) * 0.35, 2.0)
+                hh = max((x2 - x1) * 0.18, 1.5)
+                d.ground = np.array([
+                    [cx - hw, cy - hh],
+                    [cx + hw, cy - hh],
+                    [cx + hw, cy + hh],
+                    [cx - hw, cy + hh],
+                ], dtype=np.float64)
+            elif d.geom_ok and d.kpts.shape[0] >= max(gi) + 1:
+                d.ground = d.kpts[list(gi)].copy()
+            elif d.cls == 2 and d.xyxy is not None:
+                # Fallback: ground sintetico da box 2D per veicoli senza keypoint
+                # affidabili (geom_ok=False). Senza questo il veicolo finisce in
+                # without_ground, perde ground_bev e non viene mai visualizzato in BEV.
+                x1, y1, x2, y2 = d.xyxy
+                cx = (x1 + x2) * 0.5
+                cy = float(y2)
+                hw = max((x2 - x1) * 0.4, 2.0)
+                hh = max((x2 - x1) * 0.25, 1.5)
+                d.ground = np.array([
+                    [cx - hw, cy - hh],
+                    [cx + hw, cy - hh],
+                    [cx + hw, cy + hh],
+                    [cx - hw, cy + hh],
+                ], dtype=np.float64)
 
         # Deduplicate by unified class using ground footprint IoU (in BEV space)
         # Pass vehicle tracks from previous frame to enable "promotion" logic
@@ -1075,12 +1204,13 @@ class V2Pipeline(rt.RealtimePipeline):
         previous_vehicle_tracks = [t for t in self._tracker_map.values() 
                                    if hasattr(t, 'cls') and t.cls == 2] if self._tracker_map else []
         pose = _deduplicate_unified(pose, H=getattr(self, 'static_H', None), 
-                                     vehicle_tracks=previous_vehicle_tracks)
+                                     vehicle_tracks=previous_vehicle_tracks,
+                                     bev_unit=self._bev_unit_locked)
         
         if self.suppress_nested > 0:
             gi0 = self.resolver.indices(8) or [0, 1, 2, 3]
             pose = _suppress_nested(pose, self.suppress_nested, gi0)
-            trusted_kp = [d.kpts for d in pose if d.kp_ok]
+            trusted_kp = [d.kpts for d in pose if d.geom_ok]
         if trusted_kp:
             self.resolver.observe(np.stack(trusted_kp))
         self._last_pose_dets = pose
@@ -1265,10 +1395,11 @@ class V2Pipeline(rt.RealtimePipeline):
         gi = self.resolver.indices(8) or [0, 1, 2, 3]
 
         # 1. Aggiorna la scala di riferimento bev_unit nella gauge di static_H
-        for d in dets:
-            if d.cls != 0 and d.kp_ok and d.ground.shape == (4, 2):
-                self._quad_buffer.append(d.ground)
-                self._cls_buffer.append(d.cls)
+        if self._bev_unit_locked is None:    
+            for d in dets:
+                if d.cls != 0 and d.geom_ok and d.ground.shape == (4, 2):
+                    self._quad_buffer.append(d.ground)
+                    self._cls_buffer.append(d.cls)
 
         if self._bev_unit_locked is not None:
             bev_unit = self._bev_unit_locked
@@ -1284,6 +1415,13 @@ class V2Pipeline(rt.RealtimePipeline):
         # 2. Costruisci le osservazioni filtrate e proiettale subito in BEV
         bev_obs_list: List[BEVObservation] = []
         for d in dets:
+            # Se la detection è sotto --class-conf ma sopra c_min_low, limita eff_conf
+            # sotto high_conf così viene usata solo nello Stage 2 (recupero tracce esistenti)
+            eff_conf = (
+                float(d.conf)
+                if getattr(d, "high_conf_ok", True)
+                else min(float(d.conf), self.bev_tracker.high_conf - 1e-4)
+            )
             is_promoted = getattr(d, 'promoted_from_track', False)  # detection promossa da pedone a veicolo
             
             if d.cls == 0:
@@ -1304,7 +1442,8 @@ class V2Pipeline(rt.RealtimePipeline):
                 q_raw = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64) + cP
 
                 bev_obs_list.append(BEVObservation(
-                    cls=0, source_cls=int(d.source_cls if d.source_cls is not None else 0), conf=d.conf, box_xyxy=d.xyxy.copy(),
+                    cls=0, source_cls=int(d.source_cls if d.source_cls is not None else 0), conf=eff_conf, box_xyxy=d.xyxy.copy(),
+                    box_bottom_bev=cP.copy(),
                     kpts=d.kpts.copy(), ground=d.ground.copy(), kp_ok=True,
                     bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale,
                     ground_indices=list(gi)))
@@ -1340,21 +1479,61 @@ class V2Pipeline(rt.RealtimePipeline):
                         bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale,
                         ground_indices=list(gi)))
                     continue
+                x1, y1, x2, y2 = d.xyxy
+                bc_s = apply_homography(
+                    np.array([[(x1 + x2) * 0.5, float(y2)]], dtype=np.float64), H_mat
+                )
+                if not np.all(np.isfinite(bc_s)):
+                    continue
+                box_bottom_bev = bc_s[0] / bev_unit
+
                 raw_ground = d.kpts[list(gi)].copy() #rimosso l'ordinamento per angolo
 
-                P_bev = apply_homography(raw_ground, H_mat)
-                if not np.all(np.isfinite(P_bev)):
-                    continue
-                Pn = P_bev / bev_unit
-                cP = Pn.mean(axis=0)
-                _dv1, _dv2 = Pn[2] - Pn[0], Pn[3] - Pn[1]
-                obs_scale = float(np.sqrt(abs(_dv1[0] * _dv2[1] - _dv1[1] * _dv2[0]) * 0.5))
+                use_3d = False
+                if d.geom_ok and d.kpts.shape[0] >= 8:
+                    raw_ground = d.kpts[list(gi)].copy()
+                    P_bev = apply_homography(raw_ground, H_mat)
+                    if np.all(np.isfinite(P_bev)):
+                        Pn = P_bev / bev_unit
+                        cP = Pn.mean(axis=0)
+                        _dv1, _dv2 = Pn[2] - Pn[0], Pn[3] - Pn[1]
+                        obs_scale = float(np.sqrt(abs(_dv1[0] * _dv2[1] - _dv1[1] * _dv2[0]) * 0.5))
+                        # Rifiuta le proiezioni che esplodono per stiramento vicino all'orizzonte
+                        if 0.15 <= obs_scale <= 4.5:
+                            use_3d = True
 
-                bev_obs_list.append(BEVObservation(
-                    cls=int(d.cls), source_cls=int(d.source_cls if d.source_cls is not None else d.cls), conf=d.conf, box_xyxy=d.xyxy.copy(),
-                    kpts=d.kpts.copy(), ground=raw_ground, kp_ok=True,
-                    bev_center=cP, bev_quad_raw=Pn, obs_scale=obs_scale,
-                    ground_indices=list(gi)))
+                if use_3d:
+                    bev_obs_list.append(BEVObservation(
+                        cls=int(d.cls),
+                        source_cls=int(d.source_cls) if d.source_cls is not None else -1,
+                        conf=eff_conf,
+                        box_xyxy=d.xyxy.copy(),
+                        kpts=d.kpts.copy(),
+                        ground=raw_ground,
+                        kp_ok=True,
+                        bev_center=cP,
+                        bev_quad_raw=Pn,
+                        obs_scale=obs_scale,
+                        box_bottom_bev=box_bottom_bev,
+                        shape_ok=True,
+                        border_truncated=False,
+                    ))
+                else:
+                    bev_obs_list.append(BEVObservation(
+                        cls=int(d.cls),
+                        source_cls=int(d.source_cls) if d.source_cls is not None else -1,
+                        conf=eff_conf,
+                        box_xyxy=d.xyxy.copy(),
+                        kpts=d.kpts.copy(),
+                        ground=d.ground.copy(),
+                        kp_ok=bool(d.kp_ok),
+                        bev_center=box_bottom_bev,
+                        bev_quad_raw=np.zeros((0, 2), dtype=np.float64),
+                        obs_scale=0.0,
+                        box_bottom_bev=box_bottom_bev,
+                        shape_ok=False,
+                        border_truncated=bool(getattr(d, "border_truncated", False)),
+                    ))
 
         # 3. Aggiorna OC-SORT direttamente in BEV
         active_tracks = self.bev_tracker.update(bev_obs_list, self.frame_idx, img_wh)
@@ -1364,10 +1543,12 @@ class V2Pipeline(rt.RealtimePipeline):
         # 4. Crea lo snapshot _TrackView per il FixedLagBuffer
         views = []
         for t in active_tracks:
+            bev_visible = bool(getattr(t, "bev_visible", True))
             v = rt._TrackView(
                 id=t.id, cls=t.cls, kpts=t.kpts.copy(), ground=t.ground.copy(),
                 box_xyxy=t.box_xyxy.copy(), time_since_update=t.time_since_update,
-                bev_quad=t.get_bev_footprint(bev_unit))
+                bev_quad=(t.get_bev_footprint(bev_unit) if bev_visible else None))
+            v.bev_visible = bev_visible
             v.bev_pos = (t.ped_center_ema.copy() if t.cls == 0 else t.pos.copy())
             v.bev_vel = t.vel.copy()
             v.hits = t.hits
@@ -1427,9 +1608,7 @@ class V2Pipeline(rt.RealtimePipeline):
             col = style.instance_color(t.cls, t.id, source="pose")
             coasting = t.time_since_update > 0
             if self.show_3d and t.kpts.shape[0] >= 8:
-                draw_cuboid(src, t.kpts, gi, col, dim=coasting)
-            elif t.ground.shape == (4, 2):
-                draw_ground_quad(src, t.ground, col, thickness=2)
+                draw_cuboid(src, t.kpts, gi, col, dim=coasting, fill=False)
             x1, y1 = t.box_xyxy[0], t.box_xyxy[1]
             bh = float(t.box_xyxy[3] - t.box_xyxy[1])
             src_labels.append((x1, y1, t.cls, t.id, coasting, bh))
@@ -1630,6 +1809,13 @@ class V2Pipeline(rt.RealtimePipeline):
         ui.text(bev_x + 22, Hc - 20, "Bird's-eye view", size=14,
                 color=T["faint_text"], anchor="ld", shadow=False)
         self._track_chips(ui, src_labels, head + 18)
+        if self.show_bev_ids:
+            for (cx, cy, tid) in bev_labels:
+                ui.chip(bev_x + cx, cy, str(tid),
+                    size=30,
+                    fg=(255, 255, 255),
+                    bg=(20, 20, 20),
+                    alpha=0.92)
 
     def _ui_dashboard(self, ui, canvas, state, present, src_labels, bev_labels,
                       bev_x, src_wh):
@@ -1685,6 +1871,13 @@ class V2Pipeline(rt.RealtimePipeline):
         ui.text(bev_x + 22, Hc - 20, "Bird's-eye view", size=14,
                 color=T["faint_text"], anchor="ld", shadow=False, alpha=o)
         self._track_chips(ui, src_labels, 18, opacity=o)
+        if self.show_bev_ids:
+            for (cx, cy, tid) in bev_labels:
+                ui.chip(bev_x + cx, cy, str(tid),
+                    size=30,
+                    fg=(255, 255, 255),
+                    bg=(20, 20, 20),
+                    alpha=0.92)
 
 
 # --------------------------------------------------------------------------- #
@@ -2022,6 +2215,13 @@ def _stabilize_offline_v2(pipe, states, fixed, traj_C, traj_steps, args):
                     v.bev_quad = apply_homography(v.ground, H_mat)
                 except Exception:
                     pass
+    # The offline geometry passes above can rebuild a footprint from ground
+    # keypoints. Reapply the per-frame exit gate after all reconstruction so an
+    # outgoing vehicle stays hidden in BEV even while its camera cuboid remains.
+    for s in states:
+        for v in s.tracks:
+            if not getattr(v, "bev_visible", True):
+                v.bev_quad = None
     if POST["bev_fit"] and states:
         _bev_fit(pipe, states, POST["fit_max_px"], POST["fit_min_px"], POST["fit_pct"])
     if states:
@@ -2117,6 +2317,19 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="append '?' to the label of a coasting track (v1 look)")
     p.add_argument("--source-type", choices=["auto", "video", "stream"], default="auto",
                    help="'video' per file .mp4 sequenziali; 'stream' per telecamere live RTSP/USB")
+    p.add_argument("--track-high-conf", type=float, default=None,
+                   help="confidenza minima per avviare una nuova traccia; "
+                   "default max(--kp-conf, 0.35)",
+    )
+    p.add_argument("--track-ocm-weight", type=float, default=0.25,
+                   help="peso della direzione di moto; valori >=1 rifiutano anche "
+                   "associazioni chiaramente controcorrente",
+    )
+    p.add_argument("--bev-unit", type=float, default=None,
+                   help="bev_unit calibrato per la telecamera; evita la stima iniziale",
+    )
+    p.add_argument("--show-bev-ids", action="store_true",
+                   help="mostra gli ID delle tracce al centro delle footprint BEV")
     return p
 
 

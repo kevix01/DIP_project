@@ -45,6 +45,37 @@ def _vehicle_family(unified_cls: int, source_cls: int) -> int:
     return unified_cls
 
 # --------------------------------------------------------------------------- #
+# Funzione per controllare se un BB2D di un veicolo tocca il bordo del frame
+# --------------------------------------------------------------------------- #
+def _is_touching_border(box_xyxy: np.ndarray, img_wh: tuple, margin: float = 15.0) -> bool:
+    """Restituisce True se il box 2D tocca uno dei bordi del frame."""
+    if box_xyxy is None or len(box_xyxy) < 4 or img_wh is None:
+        return False
+    W, H = float(img_wh[0]), float(img_wh[1])
+    margin = max(float(margin), 0.01 * float(np.hypot(W, H)))
+    x1, y1, x2, y2 = float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3])
+    return (x1 <= margin) or (y1 <= margin) or (x2 >= W - margin) or (y2 >= H - margin)
+
+
+def _is_exiting_frame(box_xyxy: np.ndarray, vel_2d: np.ndarray,
+                      img_wh: Optional[Tuple[int, int]]) -> bool:
+    """True only when a box is at an image edge and moving out through it."""
+    if box_xyxy is None or vel_2d is None or img_wh is None:
+        return False
+    W, H = float(img_wh[0]), float(img_wh[1])
+    if W <= 0.0 or H <= 0.0:
+        return False
+    margin = max(2.0, 0.003 * float(np.hypot(W, H)))
+    x1, y1, x2, y2 = map(float, box_xyxy[:4])
+    vx, vy = map(float, vel_2d[:2])
+    return bool(
+        (x1 <= margin and vx < -0.5)
+        or (x2 >= W - margin and vx > 0.5)
+        or (y1 <= margin and vy < -0.5)
+        or (y2 >= H - margin and vy > 0.5)
+    )
+
+# --------------------------------------------------------------------------- #
 # Precomputed O(1) Savitzky-Golay Filter (Position + Analytical Velocity)
 # --------------------------------------------------------------------------- #
 
@@ -105,6 +136,8 @@ class BEVObservation:
     obs_scale: float            # observed scale in bev_unit
     ground_indices: Optional[List[int]] = None   # which 4 of the 8 kpts are ground
     box_bottom_bev: Optional[np.ndarray] = None  # (2,) bottom-center 2D projected in bev_unit
+    shape_ok: bool = True                        # safe to learn/show the rigid BEV footprint
+    border_truncated: bool = False               # box touches the image boundary
 
 
 # --------------------------------------------------------------------------- #
@@ -116,7 +149,7 @@ class BEVKalmanTrack:
     _next_id = 1
 
     def __init__(self, obs: BEVObservation, frame_idx: int, dt: float,
-                 lock_after_veh: int = 20, lock_after_ped: int = 12):
+                 lock_after_veh: int = 20, lock_after_ped: int = 12, img_wh: Optional[Tuple[int, int]] = None):
         self.id = BEVKalmanTrack._next_id
         BEVKalmanTrack._next_id += 1
         self.cls = int(obs.cls)
@@ -169,6 +202,8 @@ class BEVKalmanTrack:
         self.kpts = obs.kpts.copy()
         self.ground = obs.ground.copy()
         self.kp_ok = bool(obs.kp_ok)
+        self.shape_valid = bool(obs.shape_ok)
+        self.bev_visible = bool(self.cls == 0 or self.shape_valid)
         self.ground_indices = (list(obs.ground_indices)
                                if obs.ground_indices is not None else [0, 1, 2, 3])
 
@@ -188,7 +223,8 @@ class BEVKalmanTrack:
         self.ped_center_ema = obs.bev_center.copy()
 
         # Vehicle rigid shape S (4, 2) centered in bev_unit
-        if obs.bev_quad_raw is not None and obs.bev_quad_raw.shape == (4, 2):
+        if (self.shape_valid and obs.bev_quad_raw is not None
+                and obs.bev_quad_raw.shape == (4, 2)):
             Q0 = obs.bev_quad_raw - obs.bev_quad_raw.mean(axis=0)
             self.veh_S = self._rect_shape(Q0)
             self.veh_heading = self._estimate_kabsch_angle(Q0, self.veh_S)
@@ -200,6 +236,12 @@ class BEVKalmanTrack:
         self.veh_W = 1.0
         self.veh_locked = False
         self.veh_rms: deque = deque(maxlen=30)
+
+        # Stato di troncamento al bordo per consentire l'espansione del box 3D in ingresso
+        self.img_wh = img_wh
+        self.touching_border = _is_touching_border(obs.box_xyxy, img_wh)
+        self.border_truncated = bool(self.touching_border or obs.border_truncated)
+        self.full_view_hits = 0
 
         # Per i pedoni costruisci subito alla nascita il cuboide 3D sintetico non ruotato
         if self.cls == 0:
@@ -235,6 +277,14 @@ class BEVKalmanTrack:
         if self.time_since_update > 1:
             self.vel *= 0.85  # prevent runaway drift during occlusion
         self._kf_predict_step()
+        if self.cls != 0:
+            shift = self.vel_2d * float(self.time_since_update)
+            predicted_box = self.box_xyxy + np.array(
+                [shift[0], shift[1], shift[0], shift[1]], dtype=np.float64)
+            self.bev_visible = bool(
+                self.shape_valid
+                and not _is_exiting_frame(predicted_box, self.vel_2d, self.img_wh)
+            )
         return self.pos
 
     def ocm_direction(self, dt_frames: int = 3) -> Optional[np.ndarray]:
@@ -260,10 +310,25 @@ class BEVKalmanTrack:
         cur_bb = obs.box_bottom_bev if obs.box_bottom_bev is not None else obs.bev_center
         delta_bev = cur_bb - self.last_box_bottom_bev
 
+        self.touching_border = _is_touching_border(obs.box_xyxy, self.img_wh)
+        if self.touching_border:
+            self.border_truncated = True
+            self.full_view_hits = 0
+
         # Rileva se un veicolo/motorino ha subito una rotazione/distorsione anomala del BB 3D
         # rispetto al movimento fluido del suo box 2D:
-        use_3d_kpts = bool(obs.kp_ok and obs.kpts.shape[0] >= 8 and obs.bev_quad_raw.shape == (4, 2))
-        if self.cls != 0 and use_3d_kpts and self.hits >= 2:
+        use_3d_kpts = bool(obs.shape_ok and obs.kp_ok and obs.kpts.shape[0] >= 8
+                           and obs.bev_quad_raw.shape == (4, 2))
+        self._expanding_from_border = False
+        if self.cls != 0 and use_3d_kpts: # se l'auto si sta espandendo, sblocchiamo l'anti-jitter
+            s_trk = max(float(self.veh_scale), 1e-6)
+            s_obs = max(float(obs.obs_scale), 1e-6)
+            if not self.shape_valid:
+                self._expanding_from_border = True
+            elif self.border_truncated and s_obs > s_trk * 1.08 and (s_obs / s_trk) <= 3.5:
+                self._expanding_from_border = True
+
+        if self.cls != 0 and use_3d_kpts and self.hits >= 2 and not self._expanding_from_border:
             jump_3d_vs_2d = float(np.linalg.norm((obs.bev_center - self.last_obs_pos) - delta_bev))
             s_trk = max(float(self.veh_scale), 1e-6)
             s_obs = max(float(obs.obs_scale), 1e-6)
@@ -276,11 +341,14 @@ class BEVKalmanTrack:
         if self.cls != 0 and not use_3d_kpts:
             eff_center = self.last_obs_pos + delta_bev
         elif self.cls == 0 and self.hits >= 2:
-            # Sui pedoni, smussa i micro-salti prospettici del bottom-center causati dal passo
+            # Limita lo spostamento a 0.14 per ogni frame trascorso.
             step_vec = obs.bev_center - self.last_obs_pos
             step_norm = float(np.linalg.norm(step_vec))
-            if step_norm > 0.14 and self.time_since_update <= 1:
-                eff_center = self.last_obs_pos + step_vec * (0.14 / step_norm)
+            gap = max(1, int(self.time_since_update))
+            max_step = 0.14 * gap
+
+            if step_norm > max_step:
+                eff_center = self.last_obs_pos + step_vec * (max_step / step_norm)
             else:
                 eff_center = obs.bev_center.copy()
         else:
@@ -347,26 +415,42 @@ class BEVKalmanTrack:
 
         # 4. Update 2D/3D visual geometry & footprint shape
         if self.cls == 0:
-            self._update_pedestrian(obs)
+            self._update_pedestrian(obs, center_bev=eff_center)
         else:
             if use_3d_kpts:
                 self._update_vehicle(obs)
             else:
-                # Mantenimento tramite Box 2D (quando kp_ok=False o quando il BB 3D ha ruotato in modo anomalo):
-                # trasla il cuboide e l'impronta a terra precedenti senza ruotarli né deformarli!
+                # La quality gate vale solo per la BEV: sulla camera mostra i
+                # keypoint correnti del detector anche quando la shape è scartata.
                 old_b = self.box_xyxy
                 new_b = obs.box_xyxy
                 dx = ((new_b[0] + new_b[2]) - (old_b[0] + old_b[2])) * 0.5
                 dy = ((new_b[1] + new_b[3]) - (old_b[1] + old_b[3])) * 0.5
                 shift_2d = np.array([dx, dy], dtype=np.float64)
-                if self.kpts.shape == (8, 2):
-                    self.kpts = self.kpts + shift_2d
-                if self.ground.shape == (4, 2):
+                if obs.kpts.shape == (8, 2):
+                    self.kpts = obs.kpts.copy()
+                    self.kp_ok = bool(obs.kp_ok)
+                else:
+                    if self.kpts.shape == (8, 2):
+                        self.kpts = self.kpts + shift_2d
+                if obs.ground.shape == (4, 2):
+                    self.ground = obs.ground.copy()
+                elif not obs.shape_ok:
+                    self.ground = np.zeros((0, 2), dtype=np.float64)
+                elif self.ground.shape == (4, 2):
                     self.ground = self.ground + shift_2d
                 self.box_xyxy = new_b.copy()
 
+        if self.cls != 0:
+            self.bev_visible = bool(
+                self.shape_valid
+                and not _is_exiting_frame(self.box_xyxy, self.vel_2d, self.img_wh)
+            )
+        else:
+            self.bev_visible = True
+
     # ------------------------------------------------------------------ #
-    def _update_pedestrian(self, obs: BEVObservation):
+    def _update_pedestrian(self, obs: BEVObservation, center_bev: Optional[np.ndarray] = None):
         # 2D Box EMA anchored at bottom-center + synthetic rigid 3D cuboid
         x1, y1, x2, y2 = obs.box_xyxy
         cx = (x1 + x2) * 0.5
@@ -397,7 +481,8 @@ class BEVKalmanTrack:
 
         # Causal EMA on BEV center
         alpha_c = 0.15 if self.ped_locked else 0.4
-        self.ped_center_ema = alpha_c * obs.bev_center + (1.0 - alpha_c) * self.ped_center_ema
+        center_bev = obs.bev_center if center_bev is None else center_bev
+        self.ped_center_ema = alpha_c * center_bev + (1.0 - alpha_c) * self.ped_center_ema
 
         # Two-phase scale estimation (Burn-in 12 obs -> Smooth physical prior)
         obs_scale = obs.obs_scale
@@ -444,9 +529,13 @@ class BEVKalmanTrack:
         d_ang = float(np.arctan2(np.sin(2.0 * (best_ang - self.veh_heading)),
                                  np.cos(2.0 * (best_ang - self.veh_heading))) * 0.5)
 
+        expanding = getattr(self, "_expanding_from_border", False)
+
         # Se la rotazione in un singolo frame è estrema (> 35°) e abbiamo già storia,
         # è un glitch dei keypoint 3D (es. sul motorino): non aggiornare kpts/ground/heading!
-        if self.hits >= 3 and abs(d_ang) > np.radians(35.0):
+        # (Ignora questo blocco se il veicolo sta emergendo dal bordo, perché il cambio di aspect ratio
+        #  da "solo cofano" ad "auto intera" può ruotare l'asse maggiore di 90°).
+        if not expanding and not self.border_truncated and self.hits >= 3 and abs(d_ang) > np.radians(35.0):
             old_b = self.box_xyxy
             new_b = obs.box_xyxy
             shift_2d = np.array([
@@ -460,44 +549,64 @@ class BEVKalmanTrack:
             self.box_xyxy = new_b.copy()
             return
 
-        # Smussa l'aggiornamento dell'heading e aggiorna la geometria visiva
-        self.veh_heading = float(self.veh_heading + 0.35 * d_ang)
+        # Aggiorna la geometria visiva
         self.box_xyxy = obs.box_xyxy.copy()
         self.kpts = obs.kpts.copy()
         self.ground = obs.ground.copy()
         self.kp_ok = True
+        self.shape_valid = True
         self._bev_ground = obs.bev_quad_raw.copy()
 
         obs_scale = float(obs.obs_scale)
         old_scale = float(self.veh_scale)
-        if obs_scale > 1e-6:
-            if old_scale > 1e-6:
-                ratio = max(obs_scale / old_scale, old_scale / obs_scale)
-                if ratio <= 1.38:
-                    self.veh_scale = 0.92 * old_scale + 0.08 * obs_scale
-            else:
-                self.veh_scale = obs_scale
 
-        if not self.veh_locked:
-            _v1 = Q_aligned[2] - Q_aligned[0]
-            _v2 = Q_aligned[3] - Q_aligned[1]
-            qa = 0.5 * abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
-            med = float(np.median(self.veh_rms)) if len(self.veh_rms) >= 5 else None
-            if qa > 0.03 and (med is None or best_res <= 3.5 * med):
-                c, s = np.cos(best_ang), np.sin(best_ang)
-                R = np.array([[c, -s], [s, c]], dtype=np.float64)
-                Qc = Q_aligned @ R
-                w = self.veh_W
-                self.veh_S = self.veh_S + (Qc - self.veh_S) / (w + 1.0)
-                self.veh_S -= self.veh_S.mean(axis=0)
-                self.veh_W = w + 1.0
-                self.veh_rms.append(best_res)
-                if self.veh_W >= self.lock_after_veh:
-                    self.veh_locked = True
+        if expanding:
+            # Il veicolo sta emergendo dal bordo: sostituisci la forma monca con quella più completa!
+            self.veh_S = self._rect_shape(Q)
+            self.veh_heading = self._estimate_kabsch_angle(Q, self.veh_S)
+            self.veh_W = 1.0
+            self.veh_locked = False
+            self.veh_rms.clear()
+            self.veh_scale = obs_scale
+        else:
+            self.veh_heading = float(self.veh_heading + 0.35 * d_ang)
+            if obs_scale > 1e-6:
+                if old_scale > 1e-6:
+                    ratio = max(obs_scale / old_scale, old_scale / obs_scale)
+                    if ratio <= 1.38:
+                        alpha_s = 0.35 if self.border_truncated else 0.08
+                        self.veh_scale = (1.0 - alpha_s) * old_scale + alpha_s * obs_scale
+                else:
+                    self.veh_scale = obs_scale
+
+            if not self.veh_locked:
+                _v1 = Q_aligned[2] - Q_aligned[0]
+                _v2 = Q_aligned[3] - Q_aligned[1]
+                qa = 0.5 * abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
+                med = float(np.median(self.veh_rms)) if len(self.veh_rms) >= 5 else None
+                if qa > 0.03 and (med is None or best_res <= 3.5 * med):
+                    c, s = np.cos(best_ang), np.sin(best_ang)
+                    R = np.array([[c, -s], [s, c]], dtype=np.float64)
+                    Qc = Q_aligned @ R
+                    w = self.veh_W
+                    self.veh_S = self.veh_S + (Qc - self.veh_S) / (w + 1.0)
+                    self.veh_S -= self.veh_S.mean(axis=0)
+                    self.veh_W = w + 1.0
+                    self.veh_rms.append(best_res)
+                    if self.veh_W >= self.lock_after_veh:
+                        self.veh_locked = True
+
+        # Conta i frame completi lontano dal bordo: dopo 5 frame validi disattiva border_truncated
+        if not self.touching_border:
+            self.full_view_hits += 1
+            if self.full_view_hits >= 5:
+                self.border_truncated = False
+        else:
+            self.full_view_hits = 0
 
     # ------------------------------------------------------------------ #
     def get_bev_footprint(self, bev_unit: float, center_override: Optional[np.ndarray] = None,
-                          heading_override: Optional[float] = None) -> np.ndarray:
+                          heading_override: Optional[float] = None) -> Optional[np.ndarray]:
         """Return the posed (4, 2) footprint in H's gauge (multiplied by bev_unit)."""
         if self.cls == 0:
             c = self.ped_center_ema if center_override is None else center_override
@@ -505,6 +614,8 @@ class BEVKalmanTrack:
             S0 = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64)
             return (S0 + c) * bev_unit
         else:
+            if not self.shape_valid:
+                return None
             c = self.pos if center_override is None else center_override
             th = self.veh_heading if heading_override is None else heading_override
             cs, sn = np.cos(th), np.sin(th)
@@ -657,8 +768,18 @@ class BEVOCSortTracker:
                 iou_pred = self._box_iou_2d(pred_box_2d, o.box_xyxy)
                 iou_2d = max(iou_last, iou_pred)
 
+                # Una traccia nata al bordo senza cuboide si riaggancia con il
+                # box 2D anche quando la nuova osservazione ha già una shape 3D.
+                if t.cls != 0 and not getattr(t, "shape_valid", True):
+                    if iou_2d < 0.20:
+                        continue
+                    c2d = 0.45 * (1.0 - iou_2d) + 0.05 * (tsu - 1)
+                    total_cost[i, j] = c2d
+                    gate_cost[i, j] = c2d
+                    continue
+
                 # Gestione osservazioni veicolo con kp_ok=False (mantenimento traccia 2D anche se hits < min_hits!)
-                if t.cls != 0 and not o.kp_ok:
+                if t.cls != 0 and (not o.kp_ok or not o.shape_ok):
                     if not allow_kp_fallback or tsu > 4:
                         continue
                     if iou_2d < 0.20:
@@ -712,12 +833,20 @@ class BEVOCSortTracker:
                             continue
                     track_scale = max(float(t.veh_scale), 1e-6)
                     obs_scale = max(float(o.obs_scale), 1e-6)
-                    scale_ratio = max(obs_scale / track_scale, track_scale / obs_scale)
-                    if not has_2d_overlap:
-                        max_ratio = 1.38 if tsu > 1 else 1.60
-                        if scale_ratio > max_ratio:
+                    grow_ratio = obs_scale / track_scale
+                    shrink_ratio = track_scale / obs_scale
+                    has_shape = bool(getattr(t, "shape_valid", True))
+                    is_border_growth = (not has_shape or
+                                        (getattr(t, "border_truncated", False)
+                                         and grow_ratio > 1.0))
+                    # gli spike di scala non vengono bloccati se l'auto sta entrando dal bordo
+                    if not has_2d_overlap and has_shape:
+                        max_grow = 3.5 if is_border_growth else (1.38 if tsu > 1 else 1.60)
+                        max_shrink = 1.38 if tsu > 1 else 1.60
+                        if grow_ratio > max_grow or shrink_ratio > max_shrink:
                             continue
-                    c_base += 0.25 * min(abs(float(np.log(obs_scale / track_scale))), 1.0)
+                    if not is_border_growth:
+                        c_base += 0.25 * min(abs(float(np.log(obs_scale / track_scale))), 1.0)
 
                 # OCM + VETO CONTROCORRENTE (immune al jitter 2D/3D quando iou_2d mostra continuità)
                 ocm_full = 0.0
@@ -794,8 +923,10 @@ class BEVOCSortTracker:
         for t in self.tracks:
             t.predict()
 
-        hi_obs = [o for o in observations if o.conf >= self.high_conf and o.kp_ok]
-        lo_obs = [o for o in observations if not (o.conf >= self.high_conf and o.kp_ok)]
+        hi_obs = [o for o in observations
+                  if o.conf >= self.high_conf and o.kp_ok and o.shape_ok]
+        lo_obs = [o for o in observations
+                  if not (o.conf >= self.high_conf and o.kp_ok and o.shape_ok)]
 
         # 2. Stage 1: Associazione principale su hi_obs
         m1, un_t1, un_o1 = self._associate(self.tracks, hi_obs, img_wh, use_last_obs=False)
@@ -872,7 +1003,23 @@ class BEVOCSortTracker:
                 best_recover_t.update(obs, frame_idx)
                 continue
 
-            self.tracks.append(BEVKalmanTrack(obs, frame_idx, self.dt))
+            self.tracks.append(BEVKalmanTrack(obs, frame_idx, self.dt, img_wh=img_wh))
+
+        # Start a high-confidence 2D-only track for a clipped vehicle. Its
+        # footprint stays absent until a complete cuboid is observed.
+        for obs in lo_obs:
+            if (obs.cls == 0 or not obs.border_truncated
+                    or obs.conf < self.high_conf):
+                continue
+            duplicate = any(
+                int(t.cls) == int(obs.cls)
+                and t.time_since_update <= 4
+                and self._box_iou_2d(t.box_xyxy, obs.box_xyxy) >= 0.30
+                for t in self.tracks
+            )
+            if not duplicate:
+                self.tracks.append(BEVKalmanTrack(
+                    obs, frame_idx, self.dt, img_wh=img_wh))
 
         # 6. Prune dead or border-exited tracks
         kept = []
@@ -1025,8 +1172,11 @@ class FixedLagBuffer:
             v.bev_vel = sm_vel
             if trk_obj is not None:
                 v.cls = trk_obj.cls
-                v.bev_quad = trk_obj.get_bev_footprint(unit, center_override=sm_pos,
-                                                       heading_override=heading_override)
+                if getattr(v, "bev_visible", True):
+                    v.bev_quad = trk_obj.get_bev_footprint(
+                        unit, center_override=sm_pos, heading_override=heading_override)
+                else:
+                    v.bev_quad = None
             valid_views.append(v)
 
         target_state.tracks = valid_views
