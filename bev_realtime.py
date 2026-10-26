@@ -179,10 +179,12 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             iou_thresh = 0.3
 
             # Overlap-fraction helper: fraction of the SMALLER footprint covered
-            # by the larger one. Catches duplicates whose quads differ a lot in
-            # size (partial/large cuboid of the same vehicle): IoU = inter/union
-            # stays low and full containment may fail by a few pixels, but the
-            # smaller footprint is almost entirely swallowed by the larger one.
+            # by the larger one. This single criterion subsumes both IoU and
+            # containment: IoU >= 0.5 mathematically implies frac >= 2/3, and
+            # containment implies frac = 1. So the edge condition is just
+            # frac >= 0.65. Unlike IoU (= inter/union), the fraction stays HIGH
+            # for duplicates with very different footprint sizes (partial vs
+            # full cuboid of the same vehicle), where IoU collapses.
             def _overlap_frac(pa: np.ndarray, pb: np.ndarray) -> float:
                 ha = cv2.convexHull(pa.astype(np.float32).reshape(-1, 1, 2))
                 hb = cv2.convexHull(pb.astype(np.float32).reshape(-1, 1, 2))
@@ -194,21 +196,13 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
                 inter, _ = cv2.intersectConvexConvex(ha, hb)
                 return float(inter) / smaller
 
-            # Build overlap graph: edge if IoU >= threshold OR containment OR
-            # the smaller footprint is mostly covered by the larger one.
+            # Build overlap graph: edge iff the smaller footprint is mostly
+            # covered by the larger one (duplicate/partial cuboid of one object).
             n = len(group)
             overlap = np.zeros((n, n), dtype=bool)
             for a in range(n):
                 for b in range(a + 1, n):
-                    # Selective edges: high IoU (true duplicates), full
-                    # containment, or the smaller footprint mostly covered.
-                    # A moderate IoU alone (e.g. 0.3-0.5 for two real close
-                    # vehicles in a queue) must NOT merge them.
-                    iou_high = iou_mat[a, b] >= 0.5
-                    contains = (_polygon_contains(grounds[a], grounds[b]) or
-                               _polygon_contains(grounds[b], grounds[a]))
-                    mostly_covered = _overlap_frac(grounds[a], grounds[b]) >= 0.65
-                    if iou_high or contains or mostly_covered:
+                    if _overlap_frac(grounds[a], grounds[b]) >= 0.65:
                         overlap[a, b] = True
                         overlap[b, a] = True
 
@@ -247,14 +241,34 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
             vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
             cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
 
-            # Suppress person if any vehicle overlaps significantly
-            suppress_person = cross_iou.max(axis=1) >= 0.05
+            # Suppress person if any vehicle footprint mostly covers the
+            # pedestrian footprint in BEV. IoU = inter/union stays LOW when a
+            # small pedestrian footprint sits inside a large vehicle footprint
+            # (union dominated by the vehicle), so IoU alone misses false
+            # pedestrians that are really part of a vehicle. overlap-fraction
+            # (= inter / area_pedestrian) stays HIGH, catching these cases.
+            # IoU >= 0.05 is redundant: IoU >= 0.5 implies frac >= 2/3 > 0.65,
+            # and moderate IoU for partial overlap likely marks a real
+            # pedestrian next to the vehicle, not a false positive.
+            suppress_person = np.zeros(len(person_grounds), dtype=bool)
 
-            # Also suppress if containment (one footprint fully inside the other)
-            for p_idx, p_ground in zip(person_indices, person_grounds):
-                for v_idx, v_ground in zip(vehicle_indices, vehicle_grounds):
-                    if _polygon_contains(v_ground, p_ground) or _polygon_contains(p_ground, v_ground):
-                        suppress_person[person_indices.index(p_idx)] = True
+            def _overlap_frac_ped_veh(p_ground: np.ndarray, v_ground: np.ndarray) -> float:
+                ha = cv2.convexHull(p_ground.astype(np.float32).reshape(-1, 1, 2))
+                hb = cv2.convexHull(v_ground.astype(np.float32).reshape(-1, 1, 2))
+                area_p = cv2.contourArea(ha)
+                area_v = cv2.contourArea(hb)
+                smaller = min(area_p, area_v)
+                if smaller <= 1e-6:
+                    return 0.0
+                inter, _ = cv2.intersectConvexConvex(ha, hb)
+                return float(inter) / smaller
+
+            for p_idx, p_ground in enumerate(person_grounds):
+                if suppress_person[p_idx]:
+                    continue
+                for v_ground in vehicle_grounds:
+                    if _overlap_frac_ped_veh(p_ground, v_ground) >= 0.05:
+                        suppress_person[p_idx] = True
                         break
 
             keep = np.ones(len(merged_with_ground), dtype=bool)
@@ -265,10 +279,30 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None) 
 
         merged.extend(merged_with_ground)
 
-    # Process detections WITHOUT ground: pass through for tracker
-    # These have box 2D but no reliable keypoints/ground - tracker will use box for association
-    for d in without_ground:
-        merged.append(d)
+    # Process detections WITHOUT ground: pass through for tracker, EXCEPT
+    # pedestrian detections whose 2D box is mostly covered by a vehicle's 2D
+    # box. A vehicle mis-detected as a pedestrian usually has UNRELIABLE
+    # keypoints (kp_ok=False -> no ground), so it bypasses the BEV dedup above
+    # and survives as a ghost pedestrian on top of the vehicle. The 2D box is
+    # the only available proxy in that case: suppress the pedestrian if its
+            # box is mostly (>= 0.05) covered by a deduplicated vehicle box.
+    if without_ground:
+        veh_boxes_2d = [d.xyxy for d in merged if d.cls == 2 and d.xyxy is not None]
+        for d in without_ground:
+            if d.cls == 0 and veh_boxes_2d:
+                x1, y1, x2, y2 = d.xyxy
+                area_p = max((x2 - x1) * (y2 - y1), 1e-6)
+                covered = False
+                for vb in veh_boxes_2d:
+                    ix = max(0.0, min(x2, vb[2]) - max(x1, vb[0]))
+                    iy = max(0.0, min(y2, vb[3]) - max(y1, vb[1]))
+                    area_v = max((vb[2] - vb[0]) * (vb[3] - vb[1]), 1e-6)
+                    if (ix * iy) / min(area_p, area_v) >= 0.05:
+                        covered = True
+                        break
+                if covered:
+                    continue        # false pedestrian on a vehicle: drop
+            merged.append(d)
 
     return merged
 
