@@ -289,13 +289,32 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                 inter, _ = cv2.intersectConvexConvex(ha, hb)
                 return float(inter) / smaller
 
-            # Build overlap graph: edge iff the smaller footprint is mostly
-            # covered by the larger one (duplicate/partial cuboid of one object).
+            def _box_overlap_2d(box_a: np.ndarray, box_b: np.ndarray) -> Tuple[float, float]:
+                ix = max(0.0, min(float(box_a[2]), float(box_b[2])) - max(float(box_a[0]), float(box_b[0])))
+                iy = max(0.0, min(float(box_a[3]), float(box_b[3])) - max(float(box_a[1]), float(box_b[1])))
+                inter = ix * iy
+                if inter <= 0.0:
+                    return 0.0, 0.0
+                area_a = max(float(box_a[2] - box_a[0]) * float(box_a[3] - box_a[1]), 1.0)
+                area_b = max(float(box_b[2] - box_b[0]) * float(box_b[3] - box_b[1]), 1.0)
+                union = area_a + area_b - inter
+                return float(inter / union), float(inter / min(area_a, area_b))
+
+            # Build overlap graph: BEV footprint overlap OR 2D box overlap
             n = len(group)
             overlap = np.zeros((n, n), dtype=bool)
             for a in range(n):
                 for b in range(a + 1, n):
-                    if _overlap_frac(grounds[a], grounds[b]) >= 0.65:
+                    iou_high = iou_mat[a, b] >= (0.35 if ucls == 0 else 0.50)
+                    contains = (_polygon_contains(grounds[a], grounds[b]) or
+                                _polygon_contains(grounds[b], grounds[a]))
+                    mostly_covered = _overlap_frac(grounds[a], grounds[b]) >= 0.65
+                    iou_2d, cov_2d = _box_overlap_2d(group[a].xyxy, group[b].xyxy)
+                    if ucls == 0:
+                        dup_2d = (iou_2d >= 0.35) or (cov_2d >= 0.70)
+                    else:
+                        dup_2d = (iou_2d >= 0.55) or (cov_2d >= 0.80)
+                    if iou_high or contains or mostly_covered or dup_2d:
                         overlap[a, b] = True
                         overlap[b, a] = True
 
@@ -304,7 +323,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             for a in range(n):
                 if visited[a]:
                     continue
-                # BFS to find all nodes in this component
                 component = []
                 queue = [a]
                 visited[a] = True
@@ -315,9 +333,14 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                         if not visited[b] and overlap[cur, b]:
                             visited[b] = True
                             queue.append(b)
-                # Keep only the largest footprint in this component
+                # Per i pedoni (ucls == 0) mantieni la detection a CONFIDENZA più alta
+                # (evita che un box spurio più largo a bassa confidenza sposti la detection!);
+                # per i veicoli mantieni la footprint BEV più grande.
                 if len(component) > 1:
-                    best = max(component, key=lambda idx: bev_areas[idx])
+                    if ucls == 0:
+                        best = max(component, key=lambda idx: float(group[idx].conf))
+                    else:
+                        best = max(component, key=lambda idx: bev_areas[idx])
                     for idx in component:
                         if idx != best:
                             keep[idx] = False
@@ -325,9 +348,13 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             for idx in np.where(keep)[0]:
                 merged_with_ground.append(group[idx])
 
-        # Cross-class suppression: vehicle (2) vs person (0)
+        # Cross-class suppression: usa SOLO veicoli con footprint 3D reale (geom_ok=True)
+        # per non sopprimere pedoni reali che sfiorano box 2D di veicoli senza 3D valido
         person_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 0]
-        vehicle_indices = [i for i, d in enumerate(merged_with_ground) if d.cls == 2]
+        vehicle_indices = [
+            i for i, d in enumerate(merged_with_ground)
+            if d.cls == 2 and getattr(d, "geom_ok", True)
+        ]
 
         if person_indices and vehicle_indices:
             person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
@@ -561,44 +588,111 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
         inter, _ = cv2.intersectConvexConvex(ha, hb)
         return float(inter) / smaller
 
-    final_vehicles = [d for d in merged if d.cls == 2]
-    if final_vehicles and H is not None:
-        veh_grounds = [d.ground_bev for d in final_vehicles
-                       if hasattr(d, 'ground_bev') and d.ground_bev.shape == (4, 2)]
-        veh_boxes = [d.xyxy for d in final_vehicles if d.xyxy is not None]
+    # ------------------------------------------------------------------ #
+    # Gestione tracce veicolo attive/in coasting (entro max_track_age = 15 frame):
+    # - Se una traccia veicolo (es. motorino) NON ha una detection veicolo nel frame
+    #   corrente ma una detection "pedone" le si sovrappone (in posizione corrente o
+    #   predetta), PROMUOVI quel pedone a veicolo (ereditando source_cls della traccia)
+    #   così la traccia del motorino resta viva e non diventa un pedone!
+    # - Se invece la traccia veicolo HA già una detection veicolo nel frame corrente,
+    #   sopprimi solo il falso pedone (conducente) sopra di essa.
+    current_veh_dets = [d for d in merged if d.cls == 2 and d.xyxy is not None]
 
-        # Case D: veicolo coasting nel tracker (non rilevato nel frame corrente
-        # ma presente con una traccia attiva). Costruiamo un footprint BEV
-        # predetto dalla posizione nota del track (+ velocità se disponibile),
-        # cosi' un pedone falso che appare sopra il veicolo "scomparso" viene
-        # comunque soppresso.
-        coasting_veh_grounds = []
-        if vehicle_tracks:
-            for t in vehicle_tracks:
-                if hasattr(t, 'cls') and t.cls == 2:
-                    tsu = getattr(t, 'time_since_update', 0)
-                    if tsu >= 1 and tsu < 15 and hasattr(t, 'box_xyxy') and t.box_xyxy is not None:
-                        # Predici la posizione attuale dal box ultimo noto + velocita'
-                        box = np.asarray(t.box_xyxy, dtype=np.float64).copy()
-                        vel = getattr(t, 'vel_2d', None)
-                        if vel is not None and tsu > 0:
-                            shift = np.asarray(vel, dtype=np.float64) * float(tsu)
-                            box = box + np.array([shift[0], shift[1], shift[0], shift[1]], dtype=np.float64)
-                        # Proietta bottom-center del box in BEV come proxy del footprint
-                        cx = (box[0] + box[2]) * 0.5
-                        cy_bottom = float(box[3])
-                        try:
-                            center_bev = apply_homography(np.array([[cx, cy_bottom]], dtype=np.float64), H)
-                            if np.all(np.isfinite(center_bev)):
-                                # Usa la scala del veicolo dal track se disponibile
-                                scale = getattr(t, 'veh_scale', None)
-                                if scale is None or scale <= 1e-6:
-                                    scale = 0.3  # default bev_unit
-                                h = 0.5 * scale
-                                quad = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64) + center_bev[0]
-                                coasting_veh_grounds.append(quad)
-                        except Exception:
-                            pass
+    def _iou_and_ped_cov(ped_box: np.ndarray, veh_box: np.ndarray) -> Tuple[float, float]:
+        ix = max(0.0, min(float(ped_box[2]), float(veh_box[2])) - max(float(ped_box[0]), float(veh_box[0])))
+        iy = max(0.0, min(float(ped_box[3]), float(veh_box[3])) - max(float(ped_box[1]), float(veh_box[1])))
+        inter = ix * iy
+        if inter <= 0.0:
+            return 0.0, 0.0
+        area_p = max(float(ped_box[2] - ped_box[0]) * float(ped_box[3] - ped_box[1]), 1.0)
+        area_v = max(float(veh_box[2] - veh_box[0]) * float(veh_box[3] - veh_box[1]), 1.0)
+        return float(inter / (area_p + area_v - inter)), float(inter / area_p)
+
+    active_veh_tracks_info = []
+    if vehicle_tracks:
+        max_track_age = 15  # numero limite di frame entro cui mantenere la traccia veicolo
+        for t in vehicle_tracks:
+            if getattr(t, "cls", -1) != 2:
+                continue
+            tsu = int(getattr(t, "time_since_update", 0))
+            if tsu >= max_track_age or getattr(t, "box_xyxy", None) is None:
+                continue
+            t_box = np.asarray(t.box_xyxy, dtype=np.float64).copy()
+            vel = getattr(t, "vel_2d", None)
+            # t è stato aggiornato al frame precedente: al frame corrente si è mosso di (tsu + 1) step
+            steps_ahead = float(tsu + 1)
+            if vel is not None:
+                v2d = np.asarray(vel, dtype=np.float64)
+                pred_box = t_box + np.array([v2d[0], v2d[1], v2d[0], v2d[1]], dtype=np.float64) * steps_ahead
+            else:
+                pred_box = t_box.copy()
+
+            # Controlla se questo veicolo è già stato rilevato come veicolo (cls == 2) in questo frame
+            has_curr_veh_det = any(
+                _iou_and_ped_cov(vd.xyxy, pred_box)[0] >= 0.25
+                or _iou_and_ped_cov(vd.xyxy, t_box)[0] >= 0.25
+                for vd in current_veh_dets
+            )
+            t_src_cls = int(getattr(t, "source_cls", 3))
+            if t_src_cls not in (1, 2, 3, 5, 7):
+                t_src_cls = 3
+            active_veh_tracks_info.append((t_box, pred_box, has_curr_veh_det, t_src_cls, tsu))
+
+    if active_veh_tracks_info:
+        post_track_merged = []
+        for d in merged:
+            if d.cls != 0 or d.xyxy is None:
+                post_track_merged.append(d)
+                continue
+
+            best_match = None
+            best_score = 0.0
+            for t_box, pred_box, has_curr_veh_det, t_src_cls, tsu in active_veh_tracks_info:
+                iou_c, cov_c = _iou_and_ped_cov(d.xyxy, t_box)
+                iou_p, cov_p = _iou_and_ped_cov(d.xyxy, pred_box)
+                iou_m = max(iou_c, iou_p)
+                cov_m = max(cov_c, cov_p)
+                # Richiedi una sovrapposizione reale col motorino/veicolo (non un semplice sfioramento < 5%!)
+                if iou_m >= 0.20 or cov_m >= 0.55:
+                    score = iou_m + 0.5 * cov_m
+                    if score > best_score:
+                        best_score = score
+                        best_match = (has_curr_veh_det, t_src_cls)
+
+            if best_match is not None:
+                has_curr_veh_det, t_src_cls = best_match
+                if not has_curr_veh_det:
+                    # Il motorino/veicolo ha perso la detection veicolo in questo frame ed è stato
+                    # rilevato come pedone -> PROMUOVI a veicolo con la famiglia originale!
+                    d.cls = 2
+                    d.source_cls = t_src_cls
+                    d.promoted_from_track = True
+                    d.kp_ok = False
+                    d.geom_ok = False
+                    post_track_merged.append(d)
+                    current_veh_dets.append(d)
+                else:
+                    # Il motorino è già stato rilevato come veicolo in questo frame:
+                    # se questo box è il conducente sopra il motorino (cov >= 0.65), sopprimilo
+                    if best_score >= 0.55:
+                        continue
+                    post_track_merged.append(d)
+            else:
+                post_track_merged.append(d)
+        merged = post_track_merged
+
+    # Passata finale di soppressione falsi pedoni (conducenti) su veicoli rilevati nel frame corrente
+    final_vehicles = [
+        d for d in merged
+        if d.cls == 2 and not getattr(d, "promoted_from_track", False)
+        and (getattr(d, "geom_ok", False) or getattr(d, "high_conf_ok", True))
+    ]
+    if final_vehicles and H is not None:
+        veh_grounds = [
+            d.ground_bev for d in final_vehicles
+            if getattr(d, "geom_ok", False) and hasattr(d, "ground_bev") and d.ground_bev.shape == (4, 2)
+        ]
+        veh_boxes = [d.xyxy for d in final_vehicles if d.xyxy is not None]
 
         survivors = []
         for d in merged:
@@ -608,61 +702,22 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
 
             suppressed = False
 
-            # --- case A: pedone con ground vs veicolo con ground (BEV) ---
-            if (hasattr(d, 'ground_bev') and d.ground_bev.shape == (4, 2) and veh_grounds):
+            # --- case A: pedone vs veicolo con ground 3D valido (BEV) ---
+            if hasattr(d, "ground_bev") and d.ground_bev.shape == (4, 2) and veh_grounds:
                 for vg in veh_grounds:
-                    if _ofpv(d.ground_bev, vg) >= 0.5:
+                    if _ofpv(d.ground_bev, vg) >= 0.50:
                         suppressed = True
                         break
 
-            # --- case B: pedone con 2D box vs veicolo con 2D box ---
+            # --- case B: conducente 2D dentro il box 2D di un veicolo rilevato ---
             if not suppressed and veh_boxes and d.xyxy is not None:
                 x1, y1, x2, y2 = d.xyxy
-                area_p = max((x2 - x1) * (y2 - y1), 1e-6)
                 for vb in veh_boxes:
-                    ix = max(0.0, min(x2, vb[2]) - max(x1, vb[0]))
-                    iy = max(0.0, min(y2, vb[3]) - max(y1, vb[1]))
-                    area_v = max((vb[2] - vb[0]) * (vb[3] - vb[1]), 1e-6)
-                    if (ix * iy) / min(area_p, area_v) >= 0.05:
+                    iou_v, cov_v = _iou_and_ped_cov(d.xyxy, vb)
+                    # Sopprimi se il box pedone è largamente contenuto nel veicolo e non poggia più in basso
+                    if cov_v >= 0.75 and y2 <= vb[3] + 6.0:
                         suppressed = True
                         break
-
-            # --- case C: pedone senza ground (2D box) vs veicolo con ground BEV ---
-            if not suppressed and veh_grounds and d.xyxy is not None:
-                if not hasattr(d, 'ground_bev') or d.ground_bev.shape != (4, 2):
-                    x1, y1, x2, y2 = d.xyxy
-                    cx = (x1 + x2) * 0.5
-                    cy_bottom = float(y2)
-                    center_pt = np.array([[cx, cy_bottom]], dtype=np.float64)
-                    try:
-                        center_bev = apply_homography(center_pt, H)
-                        if np.all(np.isfinite(center_bev)):
-                            pt = tuple(center_bev[0].astype(np.float32))
-                            for vg in veh_grounds:
-                                if cv2.pointPolygonTest(
-                                        vg.astype(np.float32).reshape(-1, 1, 2), pt, False) >= 0:
-                                    suppressed = True
-                                    break
-                    except Exception:
-                        pass
-
-            # --- case D: pedone sopra veicolo coasting (track predetto) ---
-            if not suppressed and coasting_veh_grounds and d.xyxy is not None:
-                x1, y1, x2, y2 = d.xyxy
-                cx = (x1 + x2) * 0.5
-                cy_bottom = float(y2)
-                center_pt = np.array([[cx, cy_bottom]], dtype=np.float64)
-                try:
-                    center_bev = apply_homography(center_pt, H)
-                    if np.all(np.isfinite(center_bev)):
-                        pt = tuple(center_bev[0].astype(np.float32))
-                        for cvg in coasting_veh_grounds:
-                            if cv2.pointPolygonTest(
-                                    cvg.astype(np.float32).reshape(-1, 1, 2), pt, False) >= 0:
-                                suppressed = True
-                                break
-                except Exception:
-                    pass
 
             if not suppressed:
                 survivors.append(d)
@@ -1449,35 +1504,33 @@ class V2Pipeline(rt.RealtimePipeline):
                     ground_indices=list(gi)))
             else:
                 # REGOLA VEICOLI: invia al tracker gli oggetti con keypoint affidabili
-                # OPPURE le detection promosse da pedone a veicolo (senza keypoints affidabili)
-                # Queste ultime servono per mantenere il track attivo quando il modello oscilla
+                # OPPURE le detection promosse da pedone a veicolo (is_promoted=True)
                 if not d.kp_ok or d.kpts.shape[0] < 8:
-                    # Se NON è una detection promossa, salta
                     if not is_promoted:
                         continue
-                    # Per le detection promosse: usa la box 2D come proxy (come per i pedoni)
                     x1, y1, x2, y2 = d.xyxy
-                    cx = (x1 + x2) * 0.5
-                    cy_bottom = float(y2)
-                    w_2d = max(x2 - x1, 1.0)
-                    
-                    cP_s = apply_homography(np.array([[cx, cy_bottom]], dtype=np.float64), H_mat)
-                    if not np.all(np.isfinite(cP_s)):
+                    bc_s = apply_homography(
+                        np.array([[(x1 + x2) * 0.5, float(y2)]], dtype=np.float64), H_mat
+                    )
+                    if not np.all(np.isfinite(bc_s)):
                         continue
-                    cP = cP_s[0] / bev_unit
-                    p_l = apply_homography(np.array([[cx - w_2d * 0.5, cy_bottom]]), H_mat)[0] / bev_unit
-                    p_r = apply_homography(np.array([[cx + w_2d * 0.5, cy_bottom]]), H_mat)[0] / bev_unit
-                    obs_scale = float(np.linalg.norm(p_r - p_l))
-                    h = 0.5 * obs_scale
-                    q_raw = np.array([[-h, -h], [h, -h], [h, h], [-h, h]], dtype=np.float64) + cP
-                    
-                    # Crea osservazione "box-only" per la detection promossa
+                    box_bottom_bev = bc_s[0] / bev_unit
                     bev_obs_list.append(BEVObservation(
-                        cls=int(d.cls), source_cls=int(d.source_cls if d.source_cls is not None else d.cls), 
-                        conf=d.conf, box_xyxy=d.xyxy.copy(),
-                        kpts=d.kpts.copy(), ground=d.ground.copy(), kp_ok=False,
-                        bev_center=cP, bev_quad_raw=q_raw, obs_scale=obs_scale,
-                        ground_indices=list(gi)))
+                        cls=int(d.cls),
+                        source_cls=int(d.source_cls if d.source_cls is not None else 3),
+                        conf=eff_conf,
+                        box_xyxy=d.xyxy.copy(),
+                        kpts=np.zeros((0, 2), dtype=np.float64),
+                        ground=np.zeros((0, 2), dtype=np.float64),
+                        kp_ok=False,
+                        bev_center=box_bottom_bev,
+                        bev_quad_raw=np.zeros((0, 2), dtype=np.float64),
+                        obs_scale=0.0,
+                        ground_indices=list(gi),
+                        box_bottom_bev=box_bottom_bev,
+                        shape_ok=False,
+                        border_truncated=bool(getattr(d, "border_truncated", False)),
+                    ))
                     continue
                 x1, y1, x2, y2 = d.xyxy
                 bc_s = apply_homography(

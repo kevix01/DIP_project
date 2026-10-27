@@ -341,11 +341,13 @@ class BEVKalmanTrack:
         if self.cls != 0 and not use_3d_kpts:
             eff_center = self.last_obs_pos + delta_bev
         elif self.cls == 0 and self.hits >= 2:
-            # Limita lo spostamento a 0.14 per ogni frame trascorso.
+            # Consenti alla posizione di tracking del pedone di seguire gli spostamenti
+            # reali della detection (evitando che last_obs_pos accumuli ritardo e perda l'ID),
+            # tagliando solo gli outlier estremi (> 0.32 bev_unit per frame).
             step_vec = obs.bev_center - self.last_obs_pos
             step_norm = float(np.linalg.norm(step_vec))
             gap = max(1, int(self.time_since_update))
-            max_step = 0.14 * gap
+            max_step = 0.32 * gap
 
             if step_norm > max_step:
                 eff_center = self.last_obs_pos + step_vec * (max_step / step_norm)
@@ -435,8 +437,6 @@ class BEVKalmanTrack:
                         self.kpts = self.kpts + shift_2d
                 if obs.ground.shape == (4, 2):
                     self.ground = obs.ground.copy()
-                elif not obs.shape_ok:
-                    self.ground = np.zeros((0, 2), dtype=np.float64)
                 elif self.ground.shape == (4, 2):
                     self.ground = self.ground + shift_2d
                 self.box_xyxy = new_b.copy()
@@ -780,7 +780,7 @@ class BEVOCSortTracker:
 
                 # Gestione osservazioni veicolo con kp_ok=False (mantenimento traccia 2D anche se hits < min_hits!)
                 if t.cls != 0 and (not o.kp_ok or not o.shape_ok):
-                    if not allow_kp_fallback or tsu > 4:
+                    if not allow_kp_fallback or tsu > 15:
                         continue
                     if iou_2d < 0.20:
                         continue
@@ -933,8 +933,11 @@ class BEVOCSortTracker:
         for ti, oi in m1:
             self.tracks[ti].update(hi_obs[oi], frame_idx)
 
-        # 3. Stage 2: Recupero tracce (tsu <= 4) con osservazioni low-conf o veicoli kp_ok=False
-        rem_idx = [i for i in un_t1 if self.tracks[i].time_since_update <= 4]
+        # 3. Stage 2: Recupero tracce (tsu <= 4 pedoni, tsu <= 15 veicoli promossi/kp_ok=False)
+        rem_idx = [
+            i for i in un_t1
+            if self.tracks[i].time_since_update <= (15 if self.tracks[i].cls != 0 else 4)
+        ]
         rem_trks = [self.tracks[i] for i in rem_idx]
         m2, _, _ = self._associate(
             rem_trks, lo_obs, img_wh,
