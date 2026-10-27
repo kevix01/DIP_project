@@ -309,6 +309,14 @@ class BEVKalmanTrack:
         """Update track with a matched BEV observation, running OC-SORT ORU if needed."""
         cur_bb = obs.box_bottom_bev if obs.box_bottom_bev is not None else obs.bev_center
         delta_bev = cur_bb - self.last_box_bottom_bev
+        tsu_prev = max(1, int(self.time_since_update))
+
+        # Limita salti anomali di delta_bev (es. quando il box 2D oscilla durante promozione/coasting)
+        if self.cls != 0 and self.hits >= 2:
+            max_2d_step = (0.14 if self.vehicle_family == 1 else 0.24) * float(tsu_prev)
+            dn_2d = float(np.linalg.norm(delta_bev))
+            if dn_2d > max_2d_step:
+                delta_bev = delta_bev * (max_2d_step / dn_2d)
 
         self.touching_border = _is_touching_border(obs.box_xyxy, self.img_wh)
         if self.touching_border:
@@ -320,7 +328,7 @@ class BEVKalmanTrack:
         use_3d_kpts = bool(obs.shape_ok and obs.kp_ok and obs.kpts.shape[0] >= 8
                            and obs.bev_quad_raw.shape == (4, 2))
         self._expanding_from_border = False
-        if self.cls != 0 and use_3d_kpts: # se l'auto si sta espandendo, sblocchiamo l'anti-jitter
+        if self.cls != 0 and use_3d_kpts:
             s_trk = max(float(self.veh_scale), 1e-6)
             s_obs = max(float(obs.obs_scale), 1e-6)
             if not self.shape_valid:
@@ -333,22 +341,41 @@ class BEVKalmanTrack:
             s_trk = max(float(self.veh_scale), 1e-6)
             s_obs = max(float(obs.obs_scale), 1e-6)
             s_ratio = max(s_obs / s_trk, s_trk / s_obs)
-            # Se il centro 3D è saltato rispetto al box 2D (> 0.22 bev_unit) o la scala 3D
-            # è esplosa/collassata (> 1.40), usa il box 2D per la posizione e congela il 3D!
-            if jump_3d_vs_2d > 0.22 or s_ratio > 1.40:
+            max_jump = 0.16 if self.vehicle_family == 1 else 0.22
+            if jump_3d_vs_2d > max_jump or s_ratio > 1.40:
                 use_3d_kpts = False
 
-        if self.cls != 0 and not use_3d_kpts:
-            eff_center = self.last_obs_pos + delta_bev
+        if self.cls != 0:
+            pred_from_2d = self.last_obs_pos + delta_bev
+            if not use_3d_kpts:
+                eff_center = pred_from_2d
+            elif self.hits >= 2 and not self._expanding_from_border:
+                # Evita lo scatto (Gauge Jump) quando si passa da box 2D a 3D o quando i
+                # keypoint 3D del motorino oscillano: guida il passo con lo spostamento 2D
+                # e riallinea gradualmente verso il baricentro 3D (obs.bev_center).
+                diff_3d = obs.bev_center - pred_from_2d
+                diff_norm = float(np.linalg.norm(diff_3d))
+                max_corr = (0.035 if self.vehicle_family == 1 else 0.08) * float(min(tsu_prev, 3))
+                if diff_norm > max_corr:
+                    diff_3d = diff_3d * (max_corr / diff_norm)
+                blend_3d = 0.25 if self.vehicle_family == 1 else 0.55
+                eff_center = pred_from_2d + blend_3d * diff_3d
+            else:
+                eff_center = obs.bev_center.copy()
+
+            # Se il veicolo rientra da un coasting (tsu_prev > 1), raccorda eff_center con
+            # la posizione predetta di Kalman (self.pos) per evitare salti post-coasting
+            if tsu_prev > 1 and self.hits >= self.lock_after_ped // 2:
+                realign_err = eff_center - self.pos
+                err_norm = float(np.linalg.norm(realign_err))
+                max_realign = 0.12 if self.vehicle_family == 1 else 0.22
+                if err_norm > max_realign:
+                    eff_center = self.pos + realign_err * (max_realign / err_norm)
         elif self.cls == 0 and self.hits >= 2:
-            # Consenti alla posizione di tracking del pedone di seguire gli spostamenti
-            # reali della detection (evitando che last_obs_pos accumuli ritardo e perda l'ID),
-            # tagliando solo gli outlier estremi (> 0.32 bev_unit per frame).
             step_vec = obs.bev_center - self.last_obs_pos
             step_norm = float(np.linalg.norm(step_vec))
             gap = max(1, int(self.time_since_update))
             max_step = 0.32 * gap
-
             if step_norm > max_step:
                 eff_center = self.last_obs_pos + step_vec * (max_step / step_norm)
             else:
@@ -535,7 +562,9 @@ class BEVKalmanTrack:
         # è un glitch dei keypoint 3D (es. sul motorino): non aggiornare kpts/ground/heading!
         # (Ignora questo blocco se il veicolo sta emergendo dal bordo, perché il cambio di aspect ratio
         #  da "solo cofano" ad "auto intera" può ruotare l'asse maggiore di 90°).
-        if not expanding and not self.border_truncated and self.hits >= 3 and abs(d_ang) > np.radians(35.0):
+        # OBS: l'aggiornamento angolare dei motorini o delle biciclette (vehicle_family == 1 o 3) viene reso più fluido
+        max_rot_deg = 22.0 if (self.vehicle_family == 1 or self.vehicle_family == 3) else 35.0
+        if not expanding and not self.border_truncated and self.hits >= 3 and abs(d_ang) > np.radians(max_rot_deg):
             old_b = self.box_xyxy
             new_b = obs.box_xyxy
             shift_2d = np.array([
@@ -561,7 +590,6 @@ class BEVKalmanTrack:
         old_scale = float(self.veh_scale)
 
         if expanding:
-            # Il veicolo sta emergendo dal bordo: sostituisci la forma monca con quella più completa!
             self.veh_S = self._rect_shape(Q)
             self.veh_heading = self._estimate_kabsch_angle(Q, self.veh_S)
             self.veh_W = 1.0
@@ -569,7 +597,8 @@ class BEVKalmanTrack:
             self.veh_rms.clear()
             self.veh_scale = obs_scale
         else:
-            self.veh_heading = float(self.veh_heading + 0.35 * d_ang)
+            heading_gain = 0.16 if self.vehicle_family == 1 else 0.35
+            self.veh_heading = float(self.veh_heading + heading_gain * d_ang)
             if obs_scale > 1e-6:
                 if old_scale > 1e-6:
                     ratio = max(obs_scale / old_scale, old_scale / obs_scale)
@@ -1071,11 +1100,27 @@ class FixedLagBuffer:
         self.savgol = FastSavGol(max_win=self.window, poly=poly, dt=self.dt)
         self.buffer: deque = deque(maxlen=self.window)
 
-        # Stationary vehicle anchor memory: tid -> frozen_bev_pos
+        # Stationary vehicle anchor memory: tid -> (frozen_bev_pos, frozen_heading)
         self._parked_anchor: Dict[int, Tuple[np.ndarray, float]] = {}
+        # Memoria dell'ultima osservazione reale (anche se già uscita dalla finestra W)
+        # tid -> (frame_idx, box_xyxy, bev_pos, kpts, ground)
+        self._last_real_obs: Dict[int, Tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        # Memoria dell'ultima posizione BEV emessa in rendering (per raccordare coasting > lag)
+        # tid -> (frame_idx, sm_pos)
+        self._last_emitted_pos: Dict[int, Tuple[int, np.ndarray]] = {}
 
     def push(self, state, tracker_map: Dict[int, BEVKalmanTrack]):
         """Push frame ``t`` into the circular buffer; return smoothed frame ``t - lag`` (or None during warm-up)."""
+        # Aggiorna la memoria dell'ultima osservazione reale prima che i frame escano dal buffer
+        for v in state.tracks:
+            if v.time_since_update == 0:
+                self._last_real_obs[v.id] = (
+                    int(state.frame_idx),
+                    v.box_xyxy.copy(),
+                    v.bev_pos.copy(),
+                    v.kpts.copy(),
+                    v.ground.copy(),
+                )
         self.buffer.append(state)
         if len(self.buffer) < self.window:
             return None
@@ -1107,17 +1152,18 @@ class FixedLagBuffer:
             for v in st.tracks:
                 track_series.setdefault(v.id, []).append((bi, v))
 
-        # 2. Interpolate short coasting gaps inside the window if bounded by real observations
-        self._interpolate_window_gaps(buf_list, track_series, target_idx)
+        # 2. Interpola TUTTI i frame in coasting nella finestra (usando anche _last_real_obs
+        #    se l'inizio del coasting è già uscito a sinistra della finestra!)
+        self._interpolate_window_gaps(buf_list, track_series)
 
         # 3. Filter and zero-phase smooth each track present in target_state
         valid_views = []
+        cur_f_idx = int(target_state.frame_idx)
         for v in target_state.tracks:
             tid = v.id
             series = track_series.get(tid, [])
             trk_obj = tracker_map.get(tid)
 
-            # Check if track ever confirms or is just an unrecovered coasting tail
             max_hits = max((getattr(vw, "hits", 1) for _, vw in series), default=1)
             obs_after = any(bi >= target_idx and vw.time_since_update == 0 for bi, vw in series)
 
@@ -1126,17 +1172,33 @@ class FixedLagBuffer:
             if v.time_since_update > 0 and not obs_after:
                 continue  # Coast-tail trimming: never re-observed in look-ahead
 
-            # Extract BEV center series across the window
+            # Extract BEV center series across the window (già interpolata su tutti i bi!)
             pos_arr = np.array([vw.bev_pos for _, vw in series], dtype=np.float64)
             loc_idx = next((i for i, (bi, _) in enumerate(series) if bi == target_idx), len(series) - 1)
 
             # Zero-phase Savitzky-Golay position + analytical velocity
             sm_pos, sm_vel = self.savgol.eval(pos_arr, loc_idx)
+
+            # Raccordo continuo post-coasting sulla posizione emessa:
+            # se il coasting è durato più del look-ahead (lag=5), evita qualsiasi scatto
+            # limitando lo step massimo rispetto all'ultima posizione renderizzata!
+            if tid in self._last_emitted_pos:
+                last_f, last_p = self._last_emitted_pos[tid]
+                dt_frames = max(1, cur_f_idx - last_f)
+                step_vec = sm_pos - last_p
+                step_norm = float(np.linalg.norm(step_vec))
+                is_scooter = (trk_obj is not None and getattr(trk_obj, "vehicle_family", 0) == 1)
+                max_step_per_f = 0.08 if v.cls == 0 else (0.11 if is_scooter else 0.20)
+                max_allowed = max_step_per_f * float(dt_frames)
+                if step_norm > max_allowed:
+                    sm_pos = last_p + step_vec * (max_allowed / step_norm)
+                    sm_vel = (sm_pos - last_p) / (float(dt_frames) * self.dt)
+
+            self._last_emitted_pos[tid] = (cur_f_idx, sm_pos.copy())
             speed_lps = float(np.hypot(sm_vel[0], sm_vel[1]))  # in bev_unit / second
 
             heading_override = None
             if v.cls != 0:
-                # Vehicle stationary hold & trajectory heading (from refine_v2)
                 disp = float(np.linalg.norm(pos_arr[-1] - pos_arr[0])) if len(pos_arr) >= 2 else 0.0
                 is_still = (speed_lps < 0.35) and (disp < 0.18)
 
@@ -1154,12 +1216,10 @@ class FixedLagBuffer:
                         self._parked_anchor[tid] = (sm_pos.copy(), trk_obj.veh_heading if trk_obj else 0.0)
                 else:
                     self._parked_anchor.pop(tid, None)
-                    # Trajectory heading when moving straight enough
                     if self.vel_heading and speed_lps >= 0.8 and disp >= 0.35:
                         path_len = float(np.sum(np.linalg.norm(np.diff(pos_arr, axis=0), axis=1)))
                         if disp >= 0.92 * max(path_len, 1e-6) and trk_obj is not None:
                             vel_ang = float(np.arctan2(sm_vel[1], sm_vel[0]))
-                            # Align vehicle length axis with velocity vector (modulo pi)
                             S_rect = trk_obj._rect_shape(trk_obj.veh_S)
                             e = np.roll(S_rect, -1, axis=0) - S_rect
                             u_ax, v_ax = 0.5 * (e[0] - e[2]), 0.5 * (e[1] - e[3])
@@ -1168,8 +1228,9 @@ class FixedLagBuffer:
                             target_th = vel_ang - axis_ang
                             diff_th = np.arctan2(np.sin(2.0 * (target_th - trk_obj.veh_heading)),
                                                  np.cos(2.0 * (target_th - trk_obj.veh_heading))) * 0.5
-                            if abs(np.degrees(diff_th)) <= 45.0:
-                                heading_override = trk_obj.veh_heading + diff_th
+                            max_h_diff = 25.0 if getattr(trk_obj, "vehicle_family", 0) == 1 else 45.0
+                            if abs(np.degrees(diff_th)) <= max_h_diff:
+                                heading_override = trk_obj.veh_heading + 0.5 * diff_th
 
             v.bev_pos = sm_pos
             v.bev_vel = sm_vel
@@ -1185,30 +1246,61 @@ class FixedLagBuffer:
         target_state.tracks = valid_views
         return target_state
 
-    @staticmethod
-    def _interpolate_window_gaps(buf_list: List, track_series: Dict[int, List[Tuple[int, object]]],
-                                 target_idx: int):
-        """If target_idx is a coasting frame bracketed by real observations in the window, interpolate."""
+    def _interpolate_window_gaps(self, buf_list: List,
+                                 track_series: Dict[int, List[Tuple[int, object]]]):
+        """Interpola linearmente TUTTI i frame in coasting nella finestra non appena
+        compare un'osservazione reale successiva, usando _last_real_obs se l'inizio
+        del gap è già uscito dalla finestra."""
         for tid, series in track_series.items():
-            # Find if target_idx is present and currently coasting
-            target_entry = next(((bi, vw) for bi, vw in series if bi == target_idx), None)
-            if target_entry is None or target_entry[1].time_since_update == 0:
+            real_Indices = [idx for idx, (_, vw) in enumerate(series) if vw.time_since_update == 0]
+            if not real_Indices:
                 continue
 
-            before = [(bi, vw) for bi, vw in series if bi < target_idx and vw.time_since_update == 0]
-            after = [(bi, vw) for bi, vw in series if bi > target_idx and vw.time_since_update == 0]
-            if not before or not after:
-                continue
+            # Caso 1: Gap interni alla finestra (tra due osservazioni reali dentro series)
+            for r_pos in range(len(real_Indices) - 1):
+                i_start = real_Indices[r_pos]
+                i_end = real_Indices[r_pos + 1]
+                if i_end - i_start <= 1:
+                    continue
+                bi_a, va = series[i_start]
+                bi_b, vb = series[i_end]
+                fa = int(buf_list[bi_a].frame_idx)
+                fb = int(buf_list[bi_b].frame_idx)
+                span = float(max(fb - fa, 1))
+                for k in range(i_start + 1, i_end):
+                    bi_k, vk = series[k]
+                    if vk.time_since_update == 0:
+                        continue
+                    fk = int(buf_list[bi_k].frame_idx)
+                    w = float(np.clip((fk - fa) / span, 0.0, 1.0))
+                    vk.box_xyxy = va.box_xyxy * (1.0 - w) + vb.box_xyxy * w
+                    vk.bev_pos = va.bev_pos * (1.0 - w) + vb.bev_pos * w
+                    if va.kpts.shape == (8, 2) and vb.kpts.shape == (8, 2):
+                        vk.kpts = va.kpts * (1.0 - w) + vb.kpts * w
+                    if va.ground.shape == (4, 2) and vb.ground.shape == (4, 2):
+                        vk.ground = va.ground * (1.0 - w) + vb.ground * w
+                    vk.time_since_update = 0
 
-            b_idx, va = before[-1]
-            a_idx, vb = after[0]
-            w = float(target_idx - b_idx) / float(max(a_idx - b_idx, 1))
-            vt = target_entry[1]
-
-            vt.box_xyxy = va.box_xyxy * (1.0 - w) + vb.box_xyxy * w
-            vt.bev_pos = va.bev_pos * (1.0 - w) + vb.bev_pos * w
-            if va.kpts.shape == (8, 2) and vb.kpts.shape == (8, 2):
-                vt.kpts = va.kpts * (1.0 - w) + vb.kpts * w
-            if va.ground.shape == (4, 2) and vb.ground.shape == (4, 2):
-                vt.ground = va.ground * (1.0 - w) + vb.ground * w
-            vt.time_since_update = 0  # healed by look-ahead interpolation
+            # Caso 2: La serie nella finestra inizia in coasting (es. gap > lag) e poi si riaggancia
+            first_real_i = real_Indices[0]
+            if first_real_i > 0 and tid in self._last_real_obs:
+                fa, box_a, pos_a, kpts_a, ground_a = self._last_real_obs[tid]
+                bi_b, vb = series[first_real_i]
+                fb = int(buf_list[bi_b].frame_idx)
+                if fb > fa:
+                    span = float(fb - fa)
+                    for k in range(0, first_real_i):
+                        bi_k, vk = series[k]
+                        if vk.time_since_update == 0:
+                            continue
+                        fk = int(buf_list[bi_k].frame_idx)
+                        if fk <= fa:
+                            continue
+                        w = float(np.clip((fk - fa) / span, 0.0, 1.0))
+                        vk.box_xyxy = box_a * (1.0 - w) + vb.box_xyxy * w
+                        vk.bev_pos = pos_a * (1.0 - w) + vb.bev_pos * w
+                        if kpts_a.shape == (8, 2) and vb.kpts.shape == (8, 2):
+                            vk.kpts = kpts_a * (1.0 - w) + vb.kpts * w
+                        if ground_a.shape == (4, 2) and vb.ground.shape == (4, 2):
+                            vk.ground = ground_a * (1.0 - w) + vb.ground * w
+                        vk.time_since_update = 0
