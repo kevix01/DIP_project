@@ -77,6 +77,7 @@ from uod.viz import draw_cuboid, draw_dashed_polyline  # noqa: E402
 from homography_rt import apply_homography  # noqa: E402
 import threading
 from uod.bev_ocsort import BEVObservation, BEVOCSortTracker, FixedLagBuffer
+from violation_detector import ViolationDetector
 
 
 class FrameSource:
@@ -1063,6 +1064,12 @@ class V2Pipeline(rt.RealtimePipeline):
         try:
             self.static_H = np.load("homography_bangkok.npy").astype(np.float64)
             print("Omografia statica caricata con successo.")
+            try:
+                self.static_H_inv = np.linalg.inv(self.static_H)
+            except np.linalg.LinAlgError: # H non invertibile (rarissimo)
+                self.static_H_inv = None
+                print("Non è stato possibile invertire la matrice di omografia." \
+                "Le infrazioni non verranno rilevate!!!")
         except Exception:
             print("Errore: homography_bangkok.npy non trovato.")
             sys.exit(1)
@@ -1650,6 +1657,16 @@ class V2Pipeline(rt.RealtimePipeline):
         aux_dets, aux_centers = state.aux_dets, state.aux_centers
         H, gi = state.H, state.gi
         src = frame.copy()
+        # --- DISEGNO ROI IN PROSPETTIVA ---
+        if getattr(self, 'roi_image_points', None) is not None:
+            # Utilizza i punti pixel originali estratti dal JSON
+            roi_persp = self.roi_image_points
+            
+            cv2.polylines(src, [roi_persp], isClosed=True, color=(0, 255, 255), thickness=2, lineType=cv2.LINE_AA)
+            overlay = src.copy()
+            cv2.fillPoly(overlay, [roi_persp], color=(0, 255, 255))
+            cv2.addWeighted(overlay, 0.15, src, 0.85, 0, src)
+        # ----------------------------------
         src_labels = []
         if self.draw_aux_box:
             for d in aux_dets:
@@ -1667,6 +1684,19 @@ class V2Pipeline(rt.RealtimePipeline):
             src_labels.append((x1, y1, t.cls, t.id, coasting, bh))
 
         bev = self.viewport.blank_canvas(radar=True)
+        # --- DISEGNO ROI IN BEV ---
+        if getattr(self, 'roi_bev_points', None) is not None:
+            # Usa i punti BEV e scali per l'unita' di misura del tracker
+            roi_scaled = self.roi_bev_points * state.bev_unit
+            roi_canvas = self.viewport.rect_to_canvas(roi_scaled)
+            
+            if len(roi_canvas) > 0 and np.all(np.isfinite(roi_canvas)):
+                roi_canvas_pts = np.round(roi_canvas).astype(np.int32)
+                cv2.polylines(bev, [roi_canvas_pts], isClosed=True, color=(0, 255, 255), thickness=2, lineType=cv2.LINE_AA)
+                overlay_bev = bev.copy()
+                cv2.fillPoly(overlay_bev, [roi_canvas_pts], color=(0, 255, 255))
+                cv2.addWeighted(overlay_bev, 0.15, bev, 0.85, 0, bev)
+        # --------------------------
         if self.use_homography and self.show_fov:
             self.viewport.draw_fov(bev, H, state.img_wh)
         bev_labels = []
@@ -2383,6 +2413,12 @@ def build_v2_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--show-bev-ids", action="store_true",
                    help="mostra gli ID delle tracce al centro delle footprint BEV")
+    p.add_argument("--roi-file", type=str, required=True,
+                   help="Path al file JSON contenente i punti della ROI (x,y in BEV).")
+    p.add_argument("--ttc-thresh", type=float, default=2.5,
+                   help="Soglia TTC per l'infrazione in secondi.")
+    p.add_argument("--timeout-frames", type=int, default=45,
+                   help="Frames da attendere per il salvataggio immagine di uscita se traccia persa.")
     return p
 
 
@@ -2463,6 +2499,24 @@ def main(argv=None):
     if v2args.bev_unit is not None:
         print(f"bev_unit fisso in uso: {pipe._bev_unit_locked:.12g}")
 
+    # === SETUP VIOLATION DETECTOR ===
+    violation_detector = None
+    if getattr(v2args, "roi_file", None):
+        violation_detector = ViolationDetector(
+            video_name=args.input,
+            roi_file=v2args.roi_file,
+            bev_unit=pipe._bev_unit_locked,
+            ttc_threshold=v2args.ttc_thresh,
+            timeout_frames=v2args.timeout_frames
+        )
+        # Assegna direttamente i punti parsati dal JSON alla pipeline
+        pipe.roi_bev_points = violation_detector.roi.bev_points
+        pipe.roi_image_points = violation_detector.roi.image_points
+    else:
+        pipe.roi_bev_points = None
+        pipe.roi_image_points = None
+    # ================================
+
     # 6. Loop Real-Time con Fixed-Lag Circular Buffer
     sink = _FFSink(args, fps)
     n_out = 0
@@ -2479,7 +2533,22 @@ def main(argv=None):
             raw_state = pipe.step(frame)
             ready_state = pipe.lag_buffer.push(raw_state, pipe._tracker_map)
 
-            if ready_state is not None:
+            if ready_state is not None: # il lag buffer ha restituito un frame pronto
+                # === LOGICA INFRAZIONI ===
+                if violation_detector is not None:
+                    # Ottieni l'inversa dell'omografia di questo frame
+                    if pipe.static_H_inv is not None:
+                        # Passiamo il frame ORIGINALE (raw) o l'immagine di output (out_img).
+                        # Se vuoi salvare l'immagine pulita, passa ready_state.frame.
+                        violation_detector.process_frame(
+                            frame=ready_state.frame.copy(), 
+                            tracks=ready_state.tracks, 
+                            frame_idx=ready_state.frame_idx, 
+                            H_inv=pipe.static_H_inv
+                        )
+                    else: # la matrice di omografia inversa non è presente
+                        pass # la logica di rilevamento infrazioni non viene eseguita
+                # =========================
                 out_img = pipe.render(ready_state)
                 dt = time.perf_counter() - t0
                 pipe.fps_core = pipe.fps_render = rt._ema(pipe.fps_core, dt)
@@ -2491,6 +2560,17 @@ def main(argv=None):
         if not src.is_stream and not (args.max_frames and n_out >= args.max_frames):
             for tail_state in pipe.lag_buffer.flush_remaining(pipe._tracker_map):
                 if tail_state is not None:
+                    # === LOGICA INFRAZIONI TAIL ===
+                    if pipe.static_H_inv is not None:
+                        violation_detector.process_frame(
+                            frame=ready_state.frame.copy(), 
+                            tracks=ready_state.tracks, 
+                            frame_idx=ready_state.frame_idx, 
+                            H_inv=pipe.static_H_inv
+                        )
+                    else: # la matrice di omografia inversa non è presente
+                        pass # la logica di rilevamento infrazioni non viene eseguita
+                    # ==============================
                     out_img = pipe.render(tail_state)
                     n_out += 1
                     if not sink.emit(out_img):
