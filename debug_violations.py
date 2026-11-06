@@ -344,13 +344,11 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
             it = intents.get(ped.id, {})
             it_state = it.get("state", "-")
             it_flip = it.get("flip_angle", 0.0)
-            sub_p = f"({ped.bev_pos[0]:+.1f},{ped.bev_pos[1]:+.1f}) v={p_speed:.1f} {it_state[:4]}"
+            sub_p = f"({ped.bev_pos[0]:+.1f},{ped.bev_pos[1]:+.1f}) v={p_speed:.1f} {it_state[:4]} flip{it_flip:.0f}d"
             cv2.putText(panel, title_p, (cx + 8, top_y + 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.48, (74, 178, 240), 2, cv2.LINE_AA)
             cv2.putText(panel, sub_p, (cx + 8, top_y + 36), cv2.FONT_HERSHEY_SIMPLEX,
                         0.38, (170, 175, 185), 1, cv2.LINE_AA)
-            cv2.putText(panel, f"flip {it_flip:.0f}d", (cx + 8, top_y + col_head_h - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (140, 145, 155), 1, cv2.LINE_AA)
             cv2.line(panel, (cx, top_y), (cx, top_y + col_head_h + len(vehs_shown) * row_h),
                      (55, 55, 65), 1)
             cx += ped_col_w
