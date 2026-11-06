@@ -2,6 +2,8 @@ import os
 import json
 import cv2
 import numpy as np
+from collections import deque
+from dataclasses import dataclass, field
 from shapely.geometry import Polygon, Point
 
 
@@ -55,15 +57,184 @@ class ZebraCrossingROI:
         return self.polygon.intersects(veh_poly)
 
 
+# --------------------------------------------------------------------------- #
+# Intento di movimento del pedone
+# --------------------------------------------------------------------------- #
+
+INTENT_UNKNOWN = "UNKNOWN"
+INTENT_MOVING = "MOVING"        # marcia coerente
+INTENT_SLOW = "SLOW"            # moto lento
+INTENT_STOPPED = "STOPPED"      # fermo sul posto
+INTENT_TURNING = "TURNING"      # sta cambiando direzione (non ancora inversione)
+INTENT_REVERSED = "REVERSED"    # sta tornando indietro rispetto alla marcia
+
+
+@dataclass
+class PedIntent:
+    """
+    Modello dell'intento di movimento di un pedone, basato sullo spostamento
+    netto su finestre temporali (non sulla velocità istantanea, che per i
+    pedoni è rumore: EMA della posizione + Kalman su posizione grezza +
+    smoother Savitzky-Golay zero-phase).
+
+    - finestra "long": direzione di marcia stabile (intento impegnato)
+    - finestra "short": direzione del moto recente (possibile inversione)
+
+    Lo stato REVERSED/TURNING serve a distinguere "il pedone si sta
+    allontanando dalla traiettoria del veicolo" (falso positivo) da
+    "il pedone è fermo sulla striscia" (infrazione reale).
+    """
+    ped_id: int
+    long_frames: int
+    short_frames: int
+    step_frames: int = 8           # finestra breve (~0.25s) per il veto di ritirata
+    moving_speed: float = 0.25     # BEU/s sopra il quale il pedone è "in marcia"
+    stopped_speed: float = 0.08    # BEU/s sotto il quale il pedone è "fermo"
+    flip_deg: float = 45.0         # angolo oltre il quale si considera un cambio direzione
+    retreat_cos: float = -0.5      # coseno sotto il quale il moto recente è "in ritirata"
+    retreat_dist: float = 0.05     # BEU di spostamento minimo sulla finestra step
+    hist: deque = field(default_factory=lambda: deque(maxlen=256))
+    last_seen_frame: int = -1
+
+    state: str = INTENT_UNKNOWN
+    speed_long: float = 0.0
+    speed_short: float = 0.0
+    speed_step: float = 0.0
+    flip_angle: float = 0.0
+    retreating: bool = False       # veto sticky: una volta in retirata resta fino a nuovo moto netto
+    dir_long: object = None
+    dir_short: object = None
+    dir_step: object = None
+    effective_vel: object = None
+
+    def update(self, frame_idx: int, pos: np.ndarray, fps: float):
+        self.hist.append((int(frame_idx), np.asarray(pos, dtype=np.float64).copy()))
+        self.last_seen_frame = int(frame_idx)
+        self._recompute(fps)
+
+    def _window(self, cur_frame: int, n_frames: int):
+        """Restituisce (frame_ref, pos_ref) del campione più vecchio entro la finestra."""
+        target = cur_frame - int(n_frames)
+        ref = None
+        for fi, pos in self.hist:
+            if fi <= target:
+                ref = (fi, pos)
+            else:
+                break
+        return ref
+
+    def _recompute(self, fps: float):
+        fps = float(fps) if fps and fps > 1e-6 else 30.0
+        cur_frame, cur_pos = self.hist[-1]
+
+        def window_vec(n_frames):
+            ref = self._window(cur_frame, n_frames)
+            if ref is None:
+                return None
+            ref_frame, ref_pos = ref
+            dt = (cur_frame - ref_frame) / fps
+            if dt <= 1e-6:
+                return None
+            delta = cur_pos - ref_pos
+            dist = float(np.linalg.norm(delta))
+            if dist <= 1e-6:
+                return (None, 0.0, dist)
+            return (delta / dist, dist / dt, dist)
+
+        long_v = window_vec(self.long_frames)
+        short_v = window_vec(self.short_frames)
+        step_v = window_vec(self.step_frames)
+
+        self.dir_long = long_v[0] if long_v else None
+        self.speed_long = long_v[1] if long_v else 0.0
+        self.dir_short = short_v[0] if short_v else None
+        self.speed_short = short_v[1] if short_v else 0.0
+        self.dir_step = step_v[0] if step_v else None
+        self.speed_step = step_v[1] if step_v else 0.0
+
+        zero = np.zeros(2, dtype=np.float64)
+
+        if short_v is None:
+            self.state = INTENT_UNKNOWN
+            self.flip_angle = 0.0
+            self.effective_vel = zero
+            return
+
+        if self.dir_long is not None and self.dir_short is not None:
+            cosf = float(np.clip(np.dot(self.dir_long, self.dir_short), -1.0, 1.0))
+            self.flip_angle = float(np.degrees(np.arccos(cosf)))
+        else:
+            self.flip_angle = 0.0
+
+        # Veto di retirata: su una finestra breve lo spostamento netto è
+        # opposto alla direzione di marcia impegnata (long). Sticky: resta
+        # attivo finché non c'è un nuovo moto netto nella direzione di marcia.
+        if self.dir_long is not None and step_v is not None:
+            step_dist = step_v[2]
+            if (step_dist >= self.retreat_dist and self.dir_step is not None
+                    and float(np.dot(self.dir_step, self.dir_long)) < self.retreat_cos):
+                self.retreating = True
+            elif (step_dist >= self.retreat_dist and self.dir_step is not None
+                  and float(np.dot(self.dir_step, self.dir_long)) > 0.5):
+                self.retreating = False
+
+        if self.retreating:
+            self.state = INTENT_REVERSED
+            self.effective_vel = (self.dir_step * self.speed_step
+                                  if self.dir_step is not None else zero)
+        elif self.speed_short >= self.moving_speed and self.speed_long >= self.moving_speed:
+            # Il pedone sta camminando: l'intento è la direzione di marcia.
+            if self.flip_angle > self.flip_deg:
+                self.state = INTENT_TURNING
+                self.effective_vel = self.dir_short * self.speed_short
+            else:
+                self.state = INTENT_MOVING
+                self.effective_vel = self.dir_long * self.speed_long
+        elif self.speed_short < self.stopped_speed:
+            # Fermo: resta occupante statico della zona di conflitto.
+            self.state = INTENT_STOPPED
+            self.effective_vel = zero
+        else:
+            self.state = INTENT_SLOW
+            self.effective_vel = (self.dir_short * self.speed_short
+                                  if self.dir_short is not None else zero)
+
+    def as_dict(self) -> dict:
+        return {
+            "state": self.state,
+            "speed_long": round(float(self.speed_long), 3),
+            "speed_short": round(float(self.speed_short), 3),
+            "speed_step": round(float(self.speed_step), 3),
+            "flip_angle": round(float(self.flip_angle), 1),
+            "retreating": bool(self.retreating),
+        }
+
+
 class ViolationDetector:
     def __init__(self, video_name: str, roi_file: str, bev_unit: float,
                  ttc_threshold: float = 3.0, timeout_frames: int = 30,
-                 conflict_radius: float = 1.1, save_files: bool = True):
+                 conflict_radius: float = 1.1, save_files: bool = True,
+                 fps: float = 30.0, confirm_frames: int = 3,
+                 intent_long_s: float = 1.2, intent_short_s: float = 0.5,
+                 intent_moving_speed: float = 0.25,
+                 intent_stopped_speed: float = 0.08,
+                  intent_flip_deg: float = 45.0,
+                  intent_retreat_cos: float = -0.5,
+                  intent_step_s: float = 0.25,
+                  intent_retreat_dist: float = 0.05):
         self.ttc_threshold = float(ttc_threshold)
         self.timeout_frames = int(timeout_frames)
         self.conflict_radius = float(conflict_radius)  # Distanza max (in BEU) al punto di impatto (d_CPA)
         self.bev_unit = float(bev_unit) if bev_unit and bev_unit > 1e-9 else 1.0
         self.save_files = bool(save_files)
+        self.fps = float(fps) if fps and fps > 1e-6 else 30.0
+        self.confirm_frames = max(1, int(confirm_frames))
+        self.intent_retreat_cos = float(intent_retreat_cos)
+
+        self.intent_long_frames = max(1, int(round(intent_long_s * self.fps)))
+        self.intent_short_frames = max(1, int(round(intent_short_s * self.fps)))
+        self.intent_step_frames = max(1, int(round(intent_step_s * self.fps)))
+        self.intent_retreat_dist = float(intent_retreat_dist)
 
         # Inizializza ROI
         self.roi = ZebraCrossingROI(roi_file, self.bev_unit)
@@ -77,9 +248,16 @@ class ViolationDetector:
         # State tracking
         self.history_violators = set()  # ID dei veicoli che hanno già commesso l'infrazione
         self.active_violations = {}     # {veh_id: {'start_frame': int, 'json_path': str, ...}}
+        self.ped_intents = {}           # {ped_id: PedIntent}
+        self.pending_conflicts = {}     # {veh_id: {'ped_id': int, 'count': int, 'last_frame': int}}
 
-        print(f"[ViolationDetector] Inizializzato | Output: {self.out_dir} (save={self.save_files}) | TTC Thresh: {self.ttc_threshold}s")
+        print(f"[ViolationDetector] Inizializzato | Output: {self.out_dir} (save={self.save_files}) | "
+              f"TTC Thresh: {self.ttc_threshold}s | Conferma: {self.confirm_frames} frame | "
+              f"Intent: long={self.intent_long_frames}f short={self.intent_short_frames}f")
 
+    # ------------------------------------------------------------------ #
+    # Calcolo TTC legacy (punto-massa, velocità istantanea)
+    # ------------------------------------------------------------------ #
     @staticmethod
     def compute_ttc(p_veh: np.ndarray, v_veh: np.ndarray,
                     p_ped: np.ndarray, v_ped: np.ndarray,
@@ -143,6 +321,104 @@ class ViolationDetector:
 
         return float(t_cpa)
 
+    # ------------------------------------------------------------------ #
+    # Valutazione conflitto "intent-gated"
+    # ------------------------------------------------------------------ #
+    def evaluate_conflict(self, veh, ped, intent: PedIntent):
+        """
+        Valuta il conflitto veicolo/pedone usando l'INTENTO di movimento del
+        pedone invece della sua velocità istantanea.
+
+        Restituisce (ttc, label). ttc < 0 indica non-conflitto con codice:
+          -1.0 : traiettorie divergenti
+          -2.0 : pedone già superato / alle spalle del veicolo
+          -3.0 : nessuna rotta di collisione (d_CPA > conflict_radius)
+          -4.0 : il pedone sta cambiando direzione / torna indietro
+                  (NON è un falso positivo: il veicolo non lo raggiunge)
+        """
+        p_v = np.asarray(veh.bev_pos, dtype=np.float64)
+        v_v = np.asarray(veh.bev_vel, dtype=np.float64)
+        p_p = np.asarray(ped.bev_pos, dtype=np.float64)
+
+        veh_speed = float(np.linalg.norm(v_v))
+        if veh_speed < 0.15:
+            return float('inf'), "VEICOLO FERMO"
+
+        u_veh = v_v / veh_speed
+        r = p_p - p_v
+        d_long = float(np.dot(r, u_veh))
+
+        # Il pedone è già alle spalle del veicolo: nessun conflitto futuro.
+        if d_long < -0.4:
+            return -2.0, "OLTRE VEICOLO"
+
+        v_int = intent.effective_vel if intent is not None else np.zeros(2)
+        if v_int is None:
+            v_int = np.zeros(2, dtype=np.float64)
+        int_speed = float(np.linalg.norm(v_int))
+
+        if int_speed > 0.05:
+            # Pedone in moto: CPA tra veicolo e traiettoria INTENZIONALE del pedone.
+            dp = p_v - p_p
+            dv = v_v - v_int
+            dv2 = float(np.dot(dv, dv))
+            if dv2 < 1e-6:
+                return float('inf'), "VEL RELATIVA NULLA"
+            dot_pv = float(np.dot(dp, dv))
+            if dot_pv >= 0.0:
+                return -1.0, "DIVERGENTI"
+
+            t_cpa = -dot_pv / dv2
+            d_cpa_vec = dp + dv * t_cpa
+            d_cpa = float(np.linalg.norm(d_cpa_vec))
+            if d_cpa > self.conflict_radius:
+                return -3.0, "CORSIE DIVERSE"
+
+            # Veto di retirata: il pedone sta tornando indietro rispetto alla
+            # propria marcia (non verso il veicolo) -> falso positivo soppresso.
+            if intent is not None and intent.retreating:
+                return -4.0, "PEDONE IN RITIRATA"
+
+            return float(t_cpa), "IN MOTO"
+
+        # Pedone fermo: resta occupante statico della zona di conflitto.
+        # Il veicolo lo raggiungerà se la sua traiettoria futura passa entro
+        # conflict_radius dalla sua posizione.
+        r_lat = r - d_long * u_veh
+        d_line = float(np.linalg.norm(r_lat))
+        if d_line > self.conflict_radius:
+            return -3.0, "CORSIE DIVERSE"
+        t_arrive = d_long / veh_speed
+        if t_arrive > self.ttc_threshold:
+            return float('inf'), "TROPPO LONTANO"
+        return float(t_arrive), "PEDONE FERMO"
+
+    def _update_intents(self, tracks: list, frame_idx: int):
+        """Aggiorna lo stato di intento di tutti i pedoni tracciati (anche fuori ROI)."""
+        seen = set()
+        for t in tracks:
+            if t.cls != 0:
+                continue
+            seen.add(t.id)
+            intent = self.ped_intents.get(t.id)
+            if intent is None:
+                intent = PedIntent(
+                    ped_id=t.id,
+                    long_frames=self.intent_long_frames,
+                    short_frames=self.intent_short_frames,
+                    step_frames=self.intent_step_frames,
+                    retreat_cos=self.intent_retreat_cos,
+                    retreat_dist=self.intent_retreat_dist,
+                )
+                self.ped_intents[t.id] = intent
+            intent.update(frame_idx, t.bev_pos, self.fps)
+
+        # Pulizia delle intenzioni dei pedoni non più tracciati
+        stale_after = max(30, int(round(3.0 * self.fps)))
+        for pid in list(self.ped_intents.keys()):
+            if pid not in seen and (frame_idx - self.ped_intents[pid].last_seen_frame) > stale_after:
+                del self.ped_intents[pid]
+
     def bev_to_perspective(self, bev_pos: np.ndarray, H_inv: np.ndarray) -> list:
         """
         Riproietta un punto BEV (normalizzato per bev_unit) nella visuale prospettica.
@@ -163,6 +439,9 @@ class ViolationDetector:
         pedestrians_in_roi = []
         vehicles_in_roi = []
 
+        # 0. Aggiorna l'intento di movimento dei pedoni (serve al gate sui falsi positivi)
+        self._update_intents(tracks, frame_idx)
+
         # 1. Smistamento tracce e check geometrici sulla ROI
         for t in tracks:
             if t.cls == 0:
@@ -177,22 +456,22 @@ class ViolationDetector:
         vehicles_in_roi.sort(key=lambda x: x.id)
 
         ttc_matrix = {}         # (veh_id, ped_id) -> float
+        pair_status = {}       # (veh_id, ped_id) -> label leggibile
         min_ttc_per_veh = {}    # veh_id -> float (min TTC positivo)
+        confirm_counts = {}     # veh_id -> frame di conferma consecutivi
         newly_triggered = set() # veh_id multati in questo esatto frame
 
-        # 2. Calcolo matrice completa TTC e controllo infrazioni
+        # 2. Valutazione conflitto intent-gated e controllo infrazioni
         for veh in vehicles_in_roi:
             min_pos_ttc = float('inf')
             trigger_ped = None
             trigger_ttc = None
 
             for ped in pedestrians_in_roi:
-                ttc = self.compute_ttc(
-                    veh.bev_pos, veh.bev_vel,
-                    ped.bev_pos, ped.bev_vel,
-                    conflict_radius=self.conflict_radius
-                )
+                intent = self.ped_intents.get(ped.id)
+                ttc, label = self.evaluate_conflict(veh, ped, intent)
                 ttc_matrix[(veh.id, ped.id)] = ttc
+                pair_status[(veh.id, ped.id)] = label
 
                 if ttc >= 0.0 and ttc < min_pos_ttc:
                     min_pos_ttc = ttc
@@ -204,10 +483,28 @@ class ViolationDetector:
 
             min_ttc_per_veh[veh.id] = min_pos_ttc
 
-            # Se c'è almeno un pedone con 0 <= TTC <= soglia e il veicolo non è già stato multato
-            if trigger_ped is not None and veh.id not in self.history_violators:
-                self._trigger_violation(frame, frame_idx, veh, trigger_ped, trigger_ttc, H_inv)
-                newly_triggered.add(veh.id)
+            # 2b. Persistenza: il conflitto deve essere confermato su N frame
+            # consecutivi e riferirsi allo stesso pedone.
+            pending = self.pending_conflicts.get(veh.id)
+            if trigger_ped is None:
+                self.pending_conflicts.pop(veh.id, None)
+                confirm_counts[veh.id] = 0
+            else:
+                if (pending is not None
+                        and pending['ped_id'] == trigger_ped.id
+                        and (frame_idx - pending['last_frame']) <= 2):
+                    pending['count'] += 1
+                    pending['last_frame'] = frame_idx
+                else:
+                    pending = {'ped_id': trigger_ped.id, 'count': 1, 'last_frame': frame_idx}
+                    self.pending_conflicts[veh.id] = pending
+                confirm_counts[veh.id] = pending['count']
+
+                # Se il veicolo non è già stato multato e il conflitto è confermato
+                if (pending['count'] >= self.confirm_frames
+                        and veh.id not in self.history_violators):
+                    self._trigger_violation(frame, frame_idx, veh, trigger_ped, trigger_ttc, H_inv)
+                    newly_triggered.add(veh.id)
 
         # 3. Gestione Uscita Veicoli Multati (Salvataggio 2° Immagine)
         active_ids = list(self.active_violations.keys())
@@ -250,8 +547,12 @@ class ViolationDetector:
             "violating_vehicle_ids": set(self.history_violators),
             "newly_triggered_ids": newly_triggered,
             "ttc_matrix": ttc_matrix,
+            "pair_status": pair_status,
             "min_ttc_per_veh": min_ttc_per_veh,
             "ttc_threshold": self.ttc_threshold,
+            "confirm_frames_required": self.confirm_frames,
+            "confirm_counts": confirm_counts,
+            "ped_intents": {pid: it.as_dict() for pid, it in self.ped_intents.items()},
         }
 
     def _trigger_violation(self, frame, frame_idx, veh, ped, ttc, H_inv):
@@ -264,6 +565,8 @@ class ViolationDetector:
         img_path = os.path.join(self.out_dir, f"{prefix}_start.jpg")
         json_path = os.path.join(self.out_dir, f"{prefix}.json")
 
+        intent = self.ped_intents.get(ped.id)
+
         data = {
             "video_frame": frame_idx,
             "vehicle_id": veh.id,
@@ -271,6 +574,7 @@ class ViolationDetector:
             "ttc_seconds": round(ttc, 3),
             "vehicle_centroid_perspective": veh_persp,
             "pedestrian_centroid_perspective": ped_persp,
+            "pedestrian_intent": intent.as_dict() if intent is not None else None,
             "images": {
                 "start_infraction": f"{prefix}_start.jpg",
                 "exit_infraction": None,

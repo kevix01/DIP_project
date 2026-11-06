@@ -2419,6 +2419,8 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="Soglia TTC per l'infrazione in secondi.")
     p.add_argument("--timeout-frames", type=int, default=45,
                    help="Frames da attendere per il salvataggio immagine di uscita se traccia persa.")
+    p.add_argument("--confirm-frames", type=int, default=3,
+                   help="Frame consecutivi di conflitto TTC richiesti per confermare l'infrazione.")
     return p
 
 
@@ -2507,7 +2509,9 @@ def main(argv=None):
             roi_file=v2args.roi_file,
             bev_unit=pipe._bev_unit_locked,
             ttc_threshold=v2args.ttc_thresh,
-            timeout_frames=v2args.timeout_frames
+            timeout_frames=v2args.timeout_frames,
+            fps=fps,
+            confirm_frames=v2args.confirm_frames,
         )
         # Assegna direttamente i punti parsati dal JSON alla pipeline
         pipe.roi_bev_points = violation_detector.roi.bev_points
@@ -2561,11 +2565,11 @@ def main(argv=None):
             for tail_state in pipe.lag_buffer.flush_remaining(pipe._tracker_map):
                 if tail_state is not None:
                     # === LOGICA INFRAZIONI TAIL ===
-                    if pipe.static_H_inv is not None:
+                    if pipe.static_H_inv is not None and violation_detector is not None:
                         violation_detector.process_frame(
-                            frame=ready_state.frame.copy(), 
-                            tracks=ready_state.tracks, 
-                            frame_idx=ready_state.frame_idx, 
+                            frame=tail_state.frame.copy(),
+                            tracks=tail_state.tracks,
+                            frame_idx=tail_state.frame_idx,
                             H_inv=pipe.static_H_inv
                         )
                     else: # la matrice di omografia inversa non è presente

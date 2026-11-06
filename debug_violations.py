@@ -257,6 +257,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
         min_ttc_map = dbg.get("min_ttc_per_veh", {})
         violators = dbg.get("violating_vehicle_ids", set())
         newly_trig = dbg.get("newly_triggered_ids", set())
+        confirm_map = dbg.get("confirm_counts", {})
         thresh = float(dbg.get("ttc_threshold", 2.5))
 
         # Linea di separazione superiore gialla/grigia
@@ -321,7 +322,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
         ]
         fixed_w = sum(w for _, w in fixed_cols) + 16
         rem_w = max(200, width - fixed_w - 16)
-        max_ped_cols = min(len(peds), max(1, rem_w // 135))
+        max_ped_cols = min(len(peds), max(1, rem_w // 165))
         peds_shown = peds[:max_ped_cols]
         ped_col_w = rem_w // max(len(peds_shown), 1)
 
@@ -336,16 +337,21 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
             cx += cw
 
         # Disegna intestazioni colonne Pedoni in ROI
+        intents = dbg.get("ped_intents", {})
         for ped in peds_shown:
             p_speed = float(np.linalg.norm(ped.bev_vel))
             title_p = f"PEDONE P{ped.id}"
-            sub_p = f"({ped.bev_pos[0]:+.1f},{ped.bev_pos[1]:+.1f}) v={p_speed:.1f}"
+            it = intents.get(ped.id, {})
+            it_state = it.get("state", "-")
+            it_flip = it.get("flip_angle", 0.0)
+            sub_p = f"({ped.bev_pos[0]:+.1f},{ped.bev_pos[1]:+.1f}) v={p_speed:.1f} {it_state[:4]}"
             cv2.putText(panel, title_p, (cx + 8, top_y + 18), cv2.FONT_HERSHEY_SIMPLEX,
                         0.48, (74, 178, 240), 2, cv2.LINE_AA)
             cv2.putText(panel, sub_p, (cx + 8, top_y + 36), cv2.FONT_HERSHEY_SIMPLEX,
                         0.38, (170, 175, 185), 1, cv2.LINE_AA)
-            cv2.line(panel, (cx + ped_col_w, top_y),
-                     (cx + ped_col_w, top_y + col_head_h + len(vehs_shown) * row_h),
+            cv2.putText(panel, f"flip {it_flip:.0f}d", (cx + 8, top_y + col_head_h - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (140, 145, 155), 1, cv2.LINE_AA)
+            cv2.line(panel, (cx, top_y), (cx, top_y + col_head_h + len(vehs_shown) * row_h),
                      (55, 55, 65), 1)
             cx += ped_col_w
 
@@ -362,6 +368,9 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
             v_speed = float(np.linalg.norm(veh.bev_vel))
             min_ttc = min_ttc_map.get(veh.id, float('inf'))
             min_ttc_str = f"{min_ttc:.2f} s" if np.isfinite(min_ttc) else "N/A"
+            conf_n = int(confirm_map.get(veh.id, 0))
+            conf_need = int(dbg.get("confirm_frames_required", 1))
+            conf_str = f" [{conf_n}/{conf_need}]" if conf_n > 0 else ""
 
             if is_new:
                 st_txt = "INFRAZIONE ORA!"
@@ -408,7 +417,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
             # 5. Min TTC
             cw = fixed_cols[4][1]
             min_col = (60, 60, 255) if min_ttc <= thresh else (120, 230, 120)
-            cv2.putText(panel, min_ttc_str, (cx + 10, ry + row_h - 10),
+            cv2.putText(panel, min_ttc_str + conf_str, (cx + 10, ry + row_h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, min_col, 2, cv2.LINE_AA)
             cx += cw
 
@@ -450,6 +459,14 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
                     cell_border = (75, 75, 85)
                     cell_txt = "NO COLL (corsia)"
                     txt_col = (175, 175, 185)
+                    font_w = 1
+                elif ttc_val == -4.0:
+                    # Il pedone sta tornando indietro / cambiando direzione:
+                    # falso positivo soppresso (non è un'infrazione)
+                    cell_bg = (60, 45, 20)
+                    cell_border = (90, 150, 220)
+                    cell_txt = "IN RITIRATA"
+                    txt_col = (215, 220, 240)
                     font_w = 1
                 elif ttc_val < 0.0:
                     # Traiettorie divergenti
@@ -555,6 +572,8 @@ def main(argv=None):
         ttc_threshold=v2args.ttc_thresh,
         timeout_frames=v2args.timeout_frames,
         save_files=not dbg_args.no_save_violations,
+        fps=fps,
+        confirm_frames=v2args.confirm_frames,
     )
     pipe.roi_bev_points = violation_detector.roi.bev_points
     pipe.roi_image_points = violation_detector.roi.image_points
