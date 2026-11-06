@@ -6,9 +6,11 @@ in coordinate BEV tramite omografia. Tutto e' caricabile da UI:
 sorgente, omografia, bev_unit e destinazione del salvataggio.
 """
 import argparse
+import hashlib
 import http.server
 import io
 import json
+import os
 import shutil
 import socketserver
 import sys
@@ -22,6 +24,10 @@ import cv2
 import numpy as np
 
 VIDEO_EXTS = {'.avi', '.mp4', '.mov', '.mkv', '.wmv', '.flv', '.webm'}
+
+# Persistent upload cache: an uploaded source must stay reachable after the
+# app exits, otherwise the ROI JSON would reference a deleted temp path.
+UPLOAD_CACHE = Path(os.path.expanduser('~')) / '.cache' / 'roi_bev_uploads'
 
 _tmp_paths = []
 
@@ -251,6 +257,10 @@ let TOTAL_FRAMES = INITIAL.total_frames;
 // CURRENT_FRAME_INDEX è 1-based (il "numero frame" che vede l'utente)
 let CURRENT_FRAME_INDEX = (INITIAL.frame_index || 0) + 1;
 let EXISTING_POINTS = INITIAL.existing_points;
+let SRC_FINGERPRINT = INITIAL.source_fingerprint || null;
+let SRC_ORIGINAL_NAME = INITIAL.source_original_name || '';
+let HOM_SOURCE = INITIAL.roi_homography_source || 'session';
+let BEV_SOURCE = INITIAL.roi_bev_unit_source || 'session';
 
 let img = null;
 let imgWidth = 0, imgHeight = 0;
@@ -319,6 +329,17 @@ function initRectangle() {
     {x: imgWidth*m,      y: imgHeight*(1-m)}
   ];
 }
+// Quando si carica una ROI esistente i vertici devono SOPRAVVIVERE al
+// ridisegno del frame: initRectangle() li sovrascriverebbe con il
+// rettangolo di default.
+let KEEP_POINTS_ON_NEXT_LOAD = false;
+// true quando i vertici correnti sono una ROIdefinita dall'utente (caricata
+// da JSON o modificata a mano): non vanno sovrascritti dal rettangolo
+// di default al cambio frame.
+let ROI_DEFINED = false;
+// true dopo "Cancella punti": l'utente ha svuotato la ROI e non deve
+// ricomparire un rettangolo di default al cambio frame.
+let POINTS_CLEARED = false;
 function fitToScreen() {
   if (!img) return;
   const cont = document.querySelector('.canvas-container');
@@ -344,9 +365,15 @@ function loadImage(url) {
     if (EXISTING_POINTS && EXISTING_POINTS.length) {
       points = EXISTING_POINTS.map(p => ({x: p[0], y: p[1]}));
       EXISTING_POINTS = null;
-    } else {
+      ROI_DEFINED = true;
+    } else if (!ROI_DEFINED && !POINTS_CLEARED && !KEEP_POINTS_ON_NEXT_LOAD) {
+      // I vertici esistenti (ROI caricata o modificata a mano) devono
+      // sopravvivere al cambio frame: il rettangolo di default e' creato
+      // solo quando non e' ancora stata definita alcuna ROI.
       initRectangle();
+      ROI_DEFINED = true;
     }
+    KEEP_POINTS_ON_NEXT_LOAD = false;
     selectedIdx = null;
     draw(); updateBEVDisplay();
     document.getElementById('canvasHint').textContent =
@@ -468,10 +495,12 @@ canvas.addEventListener('mousedown', e => {
       if (seg !== null) {
         const ip = toImage(cx, cy);
         points.splice(seg + 1, 0, ip);
+        ROI_DEFINED = true; POINTS_CLEARED = false;
         draw(); updateBEVDisplay();
       } else {
         const ip = toImage(cx, cy);
         points.push(ip);
+        ROI_DEFINED = true; POINTS_CLEARED = false;
         draw(); updateBEVDisplay();
       }
     }
@@ -505,8 +534,8 @@ canvas.addEventListener('wheel', e => {
 }, {passive:false});
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 
-function resetROI() { if (!img) return; initRectangle(); draw(); updateBEVDisplay(); setStatus('ROI reimpostata', 'info'); }
-function clearROI() { points = []; selectedIdx = null; draw(); updateBEVDisplay(); }
+function resetROI() { if (!img) return; initRectangle(); ROI_DEFINED = true; POINTS_CLEARED = false; draw(); updateBEVDisplay(); setStatus('ROI reimpostata', 'info'); }
+function clearROI() { points = []; ROI_DEFINED = false; POINTS_CLEARED = true; selectedIdx = null; draw(); updateBEVDisplay(); }
 
 async function loadFrame(idx) {
   // idx è 1-based (numero frame utente); l'API backend è 0-based
@@ -529,6 +558,9 @@ async function uploadSource() {
     imgWidth = info.img_width;
     imgHeight = info.img_height;
     SOURCE_FRAME = info.source;
+    SRC_FINGERPRINT = info.fingerprint || null;
+    SRC_ORIGINAL_NAME = info.filename || '';
+    HOM_SOURCE = 'session'; BEV_SOURCE = 'session';
     document.getElementById('sourceLabel').textContent = info.filename || file.name;
     document.getElementById('sourceZone').classList.add('loaded');
     document.getElementById('emptyState').style.display = 'none';
@@ -559,6 +591,7 @@ async function uploadHomography() {
     if (info.error) { setStatus(info.error, 'err'); return; }
     HOMOGRAFIA = info.matrix;
     HOMOGRAPHY_FILE = info.filename || file.name;
+    HOM_SOURCE = 'session';
     document.getElementById('homLabel').textContent = HOMOGRAPHY_FILE;
     document.getElementById('homStatus').textContent = '3x3 caricata';
     document.getElementById('homZone').classList.add('loaded');
@@ -576,6 +609,7 @@ async function uploadBevUnit() {
     if (info.error) { setStatus(info.error, 'err'); return; }
     BEV_UNIT = info.bev_unit;
     BEV_UNIT_FILE = info.filename || file.name;
+    BEV_SOURCE = 'session';
     document.getElementById('bevLabel').textContent = BEV_UNIT_FILE;
     document.getElementById('bevStatus').textContent = 'bev_unit = ' + BEV_UNIT;
     document.getElementById('bevZone').classList.add('loaded');
@@ -598,7 +632,20 @@ async function saveROI() {
     bev_unit_file: BEV_UNIT_FILE,
     bev_unit: BEV_UNIT,
     image_points: points.map(p => [p.x, p.y]),
-    bev_points: bevPoints
+    bev_points: bevPoints,
+    // Provenance of the calibration in use: from the ROI being edited or
+    // from the current session. Makes a silent re-projection auditable.
+    calibration_source: {
+      homography: HOM_SOURCE,
+      bev_unit: BEV_SOURCE,
+    },
+    source_width: imgWidth,
+    source_height: imgHeight,
+    source_fingerprint: SRC_FINGERPRINT,
+    source_original_name: SRC_ORIGINAL_NAME,
+    // Frame index is 1-based (the number the user sees); 0-based only in the
+    // internal API. Documented here so a later session can seek exactly.
+    source_frame_index_base: 1,
   };
   if (IS_VIDEO) {
     payload.source_video = SOURCE_FRAME;
@@ -647,14 +694,62 @@ document.getElementById('homFile').addEventListener('change', uploadHomography);
 document.getElementById('bevFile').addEventListener('change', uploadBevUnit);
 document.getElementById('loadRoiFile').addEventListener('change', async e => {
   const file = e.target.files[0]; if (!file) return;
+  setStatus('Caricamento ROI...', 'info');
   try {
-    const data = JSON.parse(await file.text());
-    if (!data.image_points) throw new Error('formato errato');
-    points = data.image_points.map(p => ({x: p[0], y: p[1]}));
+    const fd = new FormData(); fd.append('file', file);
+    const res = await fetch('/load-roi', {method:'POST', body: fd});
+    const info = await res.json();
+    if (info.error) { setStatus('File JSON non valido: ' + info.error, 'err'); return; }
+    points = info.points.map(p => ({x: p[0], y: p[1]}));
+    ROI_DEFINED = true;
+    POINTS_CLEARED = false;
     selectedIdx = null;
+    EXISTING_POINTS = null;
+    if (info.homography) {
+      HOMOGRAFIA = info.homography;
+      HOMOGRAPHY_FILE = info.homography_file || '';
+      HOM_SOURCE = 'roi';
+      document.getElementById('homLabel').textContent = HOMOGRAPHY_FILE || 'omografia (da ROI)';
+      document.getElementById('homStatus').textContent = '3x3 caricata (da ROI)';
+      document.getElementById('homZone').classList.add('loaded');
+    }
+    if (info.bev_unit !== null && info.bev_unit !== undefined) {
+      BEV_UNIT = info.bev_unit;
+      BEV_UNIT_FILE = info.bev_unit_file || '';
+      BEV_SOURCE = 'roi';
+      document.getElementById('bevLabel').textContent = BEV_UNIT_FILE || 'bev_unit (da ROI)';
+      document.getElementById('bevStatus').textContent = 'bev_unit = ' + BEV_UNIT;
+      document.getElementById('bevZone').classList.add('loaded');
+    }
     draw(); updateBEVDisplay();
-    setStatus('ROI caricata: ' + points.length + ' punti', 'ok');
-  } catch (err) { setStatus('File JSON non valido: ' + err.message, 'err'); }
+
+    // Warn about anything that does not line up with the current session.
+    const msgs = [];
+    const sc = info.source_check || {};
+    if (sc.ok === false) {
+      msgs.push('SORGENTE DIVERSA: ' + sc.reason + '. I punti immagine della ROI ' +
+                'non sono piu validi per il video caricato.');
+    }
+    if ((info.calibration_mismatch || []).length) {
+      msgs.push('Calibrazione: ' + info.calibration_mismatch.join(', ') +
+                '. La ROI viene ricalcolata con la calibrazione attuale.');
+    }
+    if (msgs.length) {
+      setStatus('ROI caricata: ' + points.length + ' punti - ' + msgs.join(' '), 'err');
+    } else {
+      setStatus('ROI caricata: ' + points.length + ' punti (provenienza e calibrazione verificate)', 'ok');
+    }
+    // Jump to the reference frame of the ROI, if the source allows it.
+    if (info.roi_frame_index !== null && info.roi_frame_index !== undefined && IS_VIDEO) {
+      const idx = Math.min(Math.max(info.roi_frame_index + 1, 1), TOTAL_FRAMES);
+      document.getElementById('frameSlider').value = idx;
+      document.getElementById('frameInput').value = idx;
+      document.getElementById('frameIdxDisplay').textContent = 'Frame ' + idx + ' / ' + TOTAL_FRAMES;
+      // I vertici della ROI devono sopravvivere al ridisegno del frame.
+      KEEP_POINTS_ON_NEXT_LOAD = true;
+      await loadFrame(idx);
+    }
+  } catch (err) { setStatus('Errore: ' + err.message, 'err'); }
 });
 
 const slider = document.getElementById('frameSlider');
@@ -703,6 +798,11 @@ if (INITIAL.has_source) {
   }
   loadFrame(CURRENT_FRAME_INDEX);
 }
+if (INITIAL.initial_warnings && INITIAL.initial_warnings.length) {
+  setStatus(INITIAL.initial_warnings.join(' '), 'err');
+} else if (INITIAL.initial_notices && INITIAL.initial_notices.length) {
+  setStatus(INITIAL.initial_notices.join(' '), 'info');
+}
 </script>
 </body>
 </html>"""
@@ -723,7 +823,14 @@ def parse_multipart(body, content_type):
     delim = b'--' + boundary.encode()
     result = {}
     for chunk in body.split(delim):
-        chunk = chunk.strip(b'\r\n')
+        # Solo i terminatori di riga che circondano le boundary vanno rimossi:
+        # il contenuto binario del file deve restare byte-per-byte identico
+        # (strip() sui dati corrompeva i file che iniziano/finiscono con
+        # 0x0A o 0x0D, invalidando anche il fingerprint).
+        if chunk.startswith(b'\r\n'):
+            chunk = chunk[2:]
+        if chunk.endswith(b'\r\n'):
+            chunk = chunk[:-2]
         if not chunk or chunk == b'--':
             continue
         try:
@@ -759,13 +866,85 @@ def load_homography_from_bytes(data, filename):
     return np.loadtxt(io.StringIO(text)).astype(np.float64)
 
 
+def file_fingerprint(path, chunk=1 << 20):
+    """Content fingerprint of a media file.
+
+    Identifies the file by CONTENT, not by path: size, mtime and a SHA1 over
+    the first and last chunks (plus the middle one) are enough to tell two
+    different videos apart while staying cheap on large files. The ROI JSON
+    stores it so a later session can verify it is editing the same source.
+    """
+    path = Path(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    h = hashlib.sha1()
+    with path.open('rb') as f:
+        h.update(f.read(chunk))
+        if st.st_size > 2 * chunk:
+            f.seek(max(0, st.st_size // 2 - chunk // 2))
+            h.update(f.read(chunk))
+            f.seek(max(0, st.st_size - chunk))
+            h.update(f.read(chunk))
+    return {
+        'size': int(st.st_size),
+        'mtime': int(st.st_mtime),
+        'sha1_head': h.hexdigest(),
+    }
+
+
 def save_temp_upload(data, filename):
-    suffix = Path(filename or 'upload').suffix
-    tmpdir = tempfile.mkdtemp(prefix='roi_bev_')
-    path = Path(tmpdir) / ('upload' + suffix)
-    path.write_bytes(data)
-    _tmp_paths.append(tmpdir)
+    """Store an uploaded source in a persistent, content-addressed cache.
+
+    The old implementation used a temp dir that was deleted on exit, so a ROI
+    saved from an uploaded source pointed at a file that no longer existed.
+    Now the file lives in ``~/.cache/roi_bev_uploads/<sha1>.<ext>``: the path
+    stays valid across sessions, and re-uploading the same bytes reuses it.
+    """
+    suffix = Path(filename or 'upload').suffix or '.bin'
+    digest = hashlib.sha1(data).hexdigest()
+    try:
+        UPLOAD_CACHE.mkdir(parents=True, exist_ok=True)
+        path = UPLOAD_CACHE / (digest + suffix)
+        if not path.exists() or path.stat().st_size != len(data):
+            path.write_bytes(data)
+    except OSError:
+        # Fallback: keep it in a temp dir for this session only.
+        tmpdir = tempfile.mkdtemp(prefix='roi_bev_')
+        path = Path(tmpdir) / ('upload' + suffix)
+        path.write_bytes(data)
+        _tmp_paths.append(tmpdir)
     return path
+
+
+def read_frame_at(path, index):
+    """Read a frame by index, seeking accurately.
+
+    ``CAP_PROP_POS_FRAMES`` is keyframe-based on some backends: it can land on
+    a nearby frame instead of the requested one. The position is therefore
+    verified after the seek, and the frame is re-read sequentially when it
+    does not match.
+    """
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+    ret, frame = cap.read()
+    if ret and frame is not None:
+        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        if pos != int(index) + 1:
+            # Seek landed on the wrong frame: decode sequentially to be exact.
+            cap.release()
+            cap = cv2.VideoCapture(str(path))
+            if not cap.isOpened():
+                return None
+            for i in range(int(index) + 1):
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+    cap.release()
+    return frame if (ret and frame is not None) else None
 
 
 def probe_source(path):
@@ -778,16 +957,43 @@ def probe_source(path):
         if not ret or frame is None:
             raise ValueError('video non leggibile')
         h, w = frame.shape[:2]
-        return {'is_video': True, 'total_frames': total, 'img_width': w, 'img_height': h}
+        return {'is_video': True, 'total_frames': total, 'img_width': w,
+                'img_height': h, 'fingerprint': file_fingerprint(path)}
     img = cv2.imread(str(path))
     if img is None:
         raise ValueError('immagine non leggibile')
     h, w = img.shape[:2]
-    return {'is_video': False, 'total_frames': 1, 'img_width': w, 'img_height': h}
+    return {'is_video': False, 'total_frames': 1, 'img_width': w,
+            'img_height': h, 'fingerprint': file_fingerprint(path)}
+
+
+def compare_fingerprint(expected, path):
+    """Compare a stored fingerprint with the current file.
+
+    Returns (match, reason). ``expected`` may be missing/partial (older ROI
+    files): then only the fields that are actually stored are compared, and
+    the result is reported as 'unknown' rather than 'match'.
+    """
+    if not expected:
+        return False, 'nessun fingerprint registrato'
+    if not path:
+        return False, 'nessuna sorgente caricata'
+    current = file_fingerprint(path)
+    if not current:
+        return False, 'sorgente non raggiungibile'
+    if 'size' in expected and int(expected['size']) != current['size']:
+        return False, (f"dimensione file diversa "
+                       f"({expected['size']} vs {current['size']} byte)")
+    if 'sha1_head' in expected and expected['sha1_head'] != current['sha1_head']:
+        return False, 'contenuto del file diverso (sha1 non corrispondente)'
+    if 'size' not in expected and 'sha1_head' not in expected:
+        return False, 'fingerprint non confrontabile'
+    return True, 'sorgente verificata'
 
 
 class ROIHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
     should_stop = False
     server_instance = None
 
@@ -806,7 +1012,19 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
     homography_file = ''
     bev_unit_file = ''
     source_frame = ''
+    source_original_name = ''
+    source_fingerprint = {}
     output_path = 'roi_bev.json'
+    # Provenance of the ROI currently open (restored from its JSON).
+    roi_provenance = None      # dict as stored in the ROI file
+    roi_source_fingerprint = None
+    roi_source_width = 0
+    roi_source_height = 0
+    roi_source_is_video = None
+    roi_frame_index = None     # 0-based index of the reference frame
+    active_homography_source = 'session'   # 'session' | 'roi'
+    active_bev_unit_source = 'session'     # 'session' | 'roi'
+    warnings = []
 
     def log_message(self, fmt, *args):
         pass
@@ -831,11 +1049,8 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
             idx = int(params.get('index', ['0'])[0])
             try:
                 if self.is_video and self.video_path:
-                    cap = cv2.VideoCapture(str(self.video_path))
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame = cap.read()
-                    cap.release()
-                    if not ret or frame is None:
+                    frame = read_frame_at(self.video_path, idx)
+                    if frame is None:
                         self._send_json({'error': f'frame {idx} non disponibile'}, 400)
                         return
                 elif self.image_path:
@@ -872,7 +1087,16 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
                     return
                 f = fields['file']
                 tmp_path = save_temp_upload(f['data'], f.get('filename'))
-                info = probe_source(tmp_path)
+                try:
+                    info = probe_source(tmp_path)
+                except Exception as e:
+                    # Non lasciare spazzatura nella cache per file non validi.
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    self._send_json({'error': f'sorgente non leggibile: {e}'}, 400)
+                    return
                 # NB: assegna a livello di CLASSE, non di istanza:
                 # ogni richiesta HTTP crea un nuovo handler, e gli attributi
                 # di istanza verrebbero persi tra una richiesta e l'altra.
@@ -891,6 +1115,10 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
                 resp = dict(info)
                 resp['source'] = str(tmp_path)
                 resp['filename'] = f.get('filename') or 'upload'
+                # The original name matters for the ROI JSON: the cached path
+                # is content-addressed and says nothing about the source.
+                ROIHandler.source_original_name = resp['filename']
+                ROIHandler.source_fingerprint = info.get('fingerprint', {})
                 self._send_json(resp)
             except Exception as e:
                 self._send_json({'error': str(e)}, 500)
@@ -926,6 +1154,85 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({'error': str(e)}, 500)
 
+        elif parsed.path == '/load-roi':
+            try:
+                fields = parse_multipart(body, ct)
+                if 'file' not in fields:
+                    self._send_json({'error': 'nessun file'}, 400)
+                    return
+                f = fields['file']
+                data = json.loads(f['data'].decode('utf-8', errors='replace'))
+                if not data.get('image_points'):
+                    self._send_json({'error': 'formato errato: mancano image_points'}, 400)
+                    return
+                pts = data['image_points']
+                ROIHandler.roi_provenance = {
+                    'homography_file': data.get('homography_file', ''),
+                    'bev_unit_file': data.get('bev_unit_file', ''),
+                    'bev_unit': data.get('bev_unit'),
+                    'source_video': data.get('source_video'),
+                    'source_frame': data.get('source_frame'),
+                    'source_video_frame_id': data.get('source_video_frame_id'),
+                    'source_fingerprint': data.get('source_fingerprint'),
+                    'source_width': data.get('source_width'),
+                    'source_height': data.get('source_height'),
+                }
+                ROIHandler.roi_source_fingerprint = \
+                    ROIHandler.roi_provenance.get('source_fingerprint')
+                ROIHandler.roi_source_width = \
+                    int(ROIHandler.roi_provenance.get('source_width') or 0)
+                ROIHandler.roi_source_height = \
+                    int(ROIHandler.roi_provenance.get('source_height') or 0)
+                ROIHandler.roi_frame_index = None
+                fid = ROIHandler.roi_provenance.get('source_video_frame_id')
+                if fid is not None:
+                    # Stored 1-based (what the user sees); internally 0-based.
+                    ROIHandler.roi_frame_index = max(0, int(fid) - 1)
+
+                # Verify the source currently loaded against the ROI's one.
+                src_check = check_roi_source(data)
+
+                # Restore the ROI's own calibration so the ROI is edited in the
+                # gauge it was created in.
+                prov = restore_roi_provenance(data)
+                ROIHandler.roi_frame_index = prov['roi_frame_index']
+                calib_mismatch = list(prov['mismatch'])
+                if prov['homography'] is not None:
+                    if ROIHandler.homography is not None and \
+                            not np.allclose(np.asarray(ROIHandler.homography),
+                                            np.asarray(prov['homography']),
+                                            atol=1e-9):
+                        calib_mismatch.append('omografia diversa da sessione')
+                    ROIHandler.homography = prov['homography']
+                    ROIHandler.homography_file = prov['homography_file']
+                    ROIHandler.active_homography_source = 'roi'
+                else:
+                    ROIHandler.active_homography_source = 'session'
+                if prov['bev_unit'] is not None:
+                    if ROIHandler.bev_unit is not None and \
+                            abs(float(ROIHandler.bev_unit) - prov['bev_unit']) > 1e-12:
+                        calib_mismatch.append('bev_unit diverso da sessione')
+                    ROIHandler.bev_unit = prov['bev_unit']
+                    ROIHandler.bev_unit_file = prov['bev_unit_file']
+                    ROIHandler.active_bev_unit_source = 'roi'
+                else:
+                    ROIHandler.active_bev_unit_source = 'session'
+
+                self._send_json({
+                    'points': pts,
+                    'provenance': ROIHandler.roi_provenance,
+                    'source_check': src_check,
+                    'restored': prov['restored'],
+                    'calibration_mismatch': calib_mismatch,
+                    'homography': ROIHandler.homography,
+                    'homography_file': ROIHandler.homography_file,
+                    'bev_unit': ROIHandler.bev_unit,
+                    'bev_unit_file': ROIHandler.bev_unit_file,
+                    'roi_frame_index': ROIHandler.roi_frame_index,
+                })
+            except Exception as e:
+                self._send_json({'error': str(e)}, 500)
+
         elif parsed.path == '/quit':
             ROIHTTPServer.should_stop = True
             self.send_response(200)
@@ -936,6 +1243,100 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
             )).start()
         else:
             self.send_error(404)
+
+
+def restore_roi_provenance(data, roi_path=None):
+    """Restore the calibration a ROI was created with.
+
+    A ROI stores the homography/bev_unit it was computed with. Editing it with
+    a DIFFERENT calibration silently re-projects it into another gauge, so the
+    original one is restored here (when its files can be found) and any
+    mismatch with the session calibration is reported.
+
+    Returns a dict with the restored values and the list of mismatches.
+    """
+    out = {'homography': None, 'homography_file': '', 'bev_unit': None,
+           'bev_unit_file': '', 'restored': [], 'mismatch': [],
+           'roi_frame_index': None, 'source_check': {'ok': None,
+                                                     'reason': 'nessuna sorgente caricata'}}
+    roi_dir = Path(roi_path).resolve().parent if roi_path else Path.cwd()
+    proj_dir = Path(__file__).resolve().parent
+
+    def _find(name):
+        if not name:
+            return None
+        for cand in (Path(name), roi_dir / name, Path.cwd() / name,
+                     proj_dir / name):
+            try:
+                if cand.exists() and cand.is_file():
+                    return cand
+            except OSError:
+                continue
+        return None
+
+    hom_name = data.get('homography_file') or ''
+    H = None
+    cand = _find(hom_name)
+    if cand is not None:
+        try:
+            M = load_homography_from_bytes(cand.read_bytes(), str(cand))
+            if M.shape == (3, 3):
+                H = M.tolist()
+                out['homography_file'] = cand.name
+        except Exception:
+            H = None
+    if H is not None:
+        out['homography'] = H
+        out['restored'].append('omografia')
+    else:
+        out['mismatch'].append('omografia non recuperata')
+
+    bev_name = data.get('bev_unit_file') or ''
+    bev = None
+    cand = _find(bev_name)
+    if cand is not None:
+        try:
+            bev = float(cand.read_text().strip())
+            out['bev_unit_file'] = cand.name
+        except Exception:
+            bev = None
+    if bev is None and data.get('bev_unit'):
+        try:
+            bev = float(data['bev_unit'])
+            out['bev_unit_file'] = data.get('bev_unit_file', '')
+        except (TypeError, ValueError):
+            bev = None
+    if bev is not None:
+        out['bev_unit'] = bev
+        out['restored'].append('bev_unit')
+    else:
+        out['mismatch'].append('bev_unit non recuperata')
+
+    fid = data.get('source_video_frame_id')
+    if fid is not None:
+        # Stored 1-based (what the user sees); internally 0-based.
+        out['roi_frame_index'] = max(0, int(fid) - 1)
+    return out
+
+
+def check_roi_source(data):
+    """Verify the loaded source is the one the ROI was made on."""
+    cur = ROIHandler.video_path or ROIHandler.image_path
+    if not cur or not Path(str(cur)).exists():
+        return {'ok': None, 'reason': 'nessuna sorgente caricata'}
+    fp = data.get('source_fingerprint')
+    if fp:
+        return dict(zip(('ok', 'reason'), compare_fingerprint(fp, cur)))
+    w = int(data.get('source_width') or 0)
+    h = int(data.get('source_height') or 0)
+    if w and h:
+        same = (ROIHandler.img_width == w and ROIHandler.img_height == h)
+        return {'ok': same,
+                'reason': ('dimensioni compatibili' if same else
+                           f'dimensioni diverse: sorgente '
+                           f'{ROIHandler.img_width}x{ROIHandler.img_height} '
+                           f'vs ROI {w}x{h}')}
+    return {'ok': None, 'reason': 'ROI senza metadati di sorgente'}
 
 
 def build_arg_parser():
@@ -951,12 +1352,19 @@ def build_arg_parser():
                     help='File ROI JSON da pre-caricare (opzionale)')
     ap.add_argument('--output', default='roi_bev.json',
                     help='Nome suggerito per il file di output (default: roi_bev.json)')
-    ap.add_argument('--frame-index', type=int, default=0,
-                    help='Indice frame iniziale per video (default: 0)')
+    ap.add_argument('--frame-index', type=int, default=1,
+                    help='Indice frame iniziale per video, 1-based come nel '
+                         'ROI JSON (default: 1, il primo frame)')
     ap.add_argument('--port', type=int, default=8080,
                     help='Porta del server HTTP (default: 8080)')
     ap.add_argument('--no-browser', action='store_true',
                     help='Non aprire il browser automaticamente')
+    ap.add_argument('--reset-calibration-from-roi', action='store_true',
+                    help='Quando si pre-carica una ROI, ripristina omografia e '
+                         'bev_unit di provenienza invece di usare quelli di '
+                         'sessione (default: attivo)')
+    ap.add_argument('--keep-session-calibration', action='store_true',
+                    help='Non ripristinare la calibrazione di provenienza della ROI')
     return ap
 
 
@@ -970,6 +1378,9 @@ def main(argv=None):
         'has_homography': False, 'homography': None, 'homography_file': '',
         'has_bev_unit': False, 'bev_unit': None, 'bev_unit_file': '',
         'existing_points': None, 'output_file': args.output,
+        'source_fingerprint': None, 'source_original_name': '',
+        'roi_homography_source': 'session', 'roi_bev_unit_source': 'session',
+        'initial_warnings': [], 'initial_notices': [],
     }
 
     # omografia (opzionale)
@@ -1011,16 +1422,22 @@ def main(argv=None):
                 ROIHandler.video_path = None
             ROIHandler.is_video = info['is_video']
             ROIHandler.total_frames = info['total_frames']
-            ROIHandler.frame_index = max(0, min(args.frame_index, info['total_frames'] - 1))
+            # --frame-index is 1-based (same base as the ROI JSON).
+            ROIHandler.frame_index = max(
+                0, min(args.frame_index - 1, info['total_frames'] - 1))
             ROIHandler.img_width = info['img_width']
             ROIHandler.img_height = info['img_height']
             ROIHandler.source_frame = str(Path(args.frame).resolve())
+            ROIHandler.source_original_name = Path(args.frame).name
+            ROIHandler.source_fingerprint = info.get('fingerprint', {})
             initial.update({
                 'has_source': True, 'is_video': info['is_video'],
                 'total_frames': info['total_frames'],
                 'frame_index': ROIHandler.frame_index,
                 'img_width': info['img_width'], 'img_height': info['img_height'],
                 'source': ROIHandler.source_frame, 'filename': Path(args.frame).name,
+                'source_fingerprint': ROIHandler.source_fingerprint,
+                'source_original_name': ROIHandler.source_original_name,
             })
             print(f'[info] sorgente: {args.frame} ({info["img_width"]}x{info["img_height"]})')
         except Exception as e:
@@ -1032,7 +1449,88 @@ def main(argv=None):
             data = json.loads(Path(args.roi).read_text(encoding='utf-8'))
             pts = data.get('image_points', [])
             initial['existing_points'] = pts
+            ROIHandler.roi_provenance = {
+                'homography_file': data.get('homography_file', ''),
+                'bev_unit_file': data.get('bev_unit_file', ''),
+                'bev_unit': data.get('bev_unit'),
+                'source_video': data.get('source_video'),
+                'source_frame': data.get('source_frame'),
+                'source_video_frame_id': data.get('source_video_frame_id'),
+                'source_fingerprint': data.get('source_fingerprint'),
+                'source_width': data.get('source_width'),
+                'source_height': data.get('source_height'),
+            }
+            ROIHandler.roi_source_fingerprint = \
+                ROIHandler.roi_provenance.get('source_fingerprint')
+            ROIHandler.roi_source_width = \
+                int(ROIHandler.roi_provenance.get('source_width') or 0)
+            ROIHandler.roi_source_height = \
+                int(ROIHandler.roi_provenance.get('source_height') or 0)
             print(f'[info] ROI pre-caricata: {len(pts)} vertici')
+
+            # Verify the source against the ROI's own source.
+            src_check = check_roi_source(data)
+            ROIHandler.roi_source_fingerprint = data.get('source_fingerprint')
+            if src_check.get('ok') is False:
+                print(f'[warn] sorgente NON corrispondente alla ROI: '
+                      f'{src_check.get("reason")}')
+                initial['initial_warnings'].append(
+                    'SORGENTE DIVERSA: ' + str(src_check.get('reason')) +
+                    '. I punti immagine della ROI non sono piu validi per la '
+                    'sorgente caricata.')
+            elif src_check.get('ok') is True:
+                print(f'[info] sorgente: {src_check.get("reason")}')
+                initial['initial_notices'].append(
+                    'Sorgente verificata con la ROI (' +
+                    str(src_check.get('reason')) + ').')
+
+            # Restore the calibration the ROI was created with, unless the
+            # user asked to keep the session one.
+            prov = restore_roi_provenance(data, args.roi)
+            ROIHandler.roi_frame_index = prov['roi_frame_index']
+            initial['roi_frame_index'] = prov['roi_frame_index']
+            # Se la ROI ha un frame di riferimento e l'utente non ne ha
+            # indicato uno esplicitamente, posizionarsi su quel frame.
+            if (prov['roi_frame_index'] is not None and args.frame_index == 1
+                    and ROIHandler.is_video and initial.get('has_source')):
+                ROIHandler.frame_index = min(prov['roi_frame_index'],
+                                             ROIHandler.total_frames - 1)
+                initial['frame_index'] = ROIHandler.frame_index
+                print(f'[info] posizionamento sul frame di riferimento '
+                      f'della ROI: {ROIHandler.frame_index + 1}')
+            if not args.keep_session_calibration:
+                if prov['homography'] is not None:
+                    ROIHandler.homography = prov['homography']
+                    ROIHandler.homography_file = prov['homography_file']
+                    initial['has_homography'] = True
+                    initial['homography'] = prov['homography']
+                    initial['homography_file'] = prov['homography_file']
+                    ROIHandler.active_homography_source = 'roi'
+                    initial['roi_homography_source'] = 'roi'
+                if prov['bev_unit'] is not None:
+                    ROIHandler.bev_unit = prov['bev_unit']
+                    ROIHandler.bev_unit_file = prov['bev_unit_file']
+                    initial['has_bev_unit'] = True
+                    initial['bev_unit'] = prov['bev_unit']
+                    initial['bev_unit_file'] = prov['bev_unit_file']
+                    ROIHandler.active_bev_unit_source = 'roi'
+                    initial['roi_bev_unit_source'] = 'roi'
+                print(f'[info] calibrazione di provenienza ROI: '
+                      f'{", ".join(prov["restored"]) or "nessuna"}'
+                      + (f' | avvisi: {", ".join(prov["mismatch"])}'
+                         if prov['mismatch'] else ''))
+                for m in prov['mismatch']:
+                    initial['initial_warnings'].append(
+                        'Calibrazione di provenienza non recuperata: ' + m +
+                        '. La ROI viene ricalcolata con la calibrazione in uso.')
+                if prov['restored']:
+                    initial['initial_notices'].append(
+                        'Calibrazione di provenienza ripristinata: ' +
+                        ', '.join(prov['restored']) + '.')
+                if src_check.get('ok') is False:
+                    print('[warn] i punti immagine della ROI non sono validi '
+                          'per la sorgente caricata: la ROI verra\' ricalcolata '
+                          'nella calibrazione corrente.')
         except Exception as e:
             print(f'[warn] ROI non caricata: {e}')
 

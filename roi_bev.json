@@ -24,8 +24,8 @@
       289.2265684931167
     ],
     [
-      524.1057542768274,
-      291.84307053849096
+      531.5707620528772,
+      295.5756094701909
     ],
     [
       179.47122861586314,
@@ -62,8 +62,8 @@
       -1.851102614780149
     ],
     [
-      -0.5392721189195719,
-      -1.7955460990590855
+      -0.4872870805977711,
+      -1.7438814341051068
     ],
     [
       -2.7904812125241727,
@@ -79,5 +79,18 @@
     ]
   ],
   "source_video": "/home/kevin/Scrivania/DIP_project/video_dataset_bangkok/video_041_tagliato_2.avi",
-  "source_video_frame_id": 1
+  "source_video_frame_id": 1,
+  "source_fingerprint": {
+    "size": 62207670,
+    "mtime": 1792156855,
+    "sha1_head": "bae01a9880069e0170954bf66b9d3a85a3292080"
+  },
+  "source_width": 1200,
+  "source_height": 1100,
+  "source_original_name": "video_041_tagliato_2.avi",
+  "source_frame_index_base": 1,
+  "calibration_source": {
+    "homography": "roi",
+    "bev_unit": "roi"
+  }
 }
