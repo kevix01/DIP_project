@@ -93,7 +93,6 @@ class PedIntent:
     flip_deg: float = 45.0         # angolo oltre il quale si considera un cambio direzione
     retreat_cos: float = -0.5      # coseno sotto il quale il moto recente è "in ritirata"
     retreat_dist: float = 0.05     # BEU di spostamento minimo sulla finestra step
-    short_min_dist: float = 0.10   # BEU netti su finestra short perché dir_short prevalga su dir_long
     hist: deque = field(default_factory=lambda: deque(maxlen=256))
     raw_hist: deque = field(default_factory=lambda: deque(maxlen=64))
     last_seen_frame: int = -1
@@ -102,7 +101,6 @@ class PedIntent:
     speed_long: float = 0.0
     speed_short: float = 0.0
     speed_step: float = 0.0
-    short_dist: float = 0.0
     flip_angle: float = 0.0
     retreating: bool = False       # veto sticky: una volta in retirata resta fino a nuovo moto netto
     dir_long: object = None
@@ -171,7 +169,6 @@ class PedIntent:
         self.speed_short = short_v[1] if short_v else 0.0
         self.dir_step = step_v[0] if step_v else None
         self.speed_step = step_v[1] if step_v else 0.0
-        self.short_dist = short_v[2] if short_v else 0.0
 
         zero = np.zeros(2, dtype=np.float64)
 
@@ -238,7 +235,6 @@ class PedIntent:
             "speed_long": round(float(self.speed_long), 3),
             "speed_short": round(float(self.speed_short), 3),
             "speed_step": round(float(self.speed_step), 3),
-            "short_dist": round(float(self.short_dist), 3),
             "flip_angle": round(float(self.flip_angle), 1),
             "retreating": bool(self.retreating),
         }
@@ -256,7 +252,6 @@ class ViolationDetector:
                   intent_retreat_cos: float = -0.5,
                   intent_step_s: float = 0.25,
                   intent_retreat_dist: float = 0.05,
-                  intent_short_min_dist: float = 0.10,
                   lateral_pass_dlat: float = 0.45,
                   lateral_pass_cpa: float = 0.75,
                   lateral_pass_away: float = 0.05):
@@ -275,7 +270,6 @@ class ViolationDetector:
         self.intent_short_frames = max(6, int(round(intent_short_s * self.fps)))
         self.intent_step_frames = max(3, int(round(intent_step_s * self.fps)))
         self.intent_retreat_dist = float(intent_retreat_dist)
-        self.intent_short_min_dist = float(intent_short_min_dist)
         self.intent_moving_speed = float(intent_moving_speed)
         self.intent_stopped_speed = float(intent_stopped_speed)
         self.intent_flip_deg = float(intent_flip_deg)
@@ -410,21 +404,26 @@ class ViolationDetector:
         if d_long < -0.4:
             return -2.0, "OLTRE VEICOLO"
 
-        # Pedone lateralmente fuori dalla linea del veicolo e in allontanamento:
-        # ha già attraversato la corsia, nessun conflitto futuro.
+        # Geometria laterale condivisa dai controlli successivi:
+        # r_lat/d_lat (distanza del pedone dalla linea di marcia del veicolo),
+        # u_lat (versore laterale verso il pedone) e away_lat (quota della
+        # velocita' INTENZIONALE del pedone lungo tale verso).
         r_lat = r - d_long * u_veh
         d_lat = float(np.linalg.norm(r_lat))
-        v_int_probe = intent.effective_vel if intent is not None else None
-        if (d_lat > 0.6 and v_int_probe is not None
-                and float(np.linalg.norm(v_int_probe)) > 0.05 and d_lat > 0.0):
-            u_lat = r_lat / d_lat
-            if float(np.dot(np.asarray(v_int_probe, dtype=np.float64), u_lat)) > 0.08:
-                return -2.0, "PASSATO (oltre)"
+        u_lat = r_lat / d_lat if d_lat > 1e-9 else None
 
-        v_int = intent.effective_vel if intent is not None else np.zeros(2)
+        v_int = intent.effective_vel if intent is not None else None
         if v_int is None:
             v_int = np.zeros(2, dtype=np.float64)
+        v_int = np.asarray(v_int, dtype=np.float64)
         int_speed = float(np.linalg.norm(v_int))
+        away_lat = float(np.dot(v_int, u_lat)) if u_lat is not None else 0.0
+
+        # Pedone lateralmente fuori dalla linea del veicolo e in allontanamento:
+        # ha gia' attraversato la corsia, nessun conflitto futuro.
+        # Pre-filtro economico: la verifica rigorosa e' il veto laterale qui sotto.
+        if d_lat > 0.6 and int_speed > 0.05 and away_lat > 0.08:
+            return -2.0, "PASSATO (oltre)"
 
         if int_speed > 0.05:
             # Pedone in moto: CPA tra veicolo e traiettoria INTENZIONALE del pedone.
@@ -450,11 +449,6 @@ class ViolationDetector:
             # il TTC e' un falso positivo geometrico.
             n_lat = np.array([-u_veh[1], u_veh[0]], dtype=np.float64)
             lat_cpa = abs(float(np.dot(d_cpa_vec, n_lat)))
-            if d_lat > 0.0:
-                u_lat = r_lat / d_lat
-                away_lat = float(np.dot(v_int, u_lat))
-            else:
-                away_lat = 0.0
             if (d_lat >= self.lateral_pass_dlat
                     and lat_cpa >= self.lateral_pass_cpa
                     and away_lat > self.lateral_pass_away):
@@ -470,9 +464,7 @@ class ViolationDetector:
         # Pedone fermo: resta occupante statico della zona di conflitto.
         # Il veicolo lo raggiungerà se la sua traiettoria futura passa entro
         # conflict_radius dalla sua posizione.
-        r_lat = r - d_long * u_veh
-        d_line = float(np.linalg.norm(r_lat))
-        if d_line > self.conflict_radius:
+        if d_lat > self.conflict_radius:
             return -3.0, "CORSIE DIVERSE"
         t_arrive = d_long / veh_speed
         if t_arrive > self.ttc_threshold:
@@ -495,7 +487,6 @@ class ViolationDetector:
                     step_frames=self.intent_step_frames,
                     retreat_cos=self.intent_retreat_cos,
                     retreat_dist=self.intent_retreat_dist,
-                    short_min_dist=self.intent_short_min_dist,
                     moving_speed=self.intent_moving_speed,
                     stopped_speed=self.intent_stopped_speed,
                     flip_deg=self.intent_flip_deg,
