@@ -87,6 +87,7 @@ Per una calibrazione affidabile il video deve avere:
 | `--imgsz` | `640` | Risoluzione di inferenza (deve corrispondere alla scala del checkpoint) |
 | `--device` | `cuda:0` | Device di inferenza |
 | `--max-frames` | `1500` | Stop automatico dopo N frame (`0` = tutto il video) |
+| `--no-robust` | *off* | Disattiva i pesi IRLS Cauchy (`OrthoHomographySolver(robust=False)`): i corner outlier non vengono rigettati. Solo per confronto diagnostico — vedi §6.3 |
 
 ---
 
@@ -131,7 +132,8 @@ Il flusso, in ordine di esecuzione:
    essenziali, residui = coseni degli angoli delle footprint + parallelismo
    opposto, pesi IRLS Cauchy) su **tutte** le footprint raccolte: una sola
    omografia per tutto il video, come fa `_apply_global_homography` offline
-   nella pipeline.
+   nella pipeline. Il flag `--no-robust` disattiva i pesi IRLS Cauchy
+   (vedi §6.3).
 6. **bev_unit** — mediana di √(larghezza×lunghezza) delle footprint proiettate
    con la H appena estratta (formula di `_class_footprint_dims`).
 7. **Salvataggio** dei tre file descritti sopra.
@@ -140,7 +142,7 @@ Il flusso, in ordine di esecuzione:
 
 ## 6. Interpretazione dei risultati
 
-### La gauge dell'omografia
+### 6.1 La gauge dell'omografia
 
 Il solver ortogonale stima la rettifica del piano stradale **a meno di una
 similarity** (rotazione + scala uniforme + traslazione in BEV): questi gradi
@@ -148,13 +150,52 @@ di libertà sono invisibili all'obiettivo di rettangolarità. Conseguenze:
 
 - Due solve sullo stesso video (o su versioni diverse dello script) producono
   H **numericamente diverse** ma **geometricamente equivalenti**: una
-  verifica sui dati Bangkok ha mostrato che vecchia e nuova H differiscono
-  per una scala di gauge ×1.255 e una rotazione di −0.8°, con qualità di
-  rettifica pari (la nuova persino leggermente migliore: loss 314.7 vs 327.6
-  su 6526 footprint).
+  verifica sui dati Bangkok (§6.2) mostra che la H in uso nel repo e quella
+  appena estratta differiscono per una scala di gauge ≈ 1.24 e una
+  rotazione di ≈ −2.5°.
 - **La bev_unit è coerente solo con la H che l'ha generata.** È espresso
   nella stessa gauge. Usare H di una estrazione con bev_unit di un'altra è
-  un errore di gauge (le footprint sarebbero scalate/sRuotate male).
+  un errore di gauge (le footprint sarebbero scalate/ruotate male).
+
+### 6.2 Valori di riferimento misurati (video Bangkok)
+
+Estrazione eseguita su `video_dataset_bangkok/video_041_tagliato_2.avi`
+(900 frame, **6526 footprint** veicolo valide) con
+`--kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine`:
+
+| Solve | `robust` | loss | iterazioni | `bev_unit` |
+|---|---|---|---|---|
+| Default (IRLS Cauchy) | `True` | `29.90` | 30 | **`0.373092117369`** |
+| `--no-robust` | `False` | `189.25` | 7 | `0.367480188935` |
+
+La `bev_unit` della coppia già in uso nel repo
+(`homography_bangkok.npy` + `homography_bangkok_bev_unit.txt`) è
+**`0.31147524796`**; ricalcolata sulle stesse 6526 footprint dà `0.308080`
+(≈ −1 % rispetto al valore memorizzato, che era stato calcolato su un
+insieme di quad leggermente diverso).
+
+Il rapporto fra le due gauge è **0.373092117369 / 0.31147524796 = 1.1978**:
+le due omografie sono geometricamente equivalenti ma espresse in gauge
+diverse (differiscono per una similitudine di scala ≈ 1.20–1.24 e una
+rotazione di pochi gradi). Come ricorda la regola d'oro, **H e bev_unit
+devono essere usate insieme**: passare `--bev-unit 0.31147524796` con la H
+nuova (o viceversa) introduce un errore di gauge del ~20 % sulle dimensioni
+delle footprint in BEV, che si traduce in errori sulle distanze di conflitto
+usate dal rilevatore TTC.
+
+### 6.3 Effetto di `--no-robust`
+
+Il solve non robusto **non rigetta i corner outlier**: la loss passa da
+`29.90` a `189.25` (× 6.3) e la convergenza avviene in 7 iterazioni invece
+di 30 (la LM si ferma su un minimo peggiore). La `bev_unit` cambia da
+`0.373092117369` a `0.367480188935` (−1.5 %): la differenza di gauge è
+piccola, ma la rettifica è peggiore.
+
+**Uso corretto**: `--no-robust` serve solo per confronto diagnostico
+("quanto guadagno il rigetto degli outlier?"). Non va usato per produrre
+la coppia `H` + `bev_unit` destinata alla pipeline, e i suoi numeri **non
+sono confrontabili** con quelli di un solve robusto (loss su insiemi di
+quad diversi, scale diverse).
 
 ### Regola d'oro
 
@@ -181,10 +222,22 @@ La pipeline real-time consuma la coppia in due punti:
 2. **bev_unit** — passata via CLI come parametro:
 
    ```bash
-   .venv/bin/python bev_realtime_v2.py ... --bev-unit 0.373092117369
+   .venv/bin/python bev_realtime_v2.py ... --bev-unit 0.31147524796
    ```
 
-   (valore letto dal file `*_bev_unit.txt`).
+   (valore letto dal file `*_bev_unit.txt`, **dello stesso `--output`** con cui
+   è stata prodotta la H in uso).
+
+   La coppia **attualmente in uso nel repo** è:
+
+   | File | Valore |
+   |---|---|
+   | `homography_bangkok.npy` | H in gauge "repo" |
+   | `homography_bangkok_bev_unit.txt` | `0.31147524796` |
+
+   Se si estrae una nuova coppia (es. `--output homography.npy` →
+   `bev_unit = 0.373092117369`), vanno **sostituiti entrambi i file insieme**
+   e il valore di `--bev-unit` deve passare a quello nuovo.
 
 Il confronto con la vecchia coppia Bangkok (`H` con `bev_unit ≈ 0.311`) è
 invariante: la pipeline rende la BEV adattando il viewport alla gauge, quindi
@@ -201,6 +254,8 @@ coppie coerenti diverse producono la stessa vista, a scala di gauge ribaltata.
 | `[ATTENZIONE] Solo N footprint valide (< 128)` | Clip corta o traffico scarso | Aumentare `--max-frames` o usare un video più lungo; la bev_unit può essere poco stabile |
 | Loss finale alta (`info.loss` grande nel log) | Troppi outlier, scene miste, camera che si muove | Preferire camera fissa e traffico distribuito; la loss cresce col numero di quad: confrontarla **per quad** |
 | Checkpoint `.engine` fallisce | TensorRT non compatibile con la GPU/driver | Usare il checkpoint `.pt` equivalente |
+| Distanze/TTC anomali dopo aver cambiato omografia | Gauge incoerente: H nuova con `bev_unit` vecchio (o viceversa) | Sostituire **sempre** `homography_bangkok.npy` e `homography_bangkok_bev_unit.txt` insieme e aggiornare `--bev-unit` (§6.2, §7) |
+| `loss` molto più alta del previsto con `--no-robust` | Comportamento atteso: gli outlier non sono rigettati | Usare il solve robusto (default); `--no-robust` è solo diagnostico (§6.3) |
 
 ### Verifica rapida di una estrazione
 

@@ -157,6 +157,12 @@ def main():
     parser.add_argument("--max-frames", type=int, default=1500,
                         help="Stop automatico a 1500 frame (~50 sec a 30fps). "
                              "0 = legge tutto il video.")
+    parser.add_argument("--no-robust", action="store_true",
+                        help="Disattiva i pesi IRLS Cauchy del solver "
+                             "(OrthoHomographySolver(robust=False)). Il solve "
+                             "non rigetta i corner outlier: la loss sale e la "
+                             "bev_unit risultante cambia di gauge. "
+                             "Usare solo per confronto diagnostico.")
     args = parser.parse_args()
 
     print(f"Caricamento modello {args.kp_model}...")
@@ -236,8 +242,12 @@ def main():
               "Impossibile calcolare l'omografia.")
         return
 
-    solver = OrthoHomographySolver(ema=0.0)
+    solver = OrthoHomographySolver(ema=0.0, robust=not args.no_robust)
     H_matrix, info = solver.solve(quads)
+    if args.no_robust:
+        print("[AVVERTENZA] Solve non-robust: outlier non rigettati, "
+              "la loss e la gauge della bev_unit non sono confrontabili "
+              "con un solve robusto.")
 
     # Same acceptance test as the realtime global solve: finite H and a
     # usable unit. (No loss threshold: the loss sums over N quads.)

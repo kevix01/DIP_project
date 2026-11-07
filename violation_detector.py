@@ -93,13 +93,16 @@ class PedIntent:
     flip_deg: float = 45.0         # angolo oltre il quale si considera un cambio direzione
     retreat_cos: float = -0.5      # coseno sotto il quale il moto recente è "in ritirata"
     retreat_dist: float = 0.05     # BEU di spostamento minimo sulla finestra step
+    short_min_dist: float = 0.10   # BEU netti su finestra short perché dir_short prevalga su dir_long
     hist: deque = field(default_factory=lambda: deque(maxlen=256))
+    raw_hist: deque = field(default_factory=lambda: deque(maxlen=64))
     last_seen_frame: int = -1
 
     state: str = INTENT_UNKNOWN
     speed_long: float = 0.0
     speed_short: float = 0.0
     speed_step: float = 0.0
+    short_dist: float = 0.0
     flip_angle: float = 0.0
     retreating: bool = False       # veto sticky: una volta in retirata resta fino a nuovo moto netto
     dir_long: object = None
@@ -108,8 +111,25 @@ class PedIntent:
     effective_vel: object = None
 
     def update(self, frame_idx: int, pos: np.ndarray, fps: float):
-        self.hist.append((int(frame_idx), np.asarray(pos, dtype=np.float64).copy()))
+        raw = np.asarray(pos, dtype=np.float64).copy()
         self.last_seen_frame = int(frame_idx)
+        # Outlier rejection adattivo. La mediana di riferimento e' calcolata
+        # SOLO sui campioni RAW: se si usasse la history filtrata, la mediana
+        # dei campioni respinti resterebbe ferma (med_step -> 0) e ogni frame
+        # successivo verrebbe respinto a sua volta, bloccando la traccia su
+        # una posizione fantasma ("latching") e facendo apparire fermo un
+        # pedone che invece si muove.
+        filtered = raw
+        self.raw_hist.append((int(frame_idx), raw))
+        if len(self.raw_hist) >= 4:
+            window = np.stack([p for _, p in list(self.raw_hist)[-4:]], axis=0)
+            steps = np.linalg.norm(np.diff(window, axis=0), axis=1)
+            med_step = float(np.median(steps)) if len(steps) > 0 else 0.0
+            thresh = max(0.06, 3.0 * med_step)
+            med = np.median(window, axis=0)
+            if float(np.linalg.norm(raw - med)) > thresh:
+                filtered = med
+        self.hist.append((int(frame_idx), filtered))
         self._recompute(fps)
 
     def _window(self, cur_frame: int, n_frames: int):
@@ -151,6 +171,7 @@ class PedIntent:
         self.speed_short = short_v[1] if short_v else 0.0
         self.dir_step = step_v[0] if step_v else None
         self.speed_step = step_v[1] if step_v else 0.0
+        self.short_dist = short_v[2] if short_v else 0.0
 
         zero = np.zeros(2, dtype=np.float64)
 
@@ -184,12 +205,24 @@ class PedIntent:
                                   if self.dir_step is not None else zero)
         elif self.speed_short >= self.moving_speed and self.speed_long >= self.moving_speed:
             # Il pedone sta camminando: l'intento è la direzione di marcia.
+            # La direzione breve prevale solo se lo spostamento netto sulla
+            # finestra short è significativo: uno scatto breve del tracker
+            # non deve ridisegnare la traiettoria d'intento.
+            # L'intento di moto è SEMPRE la direzione della finestra long:
+            # solo un cambio di direzione sostenuto per tutta la finestra
+            # lunga (>>1s) può ridisegnare la traiettoria. Le finestre short
+            # e step servono solo a classificare lo stato e il veto di
+            # retirata, mai a sovrascrivere la direzione impegnata.
             if self.flip_angle > self.flip_deg:
                 self.state = INTENT_TURNING
-                self.effective_vel = self.dir_short * self.speed_short
             else:
                 self.state = INTENT_MOVING
+            if self.dir_long is not None:
                 self.effective_vel = self.dir_long * self.speed_long
+            elif self.dir_short is not None:
+                self.effective_vel = self.dir_short * self.speed_short
+            else:
+                self.effective_vel = zero
         elif self.speed_short < self.stopped_speed:
             # Fermo: resta occupante statico della zona di conflitto.
             self.state = INTENT_STOPPED
@@ -205,6 +238,7 @@ class PedIntent:
             "speed_long": round(float(self.speed_long), 3),
             "speed_short": round(float(self.speed_short), 3),
             "speed_step": round(float(self.speed_step), 3),
+            "short_dist": round(float(self.short_dist), 3),
             "flip_angle": round(float(self.flip_angle), 1),
             "retreating": bool(self.retreating),
         }
@@ -221,7 +255,11 @@ class ViolationDetector:
                   intent_flip_deg: float = 45.0,
                   intent_retreat_cos: float = -0.5,
                   intent_step_s: float = 0.25,
-                  intent_retreat_dist: float = 0.05):
+                  intent_retreat_dist: float = 0.05,
+                  intent_short_min_dist: float = 0.10,
+                  lateral_pass_dlat: float = 0.45,
+                  lateral_pass_cpa: float = 0.75,
+                  lateral_pass_away: float = 0.05):
         self.ttc_threshold = float(ttc_threshold)
         self.timeout_frames = int(timeout_frames)
         self.conflict_radius = float(conflict_radius)  # Distanza max (in BEU) al punto di impatto (d_CPA)
@@ -231,10 +269,24 @@ class ViolationDetector:
         self.confirm_frames = max(1, int(confirm_frames))
         self.intent_retreat_cos = float(intent_retreat_cos)
 
-        self.intent_long_frames = max(1, int(round(intent_long_s * self.fps)))
-        self.intent_short_frames = max(1, int(round(intent_short_s * self.fps)))
-        self.intent_step_frames = max(1, int(round(intent_step_s * self.fps)))
+        # A fps bassi le finestre in secondi diventano pochissimi frame e uno
+        # scatto di detection le domina: imponiamo un minimo di frame.
+        self.intent_long_frames = max(15, int(round(intent_long_s * self.fps)))
+        self.intent_short_frames = max(6, int(round(intent_short_s * self.fps)))
+        self.intent_step_frames = max(3, int(round(intent_step_s * self.fps)))
         self.intent_retreat_dist = float(intent_retreat_dist)
+        self.intent_short_min_dist = float(intent_short_min_dist)
+        self.intent_moving_speed = float(intent_moving_speed)
+        self.intent_stopped_speed = float(intent_stopped_speed)
+        self.intent_flip_deg = float(intent_flip_deg)
+
+        # Veto "superato lateralmente": soglie del controllo laterale che
+        # distingue un pedone che marcia verso/oltre la corsia (conflitto
+        # reale) da un pedone che cammina parallelo sul bordo, gia' fuori
+        # dalla linea di marcia del veicolo e in allontanamento.
+        self.lateral_pass_dlat = float(lateral_pass_dlat)
+        self.lateral_pass_cpa = float(lateral_pass_cpa)
+        self.lateral_pass_away = float(lateral_pass_away)
 
         # Inizializza ROI
         self.roi = ZebraCrossingROI(roi_file, self.bev_unit)
@@ -338,19 +390,36 @@ class ViolationDetector:
         """
         p_v = np.asarray(veh.bev_pos, dtype=np.float64)
         v_v = np.asarray(veh.bev_vel, dtype=np.float64)
-        p_p = np.asarray(ped.bev_pos, dtype=np.float64)
+        # Usa la posizione filtrata (outlier rejection) se disponibile:
+        # il jitter di detection non deve spostare il pedone verso la corsia.
+        if intent is not None and len(intent.hist) > 0:
+            p_p = np.asarray(intent.hist[-1][1], dtype=np.float64)
+        else:
+            p_p = np.asarray(ped.bev_pos, dtype=np.float64)
 
         veh_speed = float(np.linalg.norm(v_v))
         if veh_speed < 0.15:
             return float('inf'), "VEICOLO FERMO"
 
         u_veh = v_v / veh_speed
+
         r = p_p - p_v
         d_long = float(np.dot(r, u_veh))
 
         # Il pedone è già alle spalle del veicolo: nessun conflitto futuro.
         if d_long < -0.4:
             return -2.0, "OLTRE VEICOLO"
+
+        # Pedone lateralmente fuori dalla linea del veicolo e in allontanamento:
+        # ha già attraversato la corsia, nessun conflitto futuro.
+        r_lat = r - d_long * u_veh
+        d_lat = float(np.linalg.norm(r_lat))
+        v_int_probe = intent.effective_vel if intent is not None else None
+        if (d_lat > 0.6 and v_int_probe is not None
+                and float(np.linalg.norm(v_int_probe)) > 0.05 and d_lat > 0.0):
+            u_lat = r_lat / d_lat
+            if float(np.dot(np.asarray(v_int_probe, dtype=np.float64), u_lat)) > 0.08:
+                return -2.0, "PASSATO (oltre)"
 
         v_int = intent.effective_vel if intent is not None else np.zeros(2)
         if v_int is None:
@@ -373,6 +442,23 @@ class ViolationDetector:
             d_cpa = float(np.linalg.norm(d_cpa_vec))
             if d_cpa > self.conflict_radius:
                 return -3.0, "CORSIE DIVERSE"
+
+            # Veto laterale: il pedone e' gia' ben fuori dalla linea del
+            # veicolo e si allontana lateralmente. Se anche il punto di
+            # conflitto (CPA) cade a piu' di lateral_cpa_min dal centro
+            # della corsia veicolare, le traiettorie non si incrociano:
+            # il TTC e' un falso positivo geometrico.
+            n_lat = np.array([-u_veh[1], u_veh[0]], dtype=np.float64)
+            lat_cpa = abs(float(np.dot(d_cpa_vec, n_lat)))
+            if d_lat > 0.0:
+                u_lat = r_lat / d_lat
+                away_lat = float(np.dot(v_int, u_lat))
+            else:
+                away_lat = 0.0
+            if (d_lat >= self.lateral_pass_dlat
+                    and lat_cpa >= self.lateral_pass_cpa
+                    and away_lat > self.lateral_pass_away):
+                return -5.0, "SUPERATO LATERALE"
 
             # Veto di retirata: il pedone sta tornando indietro rispetto alla
             # propria marcia (non verso il veicolo) -> falso positivo soppresso.
@@ -409,6 +495,10 @@ class ViolationDetector:
                     step_frames=self.intent_step_frames,
                     retreat_cos=self.intent_retreat_cos,
                     retreat_dist=self.intent_retreat_dist,
+                    short_min_dist=self.intent_short_min_dist,
+                    moving_speed=self.intent_moving_speed,
+                    stopped_speed=self.intent_stopped_speed,
+                    flip_deg=self.intent_flip_deg,
                 )
                 self.ped_intents[t.id] = intent
             intent.update(frame_idx, t.bev_pos, self.fps)
@@ -443,9 +533,13 @@ class ViolationDetector:
         self._update_intents(tracks, frame_idx)
 
         # 1. Smistamento tracce e check geometrici sulla ROI
+        #    (per i pedoni usa la posizione filtrata dell'intento, così il
+        #    jitter di detection non fa entrare/uscire il pedone dalla ROI)
         for t in tracks:
             if t.cls == 0:
-                if self.roi.contains_point(t.bev_pos):
+                it = self.ped_intents.get(t.id)
+                pos = it.hist[-1][1] if (it is not None and len(it.hist) > 0) else t.bev_pos
+                if self.roi.contains_point(pos):
                     pedestrians_in_roi.append(t)
             elif t.cls == 2:
                 if getattr(t, 'bev_quad', None) is not None and self.roi.overlaps_polygon(t.bev_quad):
@@ -492,7 +586,7 @@ class ViolationDetector:
             else:
                 if (pending is not None
                         and pending['ped_id'] == trigger_ped.id
-                        and (frame_idx - pending['last_frame']) <= 2):
+                        and (frame_idx - pending['last_frame']) == 1):
                     pending['count'] += 1
                     pending['last_frame'] = frame_idx
                 else:
@@ -537,7 +631,7 @@ class ViolationDetector:
                 reason = "absolute_timeout"
 
             if reason is not None:
-                self._close_violation(veh_id, frame, frame_idx, reason)
+                self._close_violation(veh_id, frame, frame_idx, reason, tracks, H_inv)
 
         return {
             "frame_idx": frame_idx,
@@ -554,6 +648,25 @@ class ViolationDetector:
             "confirm_counts": confirm_counts,
             "ped_intents": {pid: it.as_dict() for pid, it in self.ped_intents.items()},
         }
+
+    @staticmethod
+    def _draw_centroid_markers(img, markers):
+        """Disegna un marker (cerchio + etichetta) su ogni centroid in prospettiva.
+
+        `markers` è una lista di (punto [x, y], etichetta, colore BGR).
+        """
+        out = img
+        for point, label, color in markers:
+            if point is None:
+                continue
+            x, y = int(point[0]), int(point[1])
+            if not (0 <= x < out.shape[1] and 0 <= y < out.shape[0]):
+                continue
+            cv2.circle(out, (x, y), 12, color, 3, lineType=cv2.LINE_AA)
+            cv2.circle(out, (x, y), 3, color, -1, lineType=cv2.LINE_AA)
+            cv2.putText(out, label, (x + 16, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, color, 2, lineType=cv2.LINE_AA)
+        return out
 
     def _trigger_violation(self, frame, frame_idx, veh, ped, ttc, H_inv):
         self.history_violators.add(veh.id)
@@ -582,8 +695,13 @@ class ViolationDetector:
             }
         }
 
+        marked = self._draw_centroid_markers(frame.copy(), [
+            (veh_persp, f"V{veh.id}", (0, 0, 255)),
+            (ped_persp, f"P{ped.id}", (0, 255, 255)),
+        ])
+
         if self.save_files:
-            cv2.imwrite(img_path, frame)
+            cv2.imwrite(img_path, marked)
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
 
@@ -595,7 +713,7 @@ class ViolationDetector:
         }
         print(f"\n🚨 INFRAZIONE: Veicolo {veh.id} vs Pedone {ped.id} (TTC: {ttc:.2f}s) al frame {frame_idx}")
 
-    def _close_violation(self, veh_id, frame, frame_idx, reason):
+    def _close_violation(self, veh_id, frame, frame_idx, reason, tracks=None, H_inv=None):
         state = self.active_violations.pop(veh_id)
 
         img_filename = f"{state['prefix']}_end.jpg"
@@ -606,8 +724,27 @@ class ViolationDetector:
         data['images']['exit_reason'] = reason
         data['exit_frame'] = frame_idx
 
+        marked = frame
+        if tracks is not None and H_inv is not None:
+            veh_t = next((t for t in tracks if t.cls == 2 and t.id == veh_id), None)
+            ped_id = data.get("pedestrian_id")
+            ped_t = next((t for t in tracks if t.cls == 0 and t.id == ped_id), None)
+
+            veh_exit = (self.bev_to_perspective(veh_t.bev_pos, H_inv)
+                        if veh_t is not None else None)
+            ped_exit = (self.bev_to_perspective(ped_t.bev_pos, H_inv)
+                        if ped_t is not None else None)
+
+            data["vehicle_centroid_perspective_exit"] = veh_exit
+            data["pedestrian_centroid_perspective_exit"] = ped_exit
+
+            markers = [(veh_exit, f"V{veh_id}", (0, 0, 255))]
+            if ped_exit is not None:
+                markers.append((ped_exit, f"P{ped_id}", (0, 255, 255)))
+            marked = self._draw_centroid_markers(frame.copy(), markers)
+
         if self.save_files:
-            cv2.imwrite(img_path, frame)
+            cv2.imwrite(img_path, marked)
             with open(state['json_path'], 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
 
