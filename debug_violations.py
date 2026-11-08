@@ -589,7 +589,9 @@ def main(argv=None):
         roi_file=v2args.roi_file,
         bev_unit=pipe._bev_unit_locked,
         ttc_threshold=v2args.ttc_thresh,
-        timeout_frames=v2args.timeout_frames,
+        clip_track_timeout_s=v2args.clip_track_timeout_s,
+        clip_absolute_timeout_s=v2args.clip_absolute_timeout_s,
+        clip_video=not v2args.no_clip,
         save_files=not dbg_args.no_save_violations,
         fps=fps,
         confirm_frames=v2args.confirm_frames,
@@ -614,7 +616,7 @@ def main(argv=None):
 
             if ready_state is not None:
                 pipe.current_debug_info = violation_detector.process_frame(
-                    frame=ready_state.frame.copy(),
+                    frame=ready_state.frame,
                     tracks=ready_state.tracks,
                     frame_idx=ready_state.frame_idx,
                     H_inv=pipe.static_H_inv,
@@ -640,6 +642,8 @@ def main(argv=None):
                     if not sink.emit(out_img):
                         break
     finally:
+        # Chiude le infrazioni ancora attive: rilascia i writer delle clip.
+        violation_detector.close_all("end_of_stream")
         src.release()
         sink.close()
         if args.display:

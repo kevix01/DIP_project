@@ -242,7 +242,9 @@ class PedIntent:
 
 class ViolationDetector:
     def __init__(self, video_name: str, roi_file: str, bev_unit: float,
-                 ttc_threshold: float = 3.0, timeout_frames: int = 30,
+                 ttc_threshold: float = 3.0,
+                 clip_track_timeout_s: float = 1.5,
+                 clip_absolute_timeout_s: float = 3.0,
                  conflict_radius: float = 1.1, save_files: bool = True,
                  fps: float = 30.0, confirm_frames: int = 3,
                  intent_long_s: float = 1.2, intent_short_s: float = 0.5,
@@ -255,13 +257,22 @@ class ViolationDetector:
                   lateral_pass_dlat: float = 0.45,
                   lateral_pass_cpa: float = 0.75,
                   lateral_pass_away: float = 0.05,
-                  conflict_dlong: float = 0.2):
+                  conflict_dlong: float = 0.2,
+                  clip_video: bool = True,
+                  clip_fourcc: str = "mp4v"):
         self.ttc_threshold = float(ttc_threshold)
-        self.timeout_frames = int(timeout_frames)
+        self.fps = float(fps) if fps and fps > 1e-6 else 30.0
+
+        # Timeout della clip in SECONDI (coerenti con il framerate):
+        #  - clip_track_timeout_s   : attesa dopo la perdita del tracking del veicolo
+        #  - clip_absolute_timeout_s : durata massima assoluta di un'infrazione
+        self.clip_track_timeout_s = max(0.0, float(clip_track_timeout_s))
+        self.clip_absolute_timeout_s = max(0.0, float(clip_absolute_timeout_s))
+        self.clip_video = bool(clip_video)
+        self.clip_fourcc = str(clip_fourcc)
         self.conflict_radius = float(conflict_radius)  # Distanza max (in BEU) al punto di impatto (d_CPA)
         self.bev_unit = float(bev_unit) if bev_unit and bev_unit > 1e-9 else 1.0
         self.save_files = bool(save_files)
-        self.fps = float(fps) if fps and fps > 1e-6 else 30.0
         self.confirm_frames = max(1, int(confirm_frames))
         self.intent_retreat_cos = float(intent_retreat_cos)
 
@@ -618,38 +629,44 @@ class ViolationDetector:
                     self._trigger_violation(frame, frame_idx, veh, trigger_ped, trigger_ttc, H_inv)
                     newly_triggered.add(veh.id)
 
-        # 3. Gestione Uscita Veicoli Multati (Salvataggio 2° Immagine)
+        # 3. Gestione infrazioni attive: prosecuzione/terminazione della clip
         active_ids = list(self.active_violations.keys())
         veh_track_dict = {t.id: t for t in tracks if t.cls == 2}
 
         for veh_id in active_ids:
             state = self.active_violations[veh_id]
-            frames_elapsed = frame_idx - state['start_frame']
+            veh_t = veh_track_dict.get(veh_id)
 
-            exited_roi = False
-            track_lost = False
-
-            if veh_id in veh_track_dict:
-                veh_t = veh_track_dict[veh_id]
-                if getattr(veh_t, 'bev_quad', None) is not None:
-                    if not self.roi.overlaps_polygon(veh_t.bev_quad):
-                        exited_roi = True
-                else:
-                    if not self.roi.contains_point(veh_t.bev_pos):
-                        exited_roi = True
+            if veh_t is not None:
+                # Il veicolo e' ancora tracciato: la clip continua.
+                state['last_track_frame'] = frame_idx
+                state['track_lost_frame'] = None
+                self._append_clip_frame(state, frame, veh_t, H_inv)
             else:
-                track_lost = True
+                # Veicolo perso: si continua a registrare finche' non scade
+                # la finestra di fallback (in secondi).
+                if state.get('track_lost_frame') is None:
+                    state['track_lost_frame'] = frame_idx
+                self._append_clip_frame(state, frame, None, H_inv)
+                lost_for = frame_idx - state['track_lost_frame']
+                if lost_for >= self.clip_track_timeout_s * self.fps:
+                    state['close_reason'] = f"timeout_track_lost_{lost_for}_frames"
+                    self._close_violation(veh_id, frame, frame_idx, state['close_reason'])
+                    continue
 
-            reason = None
-            if exited_roi:
-                reason = "exited_roi"
-            elif track_lost and frames_elapsed >= self.timeout_frames:
-                reason = f"timeout_track_lost_{frames_elapsed}_frames"
-            elif frames_elapsed >= self.timeout_frames * 2:
-                reason = "absolute_timeout"
+            frames_elapsed = frame_idx - state['start_frame']
+            if veh_t is not None:
+                exited_roi = False
+                if getattr(veh_t, 'bev_quad', None) is not None:
+                    exited_roi = not self.roi.overlaps_polygon(veh_t.bev_quad)
+                else:
+                    exited_roi = not self.roi.contains_point(veh_t.bev_pos)
+                if exited_roi:
+                    self._close_violation(veh_id, frame, frame_idx, "exited_roi")
+                    continue
 
-            if reason is not None:
-                self._close_violation(veh_id, frame, frame_idx, reason, tracks, H_inv)
+            if frames_elapsed >= self.clip_absolute_timeout_s * self.fps:
+                self._close_violation(veh_id, frame, frame_idx, "absolute_timeout")
 
         return {
             "frame_idx": frame_idx,
@@ -686,6 +703,34 @@ class ViolationDetector:
                         0.7, color, 2, lineType=cv2.LINE_AA)
         return out
 
+    def _open_clip(self, path, frame):
+        """Apre il writer video per la clip dell'infrazione (risoluzione nativa)."""
+        h, w = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*self.clip_fourcc)
+        writer = cv2.VideoWriter(path, fourcc, self.fps, (w, h))
+        if not writer.isOpened():
+            writer.release()
+            return None
+        return writer
+
+    def _append_clip_frame(self, state, frame, veh_t, H_inv):
+        """Appende un frame alla clip, marcando SOLO il centroide del veicolo infractor."""
+        writer = state.get('writer')
+        if writer is None:
+            return
+        veh_persp = None
+        if veh_t is not None and H_inv is not None:
+            veh_persp = self.bev_to_perspective(veh_t.bev_pos, H_inv)
+        if veh_persp is None:
+            # Nessun marker da disegnare: si scrive il frame originale senza copia.
+            writer.write(frame)
+        else:
+            marked = self._draw_centroid_markers(frame.copy(), [
+                (veh_persp, f"V{state['vehicle_id']}", (0, 0, 255)),
+            ])
+            writer.write(marked)
+        state['clip_frames'] = state.get('clip_frames', 0) + 1
+
     def _trigger_violation(self, frame, frame_idx, veh, ped, ttc, H_inv):
         self.history_violators.add(veh.id)
 
@@ -693,8 +738,8 @@ class ViolationDetector:
         ped_persp = self.bev_to_perspective(ped.bev_pos, H_inv) if H_inv is not None else [0, 0]
 
         prefix = f"violation_v{veh.id}_f{frame_idx}"
-        img_path = os.path.join(self.out_dir, f"{prefix}_start.jpg")
         json_path = os.path.join(self.out_dir, f"{prefix}.json")
+        clip_name = f"{prefix}.mp4"
 
         intent = self.ped_intents.get(ped.id)
 
@@ -706,63 +751,69 @@ class ViolationDetector:
             "vehicle_centroid_perspective": veh_persp,
             "pedestrian_centroid_perspective": ped_persp,
             "pedestrian_intent": intent.as_dict() if intent is not None else None,
-            "images": {
-                "start_infraction": f"{prefix}_start.jpg",
-                "exit_infraction": None,
+            "clip": {
+                "file": clip_name,
+                "fps": round(self.fps, 3),
+                "start_frame": frame_idx,
+                "end_frame": None,
+                "frames": 0,
                 "exit_reason": "pending"
             }
         }
 
-        marked = self._draw_centroid_markers(frame.copy(), [
-            (veh_persp, f"V{veh.id}", (0, 0, 255)),
-            (ped_persp, f"P{ped.id}", (0, 255, 255)),
-        ])
-
-        if self.save_files:
-            cv2.imwrite(img_path, marked)
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
-
-        self.active_violations[veh.id] = {
+        state = {
             "start_frame": frame_idx,
             "json_path": json_path,
             "prefix": prefix,
-            "data": data
+            "data": data,
+            "vehicle_id": veh.id,
+            "writer": None,
+            "clip_frames": 0,
+            "last_track_frame": frame_idx,
+            "track_lost_frame": None,
         }
+        self.active_violations[veh.id] = state
+
+        if self.save_files and self.clip_video:
+            writer = self._open_clip(os.path.join(self.out_dir, clip_name), frame)
+            if writer is not None:
+                state['writer'] = writer
+
+        # Il frame di inizio entra nella clip (marca solo il veicolo).
+        self._append_clip_frame(state, frame, veh, H_inv)
+
+        if self.save_files:
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+
         print(f"\n🚨 INFRAZIONE: Veicolo {veh.id} vs Pedone {ped.id} (TTC: {ttc:.2f}s) al frame {frame_idx}")
+
+    def close_all(self, reason: str = "end_of_stream"):
+        """Chiude tutte le infrazioni ancora attive (rilascia i writer delle clip)."""
+        for veh_id in list(self.active_violations.keys()):
+            state = self.active_violations.get(veh_id)
+            frame_idx = state['start_frame'] if state else 0
+            self._close_violation(veh_id, None, frame_idx, reason)
 
     def _close_violation(self, veh_id, frame, frame_idx, reason, tracks=None, H_inv=None):
         state = self.active_violations.pop(veh_id)
 
-        img_filename = f"{state['prefix']}_end.jpg"
-        img_path = os.path.join(self.out_dir, img_filename)
-
         data = state['data']
-        data['images']['exit_infraction'] = img_filename
-        data['images']['exit_reason'] = reason
+        clip = data['clip']
+        clip['exit_reason'] = reason
+        clip['end_frame'] = frame_idx
+        clip['frames'] = state.get('clip_frames', 0)
         data['exit_frame'] = frame_idx
 
-        marked = frame
-        if tracks is not None and H_inv is not None:
-            veh_t = next((t for t in tracks if t.cls == 2 and t.id == veh_id), None)
-            ped_id = data.get("pedestrian_id")
-            ped_t = next((t for t in tracks if t.cls == 0 and t.id == ped_id), None)
-
-            veh_exit = (self.bev_to_perspective(veh_t.bev_pos, H_inv)
-                        if veh_t is not None else None)
-            ped_exit = (self.bev_to_perspective(ped_t.bev_pos, H_inv)
-                        if ped_t is not None else None)
-
-            data["vehicle_centroid_perspective_exit"] = veh_exit
-            data["pedestrian_centroid_perspective_exit"] = ped_exit
-
-            markers = [(veh_exit, f"V{veh_id}", (0, 0, 255))]
-            if ped_exit is not None:
-                markers.append((ped_exit, f"P{ped_id}", (0, 255, 255)))
-            marked = self._draw_centroid_markers(frame.copy(), markers)
+        writer = state.get('writer')
+        if writer is not None:
+            writer.release()
+            state['writer'] = None
+        elif not (self.save_files and self.clip_video):
+            # Clip non generata (--no-clip o salvataggio disabilitato).
+            clip['file'] = None
 
         if self.save_files:
-            cv2.imwrite(img_path, marked)
             with open(state['json_path'], 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
 

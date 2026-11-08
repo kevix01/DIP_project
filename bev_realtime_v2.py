@@ -2417,8 +2417,13 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="Path al file JSON contenente i punti della ROI (x,y in BEV).")
     p.add_argument("--ttc-thresh", type=float, default=2.5,
                    help="Soglia TTC per l'infrazione in secondi.")
-    p.add_argument("--timeout-frames", type=int, default=45,
-                   help="Frames da attendere per il salvataggio immagine di uscita se traccia persa.")
+    p.add_argument("--clip-track-timeout-s", type=float, default=1.5,
+                   help="Secondi di registrazione della clip dopo la perdita del tracking "
+                        "del veicolo infractor (la clip continua anche senza veicolo).")
+    p.add_argument("--clip-absolute-timeout-s", type=float, default=3.0,
+                   help="Durata massima (secondi) della clip di un'infrazione.")
+    p.add_argument("--no-clip", action="store_true",
+                   help="Non genera il mini filmato (.mp4) dell'infrazione: salva solo il JSON.")
     p.add_argument("--confirm-frames", type=int, default=3,
                    help="Frame consecutivi di conflitto TTC richiesti per confermare l'infrazione.")
     return p
@@ -2509,7 +2514,9 @@ def main(argv=None):
             roi_file=v2args.roi_file,
             bev_unit=pipe._bev_unit_locked,
             ttc_threshold=v2args.ttc_thresh,
-            timeout_frames=v2args.timeout_frames,
+            clip_track_timeout_s=v2args.clip_track_timeout_s,
+            clip_absolute_timeout_s=v2args.clip_absolute_timeout_s,
+            clip_video=not v2args.no_clip,
             fps=fps,
             confirm_frames=v2args.confirm_frames,
         )
@@ -2545,7 +2552,7 @@ def main(argv=None):
                         # Passiamo il frame ORIGINALE (raw) o l'immagine di output (out_img).
                         # Se vuoi salvare l'immagine pulita, passa ready_state.frame.
                         violation_detector.process_frame(
-                            frame=ready_state.frame.copy(), 
+                            frame=ready_state.frame,
                             tracks=ready_state.tracks, 
                             frame_idx=ready_state.frame_idx, 
                             H_inv=pipe.static_H_inv
@@ -2567,7 +2574,7 @@ def main(argv=None):
                     # === LOGICA INFRAZIONI TAIL ===
                     if pipe.static_H_inv is not None and violation_detector is not None:
                         violation_detector.process_frame(
-                            frame=tail_state.frame.copy(),
+                            frame=tail_state.frame,
                             tracks=tail_state.tracks,
                             frame_idx=tail_state.frame_idx,
                             H_inv=pipe.static_H_inv
@@ -2580,6 +2587,9 @@ def main(argv=None):
                     if not sink.emit(out_img):
                         break
     finally:
+        # Chiude le infrazioni ancora attive: rilascia i writer delle clip.
+        if violation_detector is not None:
+            violation_detector.close_all("end_of_stream")
         src.release()
         sink.close()
         if args.display:

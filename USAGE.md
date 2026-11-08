@@ -69,6 +69,47 @@ Measured on the x model at 960 px, one RTX PRO 6000, 60 frames:
 End to end (detector + tracking + ground solve + refinement + render) the same clip runs at
 48 fps with TensorRT against 45 with PyTorch: past this point the detector is not the bottleneck.
 
+## Infrazioni sulle strisce: clip e JSON
+
+Quando si passa `--roi-file roi_bev.json`, la pipeline valuta i conflitti veicolo/pedone nella ROI
+(strisce pedonali) e salva per ogni infrazione un **mini filmato** nella cartella
+`violations_<nome_video>/`.
+
+```bash
+python bev_realtime_v2.py --input clip.mp4 --kp-model checkpoints/urbanomnidetect_v2_x_640.pt \
+    --device cuda:0 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6 \
+    --output out.mp4
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--roi-file PATH` | required | JSON con i punti BEV (`bev_points`) e immagine (`image_points`) della zona strisce |
+| `--ttc-thresh S` | 2.5 | soglia TTC (secondi) per considerare il conflitto un'infrazione |
+| `--confirm-frames N` | 3 | frame consecutivi di conflitto richiesti per confermare l'infrazione |
+| `--clip-track-timeout-s S` | 1.5 | secondi di registrazione della clip **dopo** la perdita del tracking del veicolo; la clip continua anche senza il veicolo tracciato |
+| `--clip-absolute-timeout-s S` | 3.0 | durata massima (secondi) della clip di un'infrazione |
+| `--no-clip` | off | non genera il mini filmato: salva solo il JSON |
+
+**La clip** (`violation_v<veicolo>_f<frame>.mp4`) viene scritta in streaming durante
+l'elaborazione: contiene esattamente i frame dal trigger dell'infrazione alla sua chiusura, alla
+**risoluzione nativa del video sorgente**, con il **solo centroide del veicolo infractor**
+(marker rosso + etichetta `V<id>`) sovrapposto in ogni frame in cui il veicolo è tracciato.
+Non viene generato nessun JPG.
+
+**Chiusura dell'infrazione** (e quindi fine della clip):
+
+| Causa | `clip.exit_reason` | Quando |
+|---|---|---|
+| veicolo uscito dalla ROI | `exited_roi` | normale: il veicolo ha superato le strisce |
+| tracking perso | `timeout_track_lost_<N>_frames` | il veicolo non è più tracciato da `--clip-track-timeout-s` |
+| durata massima | `absolute_timeout` | durata superiore a `--clip-absolute-timeout-s` |
+| fine stream | `end_of_stream` | il video è terminato con l'infrazione ancora attiva |
+
+**JSON** (`violation_v<veicolo>_f<frame>.json`): frame del trigger, id veicolo e pedone, TTC,
+centroide prospettico del veicolo e del pedone **al frame dell'infrazione**, stato e velocità
+dell'intento del pedone, e il blocco `clip` con nome file, fps, frame iniziale/finale, numero di
+frame e motivo di chiusura.
+
 ## `bev_realtime.py` — shared pipeline flags (v1 models directly, v2 through the adapter)
 
 ```
