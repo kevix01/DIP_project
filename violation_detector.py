@@ -254,7 +254,8 @@ class ViolationDetector:
                   intent_retreat_dist: float = 0.05,
                   lateral_pass_dlat: float = 0.45,
                   lateral_pass_cpa: float = 0.75,
-                  lateral_pass_away: float = 0.05):
+                  lateral_pass_away: float = 0.05,
+                  conflict_dlong: float = 0.2):
         self.ttc_threshold = float(ttc_threshold)
         self.timeout_frames = int(timeout_frames)
         self.conflict_radius = float(conflict_radius)  # Distanza max (in BEU) al punto di impatto (d_CPA)
@@ -281,6 +282,14 @@ class ViolationDetector:
         self.lateral_pass_dlat = float(lateral_pass_dlat)
         self.lateral_pass_cpa = float(lateral_pass_cpa)
         self.lateral_pass_away = float(lateral_pass_away)
+
+        # Gate geometrico della zona di conflitto: il pedone deve trovarsi
+        # dentro il raggio di conflitto lateralmente (d_lat) e deve essere
+        # ancora AVANTI al veicolo (d_long > conflict_dlong). Se il pedone
+        # e' gia' stato superato dal veicolo, il CPA puo' comunque cadere
+        # vicino perche' proietta la traiettoria intenzionale del pedone
+        # sulla corsia, ma il conflitto e' solo geometrico, non fisico.
+        self.conflict_dlong = float(conflict_dlong)
 
         # Inizializza ROI
         self.roi = ZebraCrossingROI(roi_file, self.bev_unit)
@@ -381,6 +390,9 @@ class ViolationDetector:
           -3.0 : nessuna rotta di collisione (d_CPA > conflict_radius)
           -4.0 : il pedone sta cambiando direzione / torna indietro
                   (NON è un falso positivo: il veicolo non lo raggiunge)
+          -5.0 : veto laterale (pedone fuori corsia e in allontanamento)
+          -6.0 : gate laterale (pedone fuori dal raggio di conflitto)
+          -7.0 : gate longitudinale (pedone già superato dal veicolo)
         """
         p_v = np.asarray(veh.bev_pos, dtype=np.float64)
         v_v = np.asarray(veh.bev_vel, dtype=np.float64)
@@ -441,6 +453,21 @@ class ViolationDetector:
             d_cpa = float(np.linalg.norm(d_cpa_vec))
             if d_cpa > self.conflict_radius:
                 return -3.0, "CORSIE DIVERSE"
+
+            # Gate laterale: il pedone e' piu' lontano dalla linea di marcia
+            # del veicolo del raggio di conflitto. Il CPA puo' comunque
+            # cadere vicino perche' la traiettoria INTENZIONALE del pedone
+            # taglia la corsia, ma il veicolo raggiunge la zona di conflitto
+            # ben prima che il pedone ci arrivi: il conflitto e' solo
+            # geometrico, non fisico.
+            if d_lat > self.conflict_radius:
+                return -6.0, "PEDONE FUORI CORRIDA"
+
+            # Gate longitudinale: il pedone e' gia' stato superato dal
+            # veicolo (o e' sullo stesso punto): qualunque conflitto con la
+            # sua traiettoria intenzionale e' un falso positivo geometrico.
+            if d_long <= self.conflict_dlong:
+                return -7.0, "PEDONE SUPERATO"
 
             # Veto laterale: il pedone e' gia' ben fuori dalla linea del
             # veicolo e si allontana lateralmente. Se anche il punto di

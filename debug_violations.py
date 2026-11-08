@@ -458,6 +458,27 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
                     cell_txt = "NO COLL (corsia)"
                     txt_col = (175, 175, 185)
                     font_w = 1
+                elif ttc_val == -5.0:
+                    # Veto laterale: pedone fuori corsia e in allontanamento
+                    cell_bg = (45, 45, 52)
+                    cell_border = (75, 75, 85)
+                    cell_txt = "SUP. LATERALE"
+                    txt_col = (175, 175, 185)
+                    font_w = 1
+                elif ttc_val == -6.0:
+                    # Gate laterale: pedone oltre il raggio di conflitto
+                    cell_bg = (45, 45, 52)
+                    cell_border = (75, 75, 85)
+                    cell_txt = "FUORI CORSIA"
+                    txt_col = (175, 175, 185)
+                    font_w = 1
+                elif ttc_val == -7.0:
+                    # Gate longitudinale: pedone gia' superato dal veicolo
+                    cell_bg = (45, 45, 52)
+                    cell_border = (75, 75, 85)
+                    cell_txt = "PED. SUPERATO"
+                    txt_col = (175, 175, 185)
+                    font_w = 1
                 elif ttc_val == -4.0:
                     # Il pedone sta tornando indietro / cambiando direzione:
                     # falso positivo soppresso (non è un'infrazione)
