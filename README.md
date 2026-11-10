@@ -6,7 +6,8 @@ Questa guida descrive gli script usati nel progetto:
 - **select_roi_bev.py** permette di disegnare e salvare la regione stradale d’interesse (ROI).
 - **violation_detector.py** contiene la logica che valuta i conflitti veicolo-pedone e registra le violazioni.
 - **bev_realtime_v2.py** esegue la pipeline di inferenza, tracking, BEV e rilevamento delle violazioni.
-- **debug_violations.py** esegue la pipeline con visualizzazioni diagnostiche, inclusa la tabella TTC.
+ - **debug_violations.py** esegue la pipeline con visualizzazioni diagnostiche, inclusa la tabella TTC.
+ - **export_engine.py** esporta il checkpoint `.pt` in un engine TensorRT/ONNX ottimizzato (vedi `EXPORT_ENGINE.md`).
 
 ## Flusso di lavoro
 
@@ -24,9 +25,14 @@ La sequenza tipica è: calibrare una scena, disegnare la ROI per quella stessa s
 
     python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo_debug.mp4"
 
+Prima di elaborare, è consigliabile esportare il modello in engine FP16 (una volta sola):
+
+    python export_engine.py --weights weights/pose.pt --imgsz 640 --half
+    # poi usare --kp-model weights/pose_640_fp16.engine
+
 Per elaborare senza la visualizzazione diagnostica, si può eseguire la pipeline normale:
 
-    python bev_realtime_v2.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
+    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
 
 Eseguire gli ultimi due comandi dalla cartella del progetto: la pipeline carica l’omografia statica dal percorso relativo **homography_bangkok.npy**. Per un’altra scena, mettere in quel percorso la matrice della calibrazione corrispondente e creare/aggiornare una ROI con la medesima calibrazione. Non abbinare una matrice H a una bev_unit o a una ROI prodotte con una calibrazione diversa.
 
@@ -87,7 +93,7 @@ La ROI JSON deve contenere image_points e bev_points (almeno tre punti per ciasc
 | **--no-clip** | disattivato | Non scrive il filmato del singolo evento, ma mantiene il JSON. |
 | **--bev-unit** | stimata se omessa | Valore numerico che deve essere coerente con H e ROI. |
 
-Gli eventi sono scritti nella cartella **violations_<nome_video>/**, relativa alla cartella di lavoro. Per ciascun evento vengono prodotti un JSON con frame, timestamp, ID, TTC e dati della clip, e un MP4 con i marker dei soggetti coinvolti (salvo l’uso di **--no-clip**). Il programma principale può inoltre salvare un video annotato completo tramite **--output**.
+Gli eventi sono scritti nella cartella **violations_<nome_video>/**, relativa alla cartella di lavoro. Per ciascun evento vengono prodotti un JSON con frame, timestamp, ID, TTC e dati della clip, e un MP4 con i marker dei soggetti coinvolti — il centroide del veicolo (rosso, `V<id>`) e quello del pedone (giallo, `P<id>`) — salvo l’uso di **--no-clip**. Il nome di clip e JSON contiene il minutaggio del video (`violation_v<id>_t<MMmSSsMMMms>`). Il programma principale può inoltre salvare un video annotato completo tramite **--output**.
 
 ### debug_violations.py
 
@@ -175,7 +181,7 @@ Il programma accetta inoltre le opzioni base e v2 elencate nelle due tabelle CLI
 
 Esempio:
 
-    python bev_realtime_v2.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
+    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
 
 ## Dipendenze e file necessari all’esecuzione
 
