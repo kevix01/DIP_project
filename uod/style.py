@@ -16,8 +16,8 @@ from typing import Tuple
 RGB = Tuple[int, int, int]
 
 __all__ = ["bgr", "class_category", "class_color", "instance_color",
-           "text_color_on", "PALETTE", "THEME", "COCO_CATEGORY",
-           "POSE_CATEGORY", "CATEGORY_LABEL"]
+            "PALETTE", "THEME", "COCO_CATEGORY",
+            "POSE_CATEGORY", "CATEGORY_LABEL"]
 
 # Curated, slightly desaturated palette (RGB). Distinct hues, similar value, so
 # they coexist without one screaming louder than the rest.
@@ -91,9 +91,3 @@ def instance_color(cls: int, instance_id: int, source: str = "pose") -> RGB:
     s = min(1.0, max(0.45, s * (0.92 + 0.16 * j)))
     r, g, b = colorsys.hls_to_rgb(h, l, s)
     return (int(r * 255), int(g * 255), int(b * 255))
-
-
-def text_color_on(rgb: RGB) -> RGB:
-    """Pick near-black or near-white text for legibility on ``rgb``."""
-    lum = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
-    return (24, 26, 30) if lum > 140 else (244, 246, 250)

@@ -15,29 +15,20 @@ WITHOUT editing any v1 file (it subclasses / re-points at import time):
    visibility / a corner collapsed to the origin / far outside the box) are
    demoted to *box-only* detections and shown like auxiliary detections
    (dashed box, BEV dot) instead of drawing a garbage cuboid.
-3. **It is its own auxiliary detector** (v2 is a full COCO detector), so the
-   separate ``yolo26x`` pass is off by default; ``--aux-model`` still merges in.
+3. **It is its own auxiliary detector** (v2 is a full COCO detector), so no
+   separate auxiliary pass is needed.
 
-Demo-reel extras (all optional, all offline / non-causal):
+Demo extras (all optional):
 
-* ``--layout dashboard``: a 16:9 composite -- camera panel top-left, a tall
-  BEV column on the right and an info strip (wordmark, scene caption, legend
-  with live counts, timings) under the camera -- instead of the raw
-  side-by-side that letterboxes to half the frame. ``--layout side`` keeps the
-  v1 look. Portrait sources always use side-by-side (camera | BEV).
-* ``--bev-fit``: auto-zoom the BEV so the clip's footprints fit the panel.
-* ``--refine``: offline track/geometry repair (see :mod:`refine_v2`) -- merge
-  re-spawned ids, fill detection gaps by interpolation, decide once per track
-  whether its cuboid is usable, rescale cuboids to fill their 2D box, pose
-  every footprint from a whole-track rigid shape with the heading of a moving
-  vehicle taken from its own trajectory, freeze vehicles that are standing
-  still, and redraw each cuboid as the projection of a rigid box (constant
-  footprint + one height) through the ground homography and the vertical
-  vanishing point.
-* ``--class-conf 0:0.4,1:0.5,3:0.5``: per-class minimum confidence (COCO ids).
-* ``--caption "Aerial view"``: one phrase describing the shot. The static
-  or moving camera tag is appended automatically, measured from how far the
-  view actually travels between the first frame and the last.
+ * ``--layout dashboard``: a 16:9 composite -- camera panel top-left, a tall
+   BEV column on the right and an info strip (wordmark, scene caption, legend
+   with live counts, timings) under the camera -- instead of the raw
+   side-by-side that letterboxes to half the frame. ``--layout side`` keeps the
+   plain look. Portrait sources always use side-by-side (camera | BEV).
+ * ``--class-conf 0:0.4,1:0.5,3:0.5``: per-class minimum confidence (COCO ids).
+ * ``--caption "Aerial view"``: one phrase describing the shot. The static
+   or moving camera tag is appended automatically, measured from how far the
+   view actually travels between the first frame and the last.
 
 Everything else is passed straight through to ``bev_realtime``.
 
@@ -70,14 +61,11 @@ from uod import style  # noqa: E402
 from uod.bev import BEVViewport  # noqa: E402
 from uod.keypoints import Detection  # noqa: E402
 from uod.textdraw import UILayer  # noqa: E402
-from uod.tracking import _iou_matrix  # noqa: E402
-from uod.classes import to_unified, is_vehicle
-import refine_v2  # noqa: E402
+from uod.classes import to_unified
 from uod.viz import draw_cuboid, draw_dashed_polyline  # noqa: E402
 from homography_rt import apply_homography  # noqa: E402
 import threading
 from uod.bev_ocsort import BEVObservation, BEVOCSortTracker, FixedLagBuffer
-from violation_detector import ViolationDetector
 
 
 class FrameSource:
@@ -133,12 +121,6 @@ class FrameSource:
 POSE_CATEGORY_V2: Dict[int, str] = {
     0: "person", 1: "bike", 2: "car", 3: "bike", 5: "bus", 7: "truck",
 }
-
-
-def _mean_kp_visibility(det: Detection) -> float:
-    """Compute mean keypoint visibility for a detection."""
-    # Use stored mean_kp_vis attribute if available, else fallback to box conf
-    return getattr(det, 'mean_kp_vis', float(det.conf))
 
 
 def _polygon_contains(poly_outer: np.ndarray, poly_inner: np.ndarray) -> bool:
@@ -267,23 +249,11 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             keep = np.ones(len(group), dtype=bool)
 
             grounds = np.stack([d.ground_bev for d in group])
+            hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in grounds]
+            areas = [cv2.contourArea(h) for h in hulls]
             iou_mat = _ground_iou_matrix(grounds, grounds)
 
-            # Single IoU threshold for all unified classes
-            iou_thresh = 0.3
-
-            # Overlap-fraction helper: fraction of the SMALLER footprint covered
-            # by the larger one. This single criterion subsumes both IoU and
-            # containment: IoU >= 0.5 mathematically implies frac >= 2/3, and
-            # containment implies frac = 1. So the edge condition is just
-            # frac >= 0.65. Unlike IoU (= inter/union), the fraction stays HIGH
-            # for duplicates with very different footprint sizes (partial vs
-            # full cuboid of the same vehicle), where IoU collapses.
-            def _overlap_frac(pa: np.ndarray, pb: np.ndarray) -> float:
-                ha = cv2.convexHull(pa.astype(np.float32).reshape(-1, 1, 2))
-                hb = cv2.convexHull(pb.astype(np.float32).reshape(-1, 1, 2))
-                area_a = cv2.contourArea(ha)
-                area_b = cv2.contourArea(hb)
+            def _overlap_frac_ha(ha, area_a, hb, area_b) -> float:
                 smaller = min(area_a, area_b)
                 if smaller <= 1e-6:
                     return 0.0
@@ -309,7 +279,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                     iou_high = iou_mat[a, b] >= (0.35 if ucls == 0 else 0.50)
                     contains = (_polygon_contains(grounds[a], grounds[b]) or
                                 _polygon_contains(grounds[b], grounds[a]))
-                    mostly_covered = _overlap_frac(grounds[a], grounds[b]) >= 0.65
+                    mostly_covered = _overlap_frac_ha(hulls[a], areas[a], hulls[b], areas[b]) >= 0.65
                     iou_2d, cov_2d = _box_overlap_2d(group[a].xyxy, group[b].xyxy)
                     if ucls == 0:
                         dup_2d = (iou_2d >= 0.35) or (cov_2d >= 0.70)
@@ -358,62 +328,57 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
         ]
 
         if person_indices and vehicle_indices:
-            person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
-            vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
-            cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
+                person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
+                vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
+                cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
+                person_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in person_grounds]
+                person_areas = [cv2.contourArea(h) for h in person_hulls]
+                veh_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in vehicle_grounds]
+                veh_areas = [cv2.contourArea(h) for h in veh_hulls]
 
-            # Suppress person if any vehicle footprint mostly covers the
-            # pedestrian footprint in BEV. IoU = inter/union stays LOW when a
-            # small pedestrian footprint sits inside a large vehicle footprint
-            # (union dominated by the vehicle), so IoU alone misses false
-            # pedestrians that are really part of a vehicle. overlap-fraction
-            # (= inter / area_pedestrian) stays HIGH, catching these cases.
-            # IoU >= 0.05 is redundant: IoU >= 0.5 implies frac >= 2/3 > 0.65,
-            # and moderate IoU for partial overlap likely marks a real
-            # pedestrian next to the vehicle, not a false positive.
-            suppress_person = np.zeros(len(person_grounds), dtype=bool)
+                # Suppress person if any vehicle footprint mostly covers the
+                # pedestrian footprint in BEV. IoU = inter/union stays LOW when a
+                # small pedestrian footprint sits inside a large vehicle footprint
+                # (union dominated by the vehicle), so IoU alone misses false
+                # pedestrians that are really part of a vehicle. overlap-fraction
+                # (= inter / area_pedestrian) stays HIGH, catching these cases.
+                suppress_person = np.zeros(len(person_grounds), dtype=bool)
 
-            def _overlap_frac_ped_veh(p_ground: np.ndarray, v_ground: np.ndarray) -> float:
-                ha = cv2.convexHull(p_ground.astype(np.float32).reshape(-1, 1, 2))
-                hb = cv2.convexHull(v_ground.astype(np.float32).reshape(-1, 1, 2))
-                area_p = cv2.contourArea(ha)
-                area_v = cv2.contourArea(hb)
-                smaller = min(area_p, area_v)
-                if smaller <= 1e-6:
-                    return 0.0
-                inter, _ = cv2.intersectConvexConvex(ha, hb)
-                return float(inter) / smaller
+                for p_idx, p_ground in enumerate(person_grounds):
+                    if suppress_person[p_idx]:
+                        continue
+                    ha = person_hulls[p_idx]
+                    area_p = person_areas[p_idx]
+                    for v_idx, v_ground in enumerate(vehicle_grounds):
+                        # Criterio 1: overlap frazione >= 0.05 (cattura quando il veicolo
+                        # copre la maggior parte del pedone, o viceversa).
+                        smaller = min(area_p, veh_areas[v_idx])
+                        if smaller > 1e-6:
+                            inter, _ = cv2.intersectConvexConvex(ha, veh_hulls[v_idx])
+                            if float(inter) / smaller >= 0.05:
+                                suppress_person[p_idx] = True
+                                break
+                        # Criterio 2: il punto di contatto col terreno del pedone
+                        # (centro del suo footprint) cade dentro il footprint del
+                        # veicolo in BEV. Cattura i falsi pedoni su veicoli dove il
+                        # footprint del pedone e' grande o parzialmente sovrapposto,
+                        # quindi overlap_frac resta sotto 0.65 pur essendo fisicamente
+                        # sopra il veicolo.
+                        p_centroid = p_ground.mean(axis=0)
+                        try:
+                            if cv2.pointPolygonTest(
+                                    v_ground.astype(np.float32).reshape(-1, 1, 2),
+                                    tuple(p_centroid.astype(np.float32)), False) >= 0:
+                                suppress_person[p_idx] = True
+                                break
+                        except Exception:
+                            pass
 
-            for p_idx, p_ground in enumerate(person_grounds):
-                if suppress_person[p_idx]:
-                    continue
-                for v_ground in vehicle_grounds:
-                    # Criterio 1: overlap frazione >= 0.65 (cattura quando il veicolo
-                    # copre la maggior parte del pedone, o viceversa).
-                    if _overlap_frac_ped_veh(p_ground, v_ground) >= 0.05:
-                        suppress_person[p_idx] = True
-                        break
-                    # Criterio 2: il punto di contatto col terreno del pedone
-                    # (centro del suo footprint) cade dentro il footprint del
-                    # veicolo in BEV. Cattura i falsi pedoni su veicoli dove il
-                    # footprint del pedone e' grande o parzialmente sovrapposto,
-                    # quindi overlap_frac resta sotto 0.65 pur essendo fisicamente
-                    # sopra il veicolo.
-                    p_centroid = p_ground.mean(axis=0)
-                    try:
-                        if cv2.pointPolygonTest(
-                                v_ground.astype(np.float32).reshape(-1, 1, 2),
-                                tuple(p_centroid.astype(np.float32)), False) >= 0:
-                            suppress_person[p_idx] = True
-                            break
-                    except Exception:
-                        pass
-
-            keep = np.ones(len(merged_with_ground), dtype=bool)
-            for idx, p_idx in enumerate(person_indices):
-                if suppress_person[idx]:
-                    keep[p_idx] = False
-            merged_with_ground = [merged_with_ground[i] for i in range(len(merged_with_ground)) if keep[i]]
+        keep = np.ones(len(merged_with_ground), dtype=bool)
+        for idx, p_idx in enumerate(person_indices):
+            if suppress_person[idx]:
+                keep[p_idx] = False
+        merged_with_ground = [merged_with_ground[i] for i in range(len(merged_with_ground)) if keep[i]]
 
         merged.extend(merged_with_ground)
 
@@ -578,12 +543,8 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
     #   - se il veicolo ha solo 2D box: copertura della 2D box del pedone >= 0.05
     #   - se il pedone ha solo 2D box: centro-bottom proiettato in BEV dentro
     #     footprint veicolo (se il veicolo ha ground_bev)
-    def _ofpv(p_ground: np.ndarray, v_ground: np.ndarray) -> float:
-        ha = cv2.convexHull(p_ground.astype(np.float32).reshape(-1, 1, 2))
-        hb = cv2.convexHull(v_ground.astype(np.float32).reshape(-1, 1, 2))
-        area_p = cv2.contourArea(ha)
-        area_v = cv2.contourArea(hb)
-        smaller = min(area_p, area_v)
+    def _ofpv_h(ha, area_a, hb, area_b) -> float:
+        smaller = min(area_a, area_b)
         if smaller <= 1e-6:
             return 0.0
         inter, _ = cv2.intersectConvexConvex(ha, hb)
@@ -694,6 +655,8 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             if getattr(d, "geom_ok", False) and hasattr(d, "ground_bev") and d.ground_bev.shape == (4, 2)
         ]
         veh_boxes = [d.xyxy for d in final_vehicles if d.xyxy is not None]
+        veh_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in veh_grounds]
+        veh_hareas = [cv2.contourArea(h) for h in veh_hulls]
 
         survivors = []
         for d in merged:
@@ -704,9 +667,11 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             suppressed = False
 
             # --- case A: pedone vs veicolo con ground 3D valido (BEV) ---
-            if hasattr(d, "ground_bev") and d.ground_bev.shape == (4, 2) and veh_grounds:
-                for vg in veh_grounds:
-                    if _ofpv(d.ground_bev, vg) >= 0.50:
+            if hasattr(d, "ground_bev") and d.ground_bev.shape == (4, 2) and veh_hulls:
+                ha = cv2.convexHull(d.ground_bev.astype(np.float32).reshape(-1, 1, 2))
+                ha_area = cv2.contourArea(ha)
+                for hb, hv_area in zip(veh_hulls, veh_hareas):
+                    if _ofpv_h(ha, ha_area, hb, hv_area) >= 0.50:
                         suppressed = True
                         break
 
@@ -978,59 +943,10 @@ def _parse_class_conf(spec: Optional[str]) -> Dict[int, float]:
 VEHICLES_V2 = (2,)   # unified vehicle class (all COCO vehicles -> 2)
 
 
-def _ground_overlap(qa, qb):
-    """Intersection of two ground quads as a fraction of the smaller one (convex hulls)."""
-    ha = cv2.convexHull(np.asarray(qa, np.float32).reshape(-1, 1, 2))
-    hb = cv2.convexHull(np.asarray(qb, np.float32).reshape(-1, 1, 2))
-    small = min(cv2.contourArea(ha), cv2.contourArea(hb))
-    if small <= 1e-6:
-        return 0.0
-    inter, _ = cv2.intersectConvexConvex(ha, hb)
-    return float(inter) / float(small)
-
-
-def _suppress_nested(dets, thresh, ground_idx):
-    """Drop a vehicle whose 2D box lies >= ``thresh`` inside a LARGER vehicle's box and whose
-    cuboid ground quad overlaps that vehicle's ground quad.
-
-    The end2end head runs no NMS and reports a box truck twice: the whole vehicle as
-    "truck" and its cab as a "car" nested inside it. The tracker then alternates between
-    the two boxes and the offline refinement cuts and drops the fragments, so the truck
-    disappears from the output although the detector saw it in every frame. The ground
-    test keeps genuine neighbours: a car in front of a bus is nested in the image but
-    stands on its own patch of road, so its footprint does not overlap the bus's.
-    """
-    veh = [d for d in dets if d.cls in VEHICLES_V2]
-    gi = list(ground_idx)
-    drop = set()
-    for a in veh:
-        ax1, ay1, ax2, ay2 = a.xyxy
-        area_a = max(ax2 - ax1, 1.0) * max(ay2 - ay1, 1.0)
-        for b in veh:
-            if b is a or id(b) in drop:
-                continue
-            bx1, by1, bx2, by2 = b.xyxy
-            if max(bx2 - bx1, 1.0) * max(by2 - by1, 1.0) <= area_a:
-                continue
-            iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-            ih = max(0.0, min(ay2, by2) - max(ay1, by1))
-            if iw * ih / area_a < thresh:
-                continue
-            if (not getattr(a, "geom_ok", False)
-                    or not getattr(b, "geom_ok", False)
-                    or a.kpts.shape[0] < 8 or b.kpts.shape[0] < 8):
-                continue                       # no cuboids to compare: keep both
-            if _ground_overlap(a.kpts[gi], b.kpts[gi]) < 0.3:
-                continue                       # nested in the image, elsewhere on the ground
-            drop.add(id(a))
-            break
-    return [d for d in dets if id(d) not in drop]
-
-
 class V2Pipeline(rt.RealtimePipeline):
     """Real-time BEV-tracked pipeline powered by BEVOCSortTracker and FixedLagBuffer."""
 
-    CONFIG: dict = dict(kp_vis=0.5, class_conf={}, bev_canvas=None, suppress_nested=0.85,
+    CONFIG: dict = dict(kp_vis=0.5, class_conf={}, bev_canvas=None,
                         layout="side", caption="", label_min_h=26.0, src_fps=30.0,
                         title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11,
                         track_high_conf=None, track_ocm_weight=0.25,
@@ -1040,9 +956,8 @@ class V2Pipeline(rt.RealtimePipeline):
         cfg = dict(V2Pipeline.CONFIG)
         if cfg.get("bev_canvas") is not None and kw.get("bev_canvas") is None:
             kw["bev_canvas"] = tuple(cfg["bev_canvas"])
-        super().__init__(pose_model, None, **kw)
+        super().__init__(pose_model, **kw)
         self.kp_vis = float(cfg.get("kp_vis", 0.5))
-        self.suppress_nested = float(cfg.get("suppress_nested", 0.85))
         self.class_conf: Dict[int, float] = dict(cfg.get("class_conf") or {})
         self.layout = cfg.get("layout", "side")
         self.caption = cfg.get("caption", "") or ""
@@ -1100,8 +1015,7 @@ class V2Pipeline(rt.RealtimePipeline):
         EVERY road user is tracked, whether or not its predicted cuboid is
         trustworthy: association uses boxes only, so a bad cuboid must not cost
         the object its identity. Each detection carries ``kp_ok`` (this frame's
-        keypoints passed the trust test) and its raw corners; the *whole-track*
-        decision is taken later, offline, in :mod:`refine_v2`. Only trusted
+        keypoints passed the trust test) and its raw corners. Only trusted
         corners produce a ground quad, so the homography solver never sees a
         degenerate footprint.
         """
@@ -1269,179 +1183,10 @@ class V2Pipeline(rt.RealtimePipeline):
                                      vehicle_tracks=previous_vehicle_tracks,
                                      bev_unit=self._bev_unit_locked)
         
-        if self.suppress_nested > 0:
-            gi0 = self.resolver.indices(8) or [0, 1, 2, 3]
-            pose = _suppress_nested(pose, self.suppress_nested, gi0)
-            trusted_kp = [d.kpts for d in pose if d.geom_ok]
         if trusted_kp:
             self.resolver.observe(np.stack(trusted_kp))
         self._last_pose_dets = pose
         return pose
-
-    def _deduplicate_detections(self, dets: List[Detection]) -> List[Detection]:
-        """Merge detections of the same physical object, keeping highest-confidence class.
-
-        - Class-agnostic NMS with IoU threshold to merge duplicate boxes
-        - Class preference: for bike(1,3) + person(0) overlaps, prefer bike regardless of confidence
-        - For vehicles (car/truck/bus): lower IoU threshold to catch nested boxes (cab in truck)
-        - For bike(1,3) vs car(2): lower IoU threshold for narrow vehicles detected as both
-        - For other classes: keep higher confidence detection
-        """
-        if len(dets) <= 1:
-            return dets
-
-        boxes = np.array([d.xyxy for d in dets])
-        classes = np.array([d.cls for d in dets])
-        confs = np.array([d.conf for d in dets])
-
-        # Sort by confidence descending
-        order = np.argsort(confs)[::-1]
-        keep = np.ones(len(dets), dtype=bool)
-
-        # Bike classes (COCO: 1=bicycle, 3=motorcycle) both map to "bike"
-        BIKE_CLASSES = {1, 3}
-        VEHICLE_CLASSES = {2, 5, 7}  # car, bus, truck
-
-        for i_idx, i in enumerate(order):
-            if not keep[i]:
-                continue
-            box_i = boxes[i:i+1]
-            cls_i = classes[i]
-            conf_i = confs[i]
-
-            # Compare with lower-confidence detections
-            for j in order[i_idx + 1:]:
-                if not keep[j]:
-                    continue
-                cls_j = classes[j]
-
-                # Dynamic IoU threshold based on class pair
-                if cls_i in VEHICLE_CLASSES and cls_j in VEHICLE_CLASSES:
-                    iou_thresh = 0.5      # vehicle-vehicle: nested boxes (cab in truck)
-                elif (cls_i in BIKE_CLASSES and cls_j in VEHICLE_CLASSES) or \
-                     (cls_j in BIKE_CLASSES and cls_i in VEHICLE_CLASSES):
-                    iou_thresh = 0.5      # bike-vehicle: narrow vehicle detected as both
-                else:
-                    iou_thresh = 0.7      # default
-
-                iou = _iou_matrix(box_i, boxes[j:j+1])[0, 0]
-                if iou < iou_thresh:
-                    continue
-
-                conf_j = confs[j]
-
-                # Special case: bike (1 or 3) vs person (0) -> always prefer bike
-                if cls_i in BIKE_CLASSES and cls_j == 0:
-                    keep[j] = False  # bike wins
-                elif cls_j in BIKE_CLASSES and cls_i == 0:
-                    keep[i] = False  # person loses to bike
-                    break
-                else:
-                    # All other cases: higher confidence wins (already sorted by conf)
-                    keep[j] = False
-
-        return [dets[i] for i in range(len(dets)) if keep[i]]
-
-    def _detect_aux_raw(self, frame) -> List[Detection]:
-        """Only an EXTERNAL auxiliary detector feeds this channel now.
-
-        The v2 model's own low-confidence-cuboid instances are no longer
-        demoted per frame (that is what made the 3D boxes flicker); they stay
-        tracked and are demoted per track offline.
-        """
-        return super()._detect_aux_raw(frame) if self.aux_model is not None else []
-
-    def _suppress_person_with_vehicle_tracks(self, state) -> List:
-        """Suppress person detections that overlap with vehicle track predictions.
-        
-        Uses confirmed vehicle tracks (including coasting up to 10 frames) to create
-        virtual ground footprints, then suppresses person detections that overlap
-        or are contained within those vehicle footprints.
-        """
-        # Use actual Track objects from tracker (have confirmed attribute)
-        tracks = self.tracker.tracks
-        
-        # Collect virtual vehicle ground footprints from confirmed tracks
-        vehicle_grounds = []
-        vehicle_ids = []
-        
-        gi = self.resolver.indices(8)
-        if gi is None:
-            gi = [0, 1, 2, 3]
-        
-        for t in tracks:
-            if int(t.cls) != 2:  # only vehicle class
-                continue
-            if not t.confirmed:
-                continue  # only confirmed tracks
-            
-            # Track with valid ground footprint (recent detection with kp_ok)
-            if t.ground.shape == (4, 2) and t.time_since_update == 0:
-                vehicle_grounds.append(t.ground.copy())
-                vehicle_ids.append(t.id)
-            # Coasting track: use predicted keypoints projected to ground (max 10 frames)
-            elif t.time_since_update <= 10 and t.kpts.shape[0] >= 8:
-                pred_state = t.predicted_state()
-                pred_kpts = pred_state[4:].reshape(-1, 2)
-                if pred_kpts.shape[0] >= 8 and gi and pred_kpts.shape[0] >= max(gi) + 1:
-                    pred_ground = pred_kpts[list(gi)].copy()
-                    vehicle_grounds.append(pred_ground)
-                    vehicle_ids.append(t.id)
-        
-        if not vehicle_grounds:
-            return state.tracks  # no vehicle tracks to suppress against
-        
-        # Transform vehicle footprints to BEV space using homography
-        vehicle_grounds_bev = []
-        for vg in vehicle_grounds:
-            try:
-                vg_bev = apply_homography(vg, state.H)
-                vehicle_grounds_bev.append(vg_bev)
-            except Exception:
-                continue
-        
-        if not vehicle_grounds_bev:
-            return state.tracks
-        
-        vehicle_grounds_bev = np.stack(vehicle_grounds_bev)  # (V, 4, 2)
-        
-        # Filter person tracks that overlap with vehicle grounds in BEV space
-        suppress_person_ids = set()
-        
-        for t in tracks:
-            if int(t.cls) != 0:  # only person class
-                continue
-            
-            if t.ground.shape != (4, 2):
-                continue  # no ground, keep (conservative)
-            
-            # Transform person ground to BEV space
-            try:
-                person_ground_bev = apply_homography(t.ground, state.H)
-            except Exception:
-                continue
-            
-            suppress = False
-            
-            for v_ground_bev in vehicle_grounds_bev:
-                # Check IoU in BEV space
-                iou_mat = _ground_iou_matrix(person_ground_bev[None], v_ground_bev[None])
-                if iou_mat[0, 0] >= 0.05:
-                    suppress = True
-                    break
-                # Check containment in BEV space
-                if _polygon_contains(v_ground_bev, person_ground_bev) or _polygon_contains(person_ground_bev, v_ground_bev):
-                    suppress = True
-                    break
-            
-            if suppress:
-                suppress_person_ids.add(t.id)
-        
-        # Filter state.tracks (_TrackView) based on suppress list
-        filtered_tracks = [tv for tv in state.tracks if tv.id not in suppress_person_ids]
-        
-        state.tracks = filtered_tracks
-        return state.tracks
 
     # ------------------------------------------------------------------ #
     def step(self, frame) -> rt.RenderState:
@@ -1963,372 +1708,10 @@ class V2Pipeline(rt.RealtimePipeline):
                     alpha=0.92)
 
 
-# --------------------------------------------------------------------------- #
-# Offline post-processing: track clean-up + BEV auto-fit, run between the core
-# pass and the v1 stabiliser (we wrap ``rt._stabilize_offline``).
-POST: dict = dict(refine=False, min_track=12, coast_tail=8, merge_gap=30,
-                  max_gap=45, min_fill=0.5, min_ok_frac=0.5, fill_box=True,
-                  vel_heading=True, hold_still=True, rigid_cuboids=True,
-                  world_lock=True, shape_smooth=True, shape_win=31, dedupe=True,
-                  speed_ratio=3.0,
-                  max_reproj=0.10, bev_fit=False, fit_max_px=40.0,
-                  fit_min_px=22.0, fit_pct=90.0)
-
-
-def _bev_fit(pipe, states, max_px, min_px, pct=90.0):
-    """Zoom the BEV so the clip's footprints fit the panel (offline only).
-
-    Measures every footprint centre in canvas units at the reference zoom, then
-    scales ``object_px`` (and the frozen world-lock, if any) so the given
-    percentile of the horizontal / forward extents fits inside the margins.
-    """
-    cw = pipe._bev_canvas or states[0].img_wh
-    ref = V2Viewport.DEFAULT_OBJECT_PX
-    vp = V2Viewport(canvas_size=cw, object_px=ref)
-    cc = np.array(vp.camera_canvas, dtype=np.float64)
-    dx, dy = [], []
-    for s in states[::2]:
-        if pipe._frozen_sim is not None:
-            sim = pipe._frozen_sim
-        else:
-            vp.update(np.asarray(s.H, dtype=np.float64), s.img_wh, unit=s.bev_unit)
-            sim = vp._sim
-        if sim is None:
-            continue
-        for v in s.tracks:
-            q = v.bev_quad
-            if q is None:
-                continue
-            p = sim.apply(np.asarray(q, dtype=np.float64)).mean(axis=0)
-            if np.all(np.isfinite(p)):
-                dx.append(abs(p[0] - cc[0]))
-                dy.append(cc[1] - p[1])
-    if len(dx) < 10:
-        print("[bev-fit] too few footprints; zoom unchanged")
-        return
-    dx, dy = np.array(dx), np.array(dy)
-    ex = float(np.percentile(dx, pct)) + 0.8 * ref     # + half a car
-    ey = float(np.percentile(dy[dy > 0], pct)) + 0.8 * ref if (dy > 0).any() else 1.0
-    avail_x = vp.W / 2.0 - vp.margin - 6
-    avail_y = vp.H - 2 * vp.margin - 6
-    s = min(avail_x / max(ex, 1e-6), avail_y / max(ey, 1e-6))
-    new_px = float(np.clip(ref * s, min_px, max_px))
-    s = new_px / ref
-    V2Viewport.DEFAULT_OBJECT_PX = new_px
-    if pipe._frozen_sim is not None:
-        pipe._frozen_sim.scale *= s
-    pipe.viewport = None                       # rebuilt with the new zoom
-    print(f"[bev-fit] extents x {ex:.0f}px  fwd {ey:.0f}px at {ref:.0f}px/object"
-          f" -> object_px {new_px:.1f}")
-
-
-def _dump_states(states, fixed, path):
-    """Pickle a frame-free geometry snapshot so the offline maths can be tuned
-    without re-running the detector (development helper only)."""
-    import pickle
-    snap = dict(fixed=bool(fixed), frames=[])
-    for s in states:
-        snap["frames"].append(dict(
-            H=np.asarray(s.H, dtype=np.float64), bev_unit=float(s.bev_unit or 0.0),
-            img_wh=tuple(s.img_wh),
-            aux=[dict(cls=int(getattr(d, "cls", -1)),
-                      box=np.asarray(d.xyxy, dtype=np.float64).copy()) for d in s.aux_dets],
-            tracks=[dict(id=int(v.id), cls=int(v.cls),
-                         quad=(np.asarray(v.bev_quad, dtype=np.float64).copy()
-                               if getattr(v, "bev_quad", None) is not None else None),
-                         kpts=np.asarray(v.kpts, dtype=np.float64).copy(),
-                         ground=np.asarray(v.ground, dtype=np.float64).copy(),
-                         box=np.asarray(v.box_xyxy, dtype=np.float64).copy(),
-                         tsu=int(v.time_since_update),
-                         obs=bool(getattr(v, "obs", v.time_since_update == 0)),
-                         kp_ok=bool(getattr(v, "kp_ok", False)))
-                    for v in s.tracks]))
-    with open(path, "wb") as fh:
-        pickle.dump(snap, fh)
-    print(f"[dump] {len(snap['frames'])} frames -> {path}")
-
-
-def _write_labels(pipe, states, fixed, path, first=0):
-    """Write what the renderer drew as data: one file of pseudo-labels.
-
-    These are model output, refined offline, not human annotation. What makes
-    them worth keeping is that the refinement is whole-track: identity, class,
-    footprint and height are each decided once over the clip and posed per
-    frame, so the series is consistent in a way per-frame inference is not.
-
-    Coordinates are pixels of the frames that were PROCESSED. When the source
-    was scaled before rendering, ``source.scale`` maps them back: multiply by
-    it to land in the original file's pixels.
-
-    ``first`` drops the head of the clip from the file while keeping it in the
-    computation. The refinement is whole-track and non-causal, so those frames
-    still inform every estimate; they are simply not written out, which is what
-    you want when the exported range has to match a range someone has actually
-    watched. Frame numbering stays that of the source throughout.
-
-    Keypoint order follows the released checkpoint: indices 0 to 3 are the
-    ground-contact corners in cyclic order, 4 to 7 the roof corners above them
-    in the same order. ``ground`` repeats the ground quad after refinement (the
-    quad that is actually drawn), ``footprint`` is that quad mapped through the
-    frame's homography onto the ground plane, where distances are comparable
-    across the clip and ``bev_unit`` is one median vehicle length.
-    """
-    import gzip
-    import json
-    from datetime import datetime, timezone
-
-    def r(a, nd=2):
-        return [[round(float(x), nd) for x in row] for row in np.asarray(a)]
-
-    frames = []
-    for i, st in enumerate(states):
-        if i < first:
-            continue
-        H = np.asarray(st.H, dtype=np.float64) if st.H is not None else None
-        tracks = []
-        for v in st.tracks:
-            g = np.asarray(v.ground, dtype=np.float64)
-            has_g = g.shape == (4, 2)
-            fp = None
-            if has_g and H is not None:
-                try:
-                    fp = r(apply_homography(g, H), 3)
-                except Exception:
-                    fp = None
-            kp = np.asarray(v.kpts, dtype=np.float64)
-            tracks.append(dict(
-                id=int(v.id), cls=int(v.cls),
-                name=style.CATEGORY_LABEL.get(POSE_CATEGORY_V2.get(int(v.cls), "other"),
-                                              "object"),
-                box=[round(float(x), 1) for x in np.asarray(v.box_xyxy).ravel()],
-                kpts=r(kp, 1) if kp.size else None,
-                ground=r(g, 1) if has_g else None,
-                footprint=fp,
-                observed=bool(getattr(v, "obs", v.time_since_update == 0)),
-                kp_ok=bool(getattr(v, "kp_ok", False))))
-        frames.append(dict(
-            i=i, t=round(i / float(pipe.src_fps or 30.0), 4),
-            H=[[float(x) for x in row] for row in H] if H is not None else None,
-            bev_unit=round(float(st.bev_unit or 0.0), 4),
-            tracks=tracks,
-            boxes_2d=[dict(cls=int(getattr(d, "cls", -1)),
-                           box=[round(float(x), 1) for x in np.asarray(d.xyxy).ravel()])
-                      for d in st.aux_dets]))
-
-    # Which half of the 8 keypoints touches the ground is a property of the
-    # checkpoint, resolved by vote at run time, so it is recorded rather than
-    # assumed.
-    gi = list(pipe.resolver.indices(8) or [0, 1, 2, 3])
-    roof = [k for k in range(8) if k not in gi]
-    w, h = (int(v) for v in states[0].img_wh) if states else (0, 0)
-    doc = dict(
-        format="urbanomnidetect-pseudo-labels/1",
-        generated=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        note=("Model output refined offline by refine_v2, not human annotation. "
-              "Treat as pseudo ground truth."),
-        source=dict(processed_wh=[w, h], fps=round(float(pipe.src_fps or 30.0), 4),
-                    frames=len(frames), first_frame=int(first),
-                    last_frame=int(len(states) - 1), rendered_frames=len(states),
-                    **pipe.labels_meta),
-        scene=dict(camera=pipe.camera_tag or "unknown",
-                   fixed_ground_plane=bool(fixed),
-                   caption=pipe.caption or None),
-        keypoints=dict(count=8, ground_indices=gi, roof_indices=roof,
-                       order="the ground half is resolved per clip by majority vote; "
-                             "each roof corner sits above the ground corner at the "
-                             "same position within its half"),
-        classes={str(k): style.CATEGORY_LABEL.get(vv, vv)
-                 for k, vv in POSE_CATEGORY_V2.items()},
-        fields=dict(
-            box="2D box [x1,y1,x2,y2] in processed pixels",
-            kpts="8 cuboid corners [[x,y]...] in processed pixels, null when 2D-only",
-            ground="4 ground-contact corners in processed pixels",
-            footprint="the same quad on the ground plane, through this frame's H",
-            observed="false when the pose was filled across a detection gap",
-            kp_ok="the keypoint head was trusted on this frame",
-            boxes_2d="detections carried without a usable cuboid"),
-        frames=frames)
-
-    op = gzip.open if path.endswith(".gz") else open
-    with op(path, "wt") as fh:
-        json.dump(doc, fh, separators=(",", ":"))
-    n_ids = len({t["id"] for f in frames for t in f["tracks"]})
-    print(f"[labels] {len(frames)} frames, {n_ids} ids -> {path}")
-
-
-_orig_stabilize = rt._stabilize_offline
-
-def _shot_camera_tag(states, C, moving_source, shift_tol=0.03, zoom_tol=0.03):
-    """Is this a static camera or a moving one, as a viewer would say it.
-
-    Not the same question the solver answers. The solver asks whether one
-    ground plane fits the whole clip, and a drone rising slowly enough still
-    passes that test: over a few seconds its per-frame motion sits under every
-    threshold, so the geometry is modelled as fixed. Saying "static camera"
-    about that footage would simply be wrong.
-
-    So the caption is measured from the NET transform between the first and the
-    last frame, not from a per-frame median: a view that has travelled more than
-    a few percent of the frame, or zoomed by more than a few percent, moved.
-    Both tolerances are fractions of the frame, so nothing here is tied to a
-    resolution, a frame rate or a clip length.
-    """
-    if moving_source:
-        return "moving camera"
-    if C is None or len(C) < 2 or not states:
-        return "static camera"
-    try:
-        w, h = [float(v) for v in states[0].img_wh]
-        M = np.asarray(C[-1], dtype=np.float64)
-        if M.shape != (3, 3) or not np.all(np.isfinite(M)):
-            return "static camera"
-        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-        dst = cv2.perspectiveTransform(src, M).reshape(-1, 2)
-    except Exception:
-        return "static camera"
-    src = src.reshape(-1, 2)
-    diag = float(np.hypot(w, h)) or 1.0
-    shift = float(np.linalg.norm(dst.mean(0) - src.mean(0))) / diag
-    area = 0.5 * abs(float(np.dot(dst[:, 0], np.roll(dst[:, 1], -1))
-                            - np.dot(dst[:, 1], np.roll(dst[:, 0], -1))))
-    zoom = np.sqrt(area / max(w * h, 1.0)) - 1.0
-    moved = shift > shift_tol or abs(zoom) > zoom_tol
-    print(f"[caption] net camera motion over the clip: {shift * 100:.1f}% of the "
-          f"frame, {zoom * 100:+.1f}% zoom -> "
-          f"{'moving' if moved else 'static'} camera")
-    return "moving camera" if moved else "static camera"
-
-
-
-
-def _stabilize_offline_v2(pipe, states, fixed, traj_C, traj_steps, args):
-    """Offline back-end: refine tracks/geometry, then the v1 stabilisation.
-
-    The refinement that changes the geometry (gap fill, keypoint repair, box
-    fill) runs BEFORE the v1 pass so its zero-phase smoothing and the global
-    ground-homography solve both see the corrected footprints. The footprint
-    shape/heading pass runs AFTER, because the global solve re-poses every
-    footprint in its own reference gauge.
-    """
-    gi = pipe.resolver.indices(8)
-    moving_source = not fixed          # what the SOURCE is, for the caption
-    if (POST["world_lock"] and not fixed and states
-            and getattr(states[0], "frame", None) is not None):
-        # The camera was judged to be moving. That verdict comes from corners
-        # tracked anywhere in the frame, so on a shot that is mostly traffic it
-        # can be measuring the CARS. Re-measure away from them and re-decide
-        # with the same thresholds: if the camera is really holding still (or
-        # drifting slowly), the whole clip can share one ground plane instead of
-        # a per-frame homography whose noise reaches every cuboid.
-        C, steps = refine_v2.ego_motion(states)
-        if len(steps) > 1:
-            diag = float(np.hypot(*states[0].img_wh)) or 1.0
-            tmed = float(np.median(steps[1:, 0])) / diag
-            rmed = float(np.median(steps[1:, 1]))
-            smed = float(np.median(steps[1:, 2]))
-            if tmed < 0.003 and rmed < 0.15 and smed < 0.003:
-                fixed = True
-                traj_C, traj_steps = C, steps
-                print("[refine] camera re-classified FIXED once the traffic is "
-                      "excluded; solving one world-locked ground plane")
-    cfg = refine_v2.RefineConfig.for_fps(getattr(pipe, "src_fps", 30.0))
-    sets = refine_v2.TrackSets()
-    if POST["refine"] and states:
-        sets = refine_v2.refine_tracks(pipe, states, gi, cfg,
-                                       dedupe=POST["dedupe"])
-
-    _orig_stabilize(pipe, states, fixed, traj_C, traj_steps, args)
-    # The caption describes the SHOT, not the solver.
-    pipe.camera_tag = _shot_camera_tag(states, traj_C, moving_source)
-
-    # ====================================================================
-    # SBLOCCO/BLOCCO PERSONALIZZATO (Filtro per Classi)
-    # ====================================================================
-    # 1. Forza la tua matrice ignorando quella calcolata dal software
-    override_H = getattr(pipe, 'static_H', np.eye(3))
-    for s in states:
-        s.H = override_H
-
-    # 2. PROIEZIONE MIRATA IN BEV
-    from homography_rt import apply_homography
-    for s in states:
-        H_mat = np.asarray(s.H, dtype=np.float64)
-        for v in s.tracks:
-            if getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
-                
-                if v.cls == 0:
-                    # --- PEDONI: impronta rigida quadrata con homografia ---
-                    # Applichiamo l'omografia ma mantenendo l'impronta quadrata rigida
-                    # per evitare che ruoti, si allarghi o si restringa frame a frame.
-                    try:
-                        v.bev_quad = pipe._pedestrian_rigid_footprint(v, H_mat, float(s.bev_unit or 0.0))
-                    except Exception:
-                        pass
-                
-                else: # --- ALTRI VEICOLI: applica l'omografia normalmente ---                   
-                    try:
-                        v.bev_quad = apply_homography(v.ground, H_mat)
-                    except Exception:
-                        pass
-    # ====================================================================
-
-    if os.environ.get("V2_DUMP_STATES"):      # dev hook: geometry-only snapshot
-        _dump_states(states, fixed, os.environ["V2_DUMP_STATES"])
-    if POST["refine"] and states:
-        refine_v2.refine_geometry(
-            pipe, states, gi, cfg, sets, fixed,
-            smooth_win=max(3, int(getattr(args, "smooth", 11) or 11)),
-            poly=int(getattr(args, "smooth_poly", 2) or 2),
-            use_velocity=POST["vel_heading"], hold_still=POST["hold_still"],
-            rigid_cuboids=POST["rigid_cuboids"], shape_smooth=POST["shape_smooth"],
-            fill_box=POST["fill_box"])
-        refine_v2.report_jitter(states)
-        if os.environ.get("V2_DUMP_FINAL"):    # dev hook: what is actually drawn
-            _dump_states(states, fixed, os.environ["V2_DUMP_FINAL"])
-    # SBLOCCO DEI BBOX (Forza l'impronta 3D dinamica dopo l'ottimizzazione dell'omografia)
-    for s in states:
-        if getattr(s, 'H', None) is None:
-            continue
-        H_mat = np.asarray(s.H, dtype=np.float64)
-        for v in s.tracks:
-            if getattr(v, 'ground', None) is not None and v.ground.shape == (4, 2):
-                if v.cls == 0:
-                    continue  # pedoni: mantengono l'impronta rigida quadrata
-                try:
-                    v.bev_quad = apply_homography(v.ground, H_mat)
-                except Exception:
-                    pass
-    # The offline geometry passes above can rebuild a footprint from ground
-    # keypoints. Reapply the per-frame exit gate after all reconstruction so an
-    # outgoing vehicle stays hidden in BEV even while its camera cuboid remains.
-    for s in states:
-        for v in s.tracks:
-            if not getattr(v, "bev_visible", True):
-                v.bev_quad = None
-    if POST["bev_fit"] and states:
-        _bev_fit(pipe, states, POST["fit_max_px"], POST["fit_min_px"], POST["fit_pct"])
-    if states:
-        n_ids = len({v.id for s in states for v in s.tracks})
-        mean_trk = np.mean([len(s.tracks) for s in states])
-        n_aux = np.mean([len(s.aux_dets) for s in states])
-        print(f"[tracks] {n_ids} 3D ids over {len(states)} frames; mean "
-              f"{mean_trk:.1f} cuboids + {n_aux:.1f} 2D-only per frame")
-    if getattr(pipe, "labels_path", "") and states:
-        _write_labels(pipe, states, fixed, pipe.labels_path,
-                      first=int(getattr(pipe, "labels_first", 0)))
-
-
-rt._stabilize_offline = _stabilize_offline_v2
-
-
-# --------------------------------------------------------------------------- #
 def build_v2_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--kp-vis", type=float, default=0.5,
                    help="min per-corner keypoint visibility to draw a cuboid")
-    p.add_argument("--suppress-nested", type=float, default=0.0,
-                   help="drop a vehicle box nested >= this fraction inside a larger vehicle "
-                        "box whose cuboid footprint it overlaps (0 = off; 0.85 recommended)")
     p.add_argument("--class-conf", default="",
                    help="per-class min confidence, COCO ids, e.g. '0:0.4,1:0.5,3:0.5'")
     p.add_argument("--bev-canvas", default=None,
@@ -2339,74 +1722,21 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="opening titles over this clip, as start,fade-in,hold,fade-out "
                         "in SOURCE seconds (the cut trims and speeds up afterwards)")
     p.add_argument("--object-px", type=float, default=40.0,
-                   help="BEV zoom: on-screen px of a median footprint (max with --bev-fit)")
-    p.add_argument("--bev-fit", action="store_true",
-                   help="offline: auto-zoom the BEV so the clip's footprints fit")
-    p.add_argument("--bev-fit-min-px", type=float, default=22.0,
-                   help="--bev-fit never zooms out below this many px per median object")
-    p.add_argument("--bev-fit-pct", type=float, default=90.0,
-                   help="--bev-fit fits this percentile of footprint extents")
+                   help="BEV zoom: on-screen px of a median footprint")
     p.add_argument("--label-min-h", type=float, default=26.0,
                    help="hide the id chip of boxes shorter than this (px); cuboid still drawn")
-    p.add_argument("--refine", "--track-cleanup", dest="refine", action="store_true",
-                   help="offline: merge split ids, fill detection gaps, per-track cuboid "
-                        "vote, box fill, whole-track rigid footprint + trajectory heading")
-    p.add_argument("--no-fill-box", dest="fill_box", action="store_false",
-                   help="do not rescale cuboids to fill their 2D box")
-    p.add_argument("--no-vel-heading", dest="vel_heading", action="store_false",
-                   help="do not take a moving vehicle's BEV heading from its trajectory")
-    p.add_argument("--no-rigid-cuboids", dest="rigid_cuboids", action="store_false",
-                   help="do not rebuild cuboids from (footprint, height, vertical VP)")
-    p.add_argument("--refine-fps", type=float, default=0.0,
-                   help="frame rate the refinement should assume (default: read from "
-                        "the source). Its thresholds are in seconds, so this only "
-                        "matters if the file's metadata is wrong")
-    p.add_argument("--speed-ratio", type=float, default=3.0,
-                   help="cut a track rather than bridge a gap that needs this many "
-                        "times its own top speed")
-    p.add_argument("--no-dedupe", dest="dedupe", action="store_false",
-                   help="do not merge tracks whose ground footprints coincide")
-    p.add_argument("--no-shape-smooth", dest="shape_smooth", action="store_false",
-                   help="do not smooth unmodelled cuboids in their own box frame")
-    p.add_argument("--shape-win", type=int, default=31,
-                   help="window for that box-frame shape smoothing")
-    p.add_argument("--no-world-lock", dest="world_lock", action="store_false",
-                   help="never re-measure ego-motion off the static scene; keep the "
-                        "per-frame homography on a camera judged to be moving")
-    p.add_argument("--no-hold-still", dest="hold_still", action="store_false",
-                   help="do not freeze the position of a vehicle that is standing still")
-    p.add_argument("--max-reproj", type=float, default=0.10,
-                   help="a rebuilt cuboid is rejected above this reprojection error "
-                        "(fraction of the 2D box diagonal)")
-    p.add_argument("--max-gap", type=int, default=45,
-                   help="longest detection gap (frames) that --refine interpolates")
-    p.add_argument("--min-fill", type=float, default=0.5,
-                   help="a track whose cuboid hull covers less than this fraction of its "
-                        "2D box is drawn 2D-only for the whole clip")
-    p.add_argument("--min-track", type=int, default=12)
-    p.add_argument("--coast-tail", type=int, default=8)
-    p.add_argument("--merge-gap", type=int, default=30)
-    p.add_argument("--labels", default="",
-                   help="also write the drawn geometry as pseudo-labels to this "
-                        "path (.json, or .json.gz to compress)")
-    p.add_argument("--labels-from", type=int, default=0,
-                   help="write labels from this frame on. Earlier frames are still "
-                        "rendered and still inform the offline refinement; they are "
-                        "left out of the file")
-    p.add_argument("--labels-source", default="",
-                   help="original file the input was scaled from, recorded in the "
-                        "label file so coordinates can be mapped back to it")
-    p.add_argument("--coast-mark", action="store_true",
-                   help="append '?' to the label of a coasting track (v1 look)")
+    p.add_argument("--fps", "--refine-fps", dest="fps", type=float, default=0.0,
+                   help="frame rate the pipeline should assume (default: read from "
+                        "the source). Only matters if the file's metadata is wrong")
     p.add_argument("--source-type", choices=["auto", "video", "stream"], default="auto",
                    help="'video' per file .mp4 sequenziali; 'stream' per telecamere live RTSP/USB")
     p.add_argument("--track-high-conf", type=float, default=None,
                    help="confidenza minima per avviare una nuova traccia; "
-                   "default max(--kp-conf, 0.35)",
+                        "default max(--kp-conf, 0.35)",
     )
     p.add_argument("--track-ocm-weight", type=float, default=0.25,
                    help="peso della direzione di moto; valori >=1 rifiutano anche "
-                   "associazioni chiaramente controcorrente",
+                        "associazioni chiaramente controcorrente",
     )
     p.add_argument("--bev-unit", type=float, default=None,
                    help="bev_unit calibrato per la telecamera; evita la stima iniziale",
@@ -2427,177 +1757,3 @@ def build_v2_argparser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-frames", type=int, default=3,
                    help="Frame consecutivi di conflitto TTC richiesti per confermare l'infrazione.")
     return p
-
-
-def main(argv=None):
-    import time
-    argv = list(sys.argv[1:] if argv is None else argv)
-    v2args, rest = build_v2_argparser().parse_known_args(argv)
-
-    # Disabilita di default il modello ausiliario esterno in v2
-    if not any(a.startswith("--aux-model") for a in rest):
-        rest += ["--aux-model", "none"]
-
-    # Parsing degli argomenti base (input, kp-model, smooth, device, ecc.)
-    args = rt.build_argparser().parse_args(rest)
-
-    # 1. Apre la sorgente (File Video oppure Stream Camera Live) una sola volta
-    src = FrameSource(args.input, source_type=getattr(v2args, "source_type", "auto"))
-    fps = float(v2args.refine_fps) or src.fps
-    src_w = int(src.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-
-    # 2. Configura le dimensioni del pannello BEV e lo zoom (--object-px)
-    canvas = None
-    if v2args.bev_canvas:
-        w, h = v2args.bev_canvas.lower().split("x")
-        canvas = (int(w), int(h))
-    elif v2args.layout == "dashboard":
-        canvas = (max(360, FINAL_W - src_w) if src_w else 640, FINAL_H)
-
-    V2Viewport.DEFAULT_OBJECT_PX = float(v2args.object_px)
-
-    # 3. Finestra del buffer circolare Fixed-Lag (default 11 frame se --smooth è 0 o assente)
-    smooth_win = int(args.smooth) if (args.smooth and args.smooth >= 3) else 11
-
-    # 4. Configura V2Pipeline
-    V2Pipeline.CONFIG = dict(
-        total_frames=src.total_frames,
-        kp_vis=v2args.kp_vis,
-        suppress_nested=v2args.suppress_nested,
-        class_conf=_parse_class_conf(v2args.class_conf),
-        bev_canvas=canvas,
-        layout=v2args.layout,
-        caption=v2args.caption,
-        show_coast_mark=v2args.coast_mark,
-        label_min_h=v2args.label_min_h,
-        src_fps=fps,
-        smooth_win=smooth_win,
-        title=tuple(float(x) for x in v2args.title.split(","))
-        if v2args.title else (0.0, 0.0, 0.0, 0.0),
-        track_high_conf=v2args.track_high_conf,
-        track_ocm_weight=v2args.track_ocm_weight,
-        bev_unit=v2args.bev_unit,
-        show_bev_ids=v2args.show_bev_ids
-    )
-
-    # 5. Carica il modello Pose26 (PyTorch o TensorRT) e istanzia la pipeline V2
-    gi = ([int(x) for x in args.ground_indices.split(",")]
-          if args.ground_indices else None)
-    pose = rt.load_detector(args.kp_model, device=args.device, imgsz=args.kp_imgsz,
-                            export=args.export, half=args.half, task="pose")
-
-    pipe = V2Pipeline(
-        pose, None,
-        kp_imgsz=args.kp_imgsz,
-        kp_conf=args.kp_conf,
-        device=args.device,
-        ground_indices=gi,
-        use_homography=(args.homography != "none"),
-        show_3d=not args.no_3d,
-        snap_rect=not args.no_snap_rect,
-        trails=not args.no_trails,
-        trail_len=args.trail_len,
-        stabilize=not args.no_stabilize,
-        bev_window=args.bev_window,
-        show_fov=not args.no_fov,
-        tracker_kwargs=dict(max_age=args.max_age, min_hits=args.min_hits),
-    )
-
-    if v2args.bev_unit is not None:
-        print(f"bev_unit fisso in uso: {pipe._bev_unit_locked:.12g}")
-
-    # === SETUP VIOLATION DETECTOR ===
-    violation_detector = None
-    if getattr(v2args, "roi_file", None):
-        violation_detector = ViolationDetector(
-            video_name=args.input,
-            roi_file=v2args.roi_file,
-            bev_unit=pipe._bev_unit_locked,
-            ttc_threshold=v2args.ttc_thresh,
-            clip_track_timeout_s=v2args.clip_track_timeout_s,
-            clip_absolute_timeout_s=v2args.clip_absolute_timeout_s,
-            clip_video=not v2args.no_clip,
-            fps=fps,
-            confirm_frames=v2args.confirm_frames,
-        )
-        # Assegna direttamente i punti parsati dal JSON alla pipeline
-        pipe.roi_bev_points = violation_detector.roi.bev_points
-        pipe.roi_image_points = violation_detector.roi.image_points
-    else:
-        pipe.roi_bev_points = None
-        pipe.roi_image_points = None
-    # ================================
-
-    # 6. Loop Real-Time con Fixed-Lag Circular Buffer
-    sink = _FFSink(args, fps)
-    n_out = 0
-    try:
-        while True:
-            ok, frame = src.read()
-            if not ok:
-                break
-            if frame is None:
-                time.sleep(0.001)  # In modalità stream attende il frame successivo
-                continue
-
-            t0 = time.perf_counter()
-            raw_state = pipe.step(frame)
-            ready_state = pipe.lag_buffer.push(raw_state, pipe._tracker_map)
-
-            if ready_state is not None: # il lag buffer ha restituito un frame pronto
-                # === LOGICA INFRAZIONI ===
-                if violation_detector is not None:
-                    # Ottieni l'inversa dell'omografia di questo frame
-                    if pipe.static_H_inv is not None:
-                        # Passiamo il frame ORIGINALE (raw) o l'immagine di output (out_img).
-                        # Se vuoi salvare l'immagine pulita, passa ready_state.frame.
-                        violation_detector.process_frame(
-                            frame=ready_state.frame,
-                            tracks=ready_state.tracks, 
-                            frame_idx=ready_state.frame_idx, 
-                            H_inv=pipe.static_H_inv
-                        )
-                    else: # la matrice di omografia inversa non è presente
-                        pass # la logica di rilevamento infrazioni non viene eseguita
-                # =========================
-                out_img = pipe.render(ready_state)
-                dt = time.perf_counter() - t0
-                pipe.fps_core = pipe.fps_render = rt._ema(pipe.fps_core, dt)
-                n_out += 1
-                if not sink.emit(out_img) or (args.max_frames and n_out >= args.max_frames):
-                    break
-
-        # 7. Se la sorgente è un file video, svuota gli ultimi frame nel buffer circolare
-        if not src.is_stream and not (args.max_frames and n_out >= args.max_frames):
-            for tail_state in pipe.lag_buffer.flush_remaining(pipe._tracker_map):
-                if tail_state is not None:
-                    # === LOGICA INFRAZIONI TAIL ===
-                    if pipe.static_H_inv is not None and violation_detector is not None:
-                        violation_detector.process_frame(
-                            frame=tail_state.frame,
-                            tracks=tail_state.tracks,
-                            frame_idx=tail_state.frame_idx,
-                            H_inv=pipe.static_H_inv
-                        )
-                    else: # la matrice di omografia inversa non è presente
-                        pass # la logica di rilevamento infrazioni non viene eseguita
-                    # ==============================
-                    out_img = pipe.render(tail_state)
-                    n_out += 1
-                    if not sink.emit(out_img):
-                        break
-    finally:
-        # Chiude le infrazioni ancora attive: rilascia i writer delle clip.
-        if violation_detector is not None:
-            violation_detector.close_all("end_of_stream")
-        src.release()
-        sink.close()
-        if args.display:
-            cv2.destroyAllWindows()
-
-    print(f"\nCompletato: {n_out} frame renderizzati ({pipe.fps_core:.1f} fps)")
-    return n_out
-
-
-if __name__ == "__main__":
-    main()

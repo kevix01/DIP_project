@@ -3,10 +3,10 @@
 Modules
 -------
 keypoints   parse pose-model outputs; resolve ground-corner indices
-aux_head    ridge map from auxiliary boxes to ground centres (paper Sec. 3.5)
 bev         temporally stable radar-style BEV viewport + rendering
-tracking    real-time temporal tracker with motion-coasted persistence
+bev_ocsort  real-time BEV tracker with motion-coasted persistence
 viz         drawing helpers for the source frame and BEV
+textdraw    HUD text layer
 model       model loading + optional TensorRT export
 classes     unified class mapping (0=pedestrian, 2=vehicle)
 

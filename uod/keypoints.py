@@ -30,10 +30,7 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-from .classes import to_unified
-
-__all__ = ["Detection", "GroundIndexResolver", "parse_pose_result",
-           "parse_boxes_result"]
+__all__ = ["Detection", "GroundIndexResolver"]
 
 
 @dataclass
@@ -51,18 +48,8 @@ class Detection:
     ground: np.ndarray = field(      # (4, 2) ground footprint, cyclic order
         default_factory=lambda: np.zeros((0, 2)))
     track_id: int = -1
-    is_aux: bool = False             # came from the auxiliary box-only detector
     source_cls: Optional[int] = None  # original COCO class before unification
     geom_ok: bool = False             # trusted for rigid BEV footprint; raw camera points remain drawable
-
-    @property
-    def center(self) -> np.ndarray:
-        x1, y1, x2, y2 = self.xyxy
-        return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5])
-
-    @property
-    def has_ground(self) -> bool:
-        return self.ground.shape == (4, 2)
 
 
 class GroundIndexResolver:
@@ -121,75 +108,3 @@ class GroundIndexResolver:
             second_is_ground = self._votes_lower_half > self._votes_total / 2
             self._locked = (list(range(half, k)) if second_is_ground
                             else list(range(half)))
-
-
-def _order_ground_quad(quad: np.ndarray) -> np.ndarray:
-    """Order four ground corners CCW around their centroid.
-
-    The model already emits a consistent cyclic order, but auxiliary sources or
-    occlusion can scramble it; re-ordering guarantees a simple (non
-    self-intersecting) polygon for the orthogonality loss.
-    """
-    c = quad.mean(axis=0)
-    ang = np.arctan2(quad[:, 1] - c[1], quad[:, 0] - c[0])
-    return quad[np.argsort(ang)]
-
-
-def parse_pose_result(result, ground_indices: Optional[Sequence[int]],
-                      reorder: bool = False) -> List[Detection]:
-    """Convert one Ultralytics pose ``Results`` object into ``Detection``s.
-
-    ``ground_indices`` selects the ground keypoints; if ``None`` the per-object
-    ground footprint is left empty (used while the resolver is still voting).
-    
-    The detection cls is set to unified class (0=pedestrian, 2=vehicle).
-    The original COCO class is preserved in source_cls.
-    """
-    dets: List[Detection] = []
-    if result is None or result.boxes is None or len(result.boxes) == 0:
-        return dets
-
-    xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float64)
-    conf = result.boxes.conf.cpu().numpy().astype(np.float64)
-    cls = result.boxes.cls.cpu().numpy().astype(int)
-    has_kp = result.keypoints is not None and result.keypoints.data is not None
-    kp_all = (result.keypoints.data.cpu().numpy()[:, :, :2].astype(np.float64)
-              if has_kp else None)
-
-    gi = list(ground_indices) if ground_indices else None
-    for i in range(len(xyxy)):
-        kp = kp_all[i] if kp_all is not None else np.zeros((0, 2))
-        ground = np.zeros((0, 2))
-        if gi and kp.shape[0] >= max(gi) + 1:
-            ground = kp[gi].copy()
-            if reorder:
-                ground = _order_ground_quad(ground)
-        source_cls = int(cls[i])
-        unified_cls = to_unified(source_cls)
-        dets.append(Detection(cls=unified_cls, conf=float(conf[i]),
-                              xyxy=xyxy[i], kpts=kp, ground=ground,
-                              source_cls=source_cls))
-    return dets
-
-
-def parse_boxes_result(result, conf_thresh: float = 0.0,
-                       class_filter: Optional[Sequence[int]] = None
-                       ) -> List[Detection]:
-    """Convert a box-only (auxiliary) ``Results`` object into ``Detection``s."""
-    dets: List[Detection] = []
-    if result is None or result.boxes is None or len(result.boxes) == 0:
-        return dets
-    xyxy = result.boxes.xyxy.cpu().numpy().astype(np.float64)
-    conf = result.boxes.conf.cpu().numpy().astype(np.float64)
-    cls = result.boxes.cls.cpu().numpy().astype(int)
-    cf = set(class_filter) if class_filter is not None else None
-    for i in range(len(xyxy)):
-        if conf[i] < conf_thresh:
-            continue
-        if cf is not None and int(cls[i]) not in cf:
-            continue
-        source_cls = int(cls[i])
-        unified_cls = to_unified(source_cls)
-        dets.append(Detection(cls=unified_cls, conf=float(conf[i]),
-                              xyxy=xyxy[i], is_aux=True, source_cls=source_cls))
-    return dets

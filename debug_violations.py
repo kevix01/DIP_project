@@ -513,6 +513,11 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if any(a in ("-h", "--help") for a in argv):
+        bev_v2.build_v2_argparser().print_help()
+        print()
+        rt.build_argparser().print_help()
+        return 0
 
     # Aggiunge parametri specifici per il debug
     dbg_parser = argparse.ArgumentParser(add_help=False)
@@ -523,12 +528,10 @@ def main(argv=None):
     dbg_args, rest_argv = dbg_parser.parse_known_args(argv)
 
     v2args, rest = bev_v2.build_v2_argparser().parse_known_args(rest_argv)
-    if not any(a.startswith("--aux-model") for a in rest):
-        rest += ["--aux-model", "none"]
     args = rt.build_argparser().parse_args(rest)
 
     src = bev_v2.FrameSource(args.input, source_type=getattr(v2args, "source_type", "auto"))
-    fps = float(v2args.refine_fps) or src.fps
+    fps = float(v2args.fps) or src.fps
     src_w = int(src.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
 
     canvas = None
@@ -545,12 +548,10 @@ def main(argv=None):
     bev_v2.V2Pipeline.CONFIG = dict(
         total_frames=src.total_frames,
         kp_vis=v2args.kp_vis,
-        suppress_nested=v2args.suppress_nested,
         class_conf=bev_v2._parse_class_conf(v2args.class_conf),
         bev_canvas=canvas,
         layout="side",
         caption=v2args.caption,
-        show_coast_mark=v2args.coast_mark,
         label_min_h=v2args.label_min_h,
         src_fps=fps,
         smooth_win=smooth_win,

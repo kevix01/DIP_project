@@ -9,12 +9,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-__all__ = ["load_detector", "maybe_export", "DEFAULT_AUX_MODEL"]
-
-# Default frozen auxiliary 2D detector: a recent COCO-pretrained YOLO. The
-# paper used a COCO model purely to broaden recall; ``yolo26x`` is the sane
-# modern default (replacing the older, much slower ``drone_hyper_100.pt``).
-DEFAULT_AUX_MODEL = "yolo26x.pt"
+__all__ = ["load_detector", "maybe_export"]
 
 
 def maybe_export(weights: str, imgsz: int, device: str, fmt: str = "engine",

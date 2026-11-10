@@ -5,6 +5,7 @@ import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 from shapely.geometry import Polygon, Point
+from shapely.prepared import prep
 
 
 class ZebraCrossingROI:
@@ -14,6 +15,7 @@ class ZebraCrossingROI:
         Il JSON deve contenere le chiavi 'bev_points' e 'image_points'.
         """
         self.polygon = None
+        self._prep = None
         self.bev_points = None
         self.image_points = None
         self.bev_unit = float(bev_unit) if bev_unit and bev_unit > 1e-9 else 1.0
@@ -34,13 +36,14 @@ class ZebraCrossingROI:
 
         if len(self.bev_points) >= 3 and len(self.image_points) >= 3:
             self.polygon = Polygon(self.bev_points)
+            self._prep = prep(self.polygon)
         else:
             raise ValueError("La ROI deve contenere almeno 3 punti sia per BEV che per Immagine.")
 
     def contains_point(self, point: np.ndarray) -> bool:
         if point is None or not np.all(np.isfinite(point)):
             return False
-        return self.polygon.contains(Point(float(point[0]), float(point[1])))
+        return self._prep.contains(Point(float(point[0]), float(point[1])))
 
     def overlaps_polygon(self, quad: np.ndarray) -> bool:
         """
@@ -54,7 +57,7 @@ class ZebraCrossingROI:
         veh_poly = Polygon(quad_beu)
         if not veh_poly.is_valid:
             veh_poly = veh_poly.buffer(0)
-        return self.polygon.intersects(veh_poly)
+        return self._prep.intersects(veh_poly)
 
 
 # --------------------------------------------------------------------------- #
@@ -94,7 +97,7 @@ class PedIntent:
     retreat_cos: float = -0.5      # coseno sotto il quale il moto recente è "in ritirata"
     retreat_dist: float = 0.05     # BEU di spostamento minimo sulla finestra step
     hist: deque = field(default_factory=lambda: deque(maxlen=256))
-    raw_hist: deque = field(default_factory=lambda: deque(maxlen=64))
+    raw_hist: deque = field(default_factory=lambda: deque(maxlen=4))
     last_seen_frame: int = -1
 
     state: str = INTENT_UNKNOWN
@@ -120,7 +123,7 @@ class PedIntent:
         filtered = raw
         self.raw_hist.append((int(frame_idx), raw))
         if len(self.raw_hist) >= 4:
-            window = np.stack([p for _, p in list(self.raw_hist)[-4:]], axis=0)
+            window = np.stack([p for _, p in self.raw_hist], axis=0)
             steps = np.linalg.norm(np.diff(window, axis=0), axis=1)
             med_step = float(np.median(steps)) if len(steps) > 0 else 0.0
             thresh = max(0.06, 3.0 * med_step)
@@ -134,10 +137,9 @@ class PedIntent:
         """Restituisce (frame_ref, pos_ref) del campione più vecchio entro la finestra."""
         target = cur_frame - int(n_frames)
         ref = None
-        for fi, pos in self.hist:
+        for fi, pos in reversed(self.hist):
             if fi <= target:
                 ref = (fi, pos)
-            else:
                 break
         return ref
 
@@ -320,72 +322,6 @@ class ViolationDetector:
         print(f"[ViolationDetector] Inizializzato | Output: {self.out_dir} (save={self.save_files}) | "
               f"TTC Thresh: {self.ttc_threshold}s | Conferma: {self.confirm_frames} frame | "
               f"Intent: long={self.intent_long_frames}f short={self.intent_short_frames}f")
-
-    # ------------------------------------------------------------------ #
-    # Calcolo TTC legacy (punto-massa, velocità istantanea)
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def compute_ttc(p_veh: np.ndarray, v_veh: np.ndarray,
-                    p_ped: np.ndarray, v_ped: np.ndarray,
-                    conflict_radius: float = 1.1) -> float:
-        """
-        Calcola il TTC 2D reale in BEV verificando che esista una rotta di collisione.
-        Codici di ritorno per non-violazione (utili per la tabella di debug):
-          -1.0 : Traiettorie divergenti (distanza in aumento)
-          -2.0 : Pedone già passato / in allontanamento dalla corsia del veicolo
-          -3.0 : Traiettorie non incidenti (d_CPA > conflict_radius, corsie diverse)
-           inf : Velocità relativa o del veicolo quasi nulla
-        """
-        p_v = np.asarray(p_veh, dtype=np.float64)
-        v_v = np.asarray(v_veh, dtype=np.float64)
-        p_p = np.asarray(p_ped, dtype=np.float64)
-        v_p = np.asarray(v_ped, dtype=np.float64)
-
-        veh_speed = float(np.linalg.norm(v_v))
-        if veh_speed < 0.15:
-            return float('inf')  # Veicolo fermo
-
-        # Vettore dal veicolo verso il pedone: r = p_ped - p_veh
-        r = p_p - p_v
-        u_veh = v_v / veh_speed  # Versore direzione di marcia del veicolo
-
-        # 1. Controllo Longitudinale: il pedone è già dietro al veicolo?
-        d_long = float(np.dot(r, u_veh))
-        if d_long < -0.4:
-            return -2.0  # Il veicolo ha già superato la linea del pedone
-
-        # 2. Controllo Laterale: il pedone ha già superato la corsia e si sta allontanando?
-        r_lat = r - d_long * u_veh
-        d_lat = float(np.linalg.norm(r_lat))
-        ped_speed = float(np.linalg.norm(v_p))
-        if d_lat > 0.6 and ped_speed > 0.10:
-            u_lat = r_lat / d_lat
-            v_ped_away = float(np.dot(v_p, u_lat))
-            # Se v_ped_away > 0.08, il pedone si trova a lato dell'auto e cammina allontanandosi da essa
-            if v_ped_away > 0.08:
-                return -2.0
-
-        # 3. Calcolo t_CPA (Time to Closest Point of Approach)
-        dp = p_v - p_p
-        dv = v_v - v_p
-        dv2 = float(np.dot(dv, dv))
-        if dv2 < 1e-6:
-            return float('inf')
-
-        dot_pv = float(np.dot(dp, dv))
-        if dot_pv >= 0.0:
-            return -1.0  # Traiettorie divergenti
-
-        t_cpa = -dot_pv / dv2
-
-        # 4. Verifica Distanza Minima d_CPA all'istante t_cpa
-        # Se a t = t_cpa i due oggetti restano distanti più di conflict_radius, non c'è collisione!
-        d_cpa_vec = dp + dv * t_cpa
-        d_cpa = float(np.linalg.norm(d_cpa_vec))
-        if d_cpa > conflict_radius:
-            return -3.0  # Sfilano su corsie diverse senza intersecarsi
-
-        return float(t_cpa)
 
     # ------------------------------------------------------------------ #
     # Valutazione conflitto "intent-gated"
@@ -576,7 +512,7 @@ class ViolationDetector:
         pedestrians_in_roi = []
         vehicles_in_roi = []
 
-        # 0. Aggiorna l'intento di movimento dei pedoni (serve al gate sui falsi positivi)
+        # 0. Aggiorna l'intento di movimento dei pedoni in ROI (serve al gate sui falsi positivi)
         self._update_intents(tracks, frame_idx)
 
         # 1. Smistamento tracce e check geometrici sulla ROI
@@ -591,6 +527,9 @@ class ViolationDetector:
             elif t.cls == 2:
                 if getattr(t, 'bev_quad', None) is not None and self.roi.overlaps_polygon(t.bev_quad):
                     vehicles_in_roi.append(t)
+
+        # Intenti solo per i pedoni effettivamente in ROI (usati da evaluate_conflict)
+        roi_ped_intents = {p.id: self.ped_intents[p.id] for p in pedestrians_in_roi if p.id in self.ped_intents}
 
         # Ordina per ID per stabilità visiva nella tabella di debug
         pedestrians_in_roi.sort(key=lambda x: x.id)
@@ -609,7 +548,7 @@ class ViolationDetector:
             trigger_ttc = None
 
             for ped in pedestrians_in_roi:
-                intent = self.ped_intents.get(ped.id)
+                intent = roi_ped_intents.get(ped.id)
                 ttc, label = self.evaluate_conflict(veh, ped, intent)
                 ttc_matrix[(veh.id, ped.id)] = ttc
                 pair_status[(veh.id, ped.id)] = label
@@ -705,7 +644,7 @@ class ViolationDetector:
             "ttc_threshold": self.ttc_threshold,
             "confirm_frames_required": self.confirm_frames,
             "confirm_counts": confirm_counts,
-            "ped_intents": {pid: it.as_dict() for pid, it in self.ped_intents.items()},
+            "ped_intents": {pid: it.as_dict() for pid, it in roi_ped_intents.items()},
         }
 
     @staticmethod

@@ -21,9 +21,9 @@ import numpy as np
 
 from . import style
 
-__all__ = ["stroke_polyline", "fill_poly_alpha", "draw_cuboid", "draw_box",
-           "draw_ground_quad", "draw_dashed_polyline", "stack_side_by_side",
-           "rounded_contour"]
+__all__ = ["stroke_polyline", "fill_poly_alpha", "draw_cuboid",
+            "draw_ground_quad", "draw_dashed_polyline", "stack_side_by_side",
+            "rounded_contour"]
 
 
 def rounded_contour(pts, radius, steps=4):
@@ -98,14 +98,6 @@ def fill_poly_alpha(img, pts, color_rgb, alpha):
     ov = roi.copy()
     cv2.fillPoly(ov, [p - [x0, y0]], _bgr(color_rgb), cv2.LINE_AA)
     cv2.addWeighted(ov, alpha, roi, 1 - alpha, 0, roi)
-
-
-def draw_box(img, xyxy, color_rgb, thickness=2, halo=True, radius=0):
-    """Draw a 2D bounding box (used for auxiliary detections), optionally rounded."""
-    x1, y1, x2, y2 = [float(v) for v in xyxy]
-    rect = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-    pts = rounded_contour(rect, radius) if radius > 0 else rect
-    stroke_polyline(img, pts, color_rgb, thickness, closed=True, halo=halo)
 
 
 def draw_cuboid(img, kpts8, ground_indices: Optional[Sequence[int]], color_rgb,

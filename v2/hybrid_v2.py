@@ -7,7 +7,7 @@ pipeline marks each instance's keypoint availability through the keypoint
 this module supplies the only framework change: a pose loss that supervises
 keypoints ONLY on instances that have them.
 
-Two pieces:
+One piece:
   * ``HybridPoseLoss26`` -- the end-to-end YOLO26 pose loss with keypoint
     location / objectness / RLE losses restricted to instances with at least one
     visible keypoint, so COCO/VisDrone vehicles never get pushed toward "no
@@ -15,21 +15,14 @@ Two pieces:
     keeps the keypoint head and the flow model in the autograd graph every step
     (a zero-weighted touch), so DistributedDataParallel needs no
     ``find_unused_parameters`` even on batches/ranks with no annotated keypoints.
-  * ``HybridPoseTrainer`` -- a PoseTrainer that builds the pose model, attaches
-    the hybrid loss, and (by ``pretrained=...``) transfers the YOLO26 detection
-    weights so box/cls start strong and only the keypoint head must be learned.
 """
 from __future__ import annotations
 
 import os
 
-import numpy as np
 import torch
-from torch import distributed as dist
 
-from ultralytics.models import yolo
 from ultralytics.nn.tasks import PoseModel
-from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK
 from ultralytics.utils.loss import E2ELoss, PoseLoss26
 from ultralytics.utils.ops import xyxy2xywh
 
@@ -53,13 +46,7 @@ _STRUCT_GAIN = float(os.environ.get("V2_STRUCT_GAIN", "0.5"))
 # annotated instances only, where OKS pins the corners; set V2_STRUCT_UNLABELED=1 to
 # reproduce the old recipe.
 _STRUCT_UNLABELED = bool(int(os.environ.get("V2_STRUCT_UNLABELED", "0")))
-# Hedge: the unlabeled prior HELPS early (epoch-1 reel corner error 0.094 with it vs
-# 0.157 without, x scale) and only collapses the head over many epochs. With
-# V2_STRUCT_UNLABELED_EPOCHS=N it is applied to bbox-only anchors for the first N
-# epochs only (the trainer flips _struct_unlabeled_active at each epoch start), then
-# the annotated-only default takes over. 0 = never (default).
-_STRUCT_UNLABELED_EPOCHS = int(os.environ.get("V2_STRUCT_UNLABELED_EPOCHS", "0"))
-_struct_unlabeled_active = _STRUCT_UNLABELED or _STRUCT_UNLABELED_EPOCHS > 0
+_struct_unlabeled_active = _STRUCT_UNLABELED
 
 # Class-balanced keypoint supervision: the synth pose data is ALL vehicles, so
 # person/bicycle/motorcycle keypoints are heavily outnumbered (car ~80% of kpt
@@ -238,107 +225,3 @@ class HybridPoseModel26(PoseModel):
 
     def init_criterion(self):
         return E2ELoss(self, HybridPoseLoss26)
-
-
-# COCO ids of the classes the keypoint head exists for. Fitness (=> best.pt) is taken
-# over these only: the stock pose fitness averages pose mAP over all 80 classes, ~74 of
-# which never carry keypoints and score 0, so pose contributed ~0.01 to a box-dominated
-# fitness and best.pt froze at epoch 1 in every 640 run (the COCO-transfer box blip).
-ROAD_CLASSES = (0, 1, 2, 3, 5, 7)   # person bicycle car motorcycle bus truck
-
-# Head-only fine-tuning. V2_TRAIN_ONLY="cv3,one2one_cv3" trains just the named children
-# of the detection head (here: the one2many and one2one CLASS branches) and freezes
-# everything else, BatchNorm statistics included. Purpose (2026-09-08): heal class
-# boundaries damaged by the synthetic renders -- bus is 14.8% of synth instances vs
-# 0.6% of COCO, and the deployed x model labels a white van "bus" -- by a short pass
-# over real bbox-only data (v2_real_cls.yaml: COCO + VisDrone x3) with the pose head
-# untouched.
-_TRAIN_ONLY = [c for c in os.environ.get("V2_TRAIN_ONLY", "").split(",") if c]
-
-
-def _schedule_struct_prior(trainer):
-    """Unlabeled prior for the first V2_STRUCT_UNLABELED_EPOCHS epochs, then annotated-only."""
-    global _struct_unlabeled_active
-    active = trainer.epoch < _STRUCT_UNLABELED_EPOCHS
-    if active != _struct_unlabeled_active and RANK in {-1, 0}:
-        print(f"[struct prior] epoch {trainer.epoch + 1}: unlabeled anchors "
-              f"{'ON' if active else 'OFF (annotated only)'}", flush=True)
-    _struct_unlabeled_active = active
-
-
-class HybridPoseTrainer(yolo.pose.PoseTrainer):
-    """PoseTrainer that uses the hybrid masked model and transfers detect weights."""
-
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        super().__init__(cfg, overrides, _callbacks)
-        # Deployment proxy: score every saved epoch on the demo-reel clips against the
-        # reel labels (v2/ood_reel.py). Env var so DDP subprocesses inherit it.
-        reel = os.environ.get("V2_OOD_REEL", "")
-        if reel and RANK in {-1, 0}:
-            from v2.ood_reel import make_callback
-            self.add_callback("on_model_save", make_callback(reel))
-        if _STRUCT_UNLABELED_EPOCHS > 0 and not _STRUCT_UNLABELED:
-            self.add_callback("on_train_epoch_start", _schedule_struct_prior)   # every rank
-
-    def _setup_train(self):
-        """Stock setup, then (V2_TRAIN_ONLY) restrict training to the named head branches."""
-        super()._setup_train()
-        if not _TRAIN_ONLY:
-            return
-        m = getattr(self.model, "module", self.model)   # unwrap DDP
-        hi = len(m.model) - 1
-        head = m.model[hi]
-        missing = [c for c in _TRAIN_ONLY if not hasattr(head, c)]
-        if missing:
-            raise ValueError(f"V2_TRAIN_ONLY: head has no children {missing}; "
-                             f"it has {[n for n, _ in head.named_children()]}")
-        keep = tuple(f"model.{hi}.{c}." for c in _TRAIN_ONLY)
-        n_train = n_frozen = 0
-        for k, v in m.named_parameters():
-            v.requires_grad = k.startswith(keep)
-            n_train += v.numel() if v.requires_grad else 0
-            n_frozen += 0 if v.requires_grad else v.numel()
-        # _model_train() puts the BatchNorms of every module named here into eval mode,
-        # so frozen layers keep their running statistics as well as their weights.
-        self.freeze_layer_names = list(self.freeze_layer_names) + [f"model.{i}." for i in range(hi)] + [
-            f"model.{hi}.{n}." for n, _ in head.named_children() if f"model.{hi}.{n}." not in keep]
-        LOGGER.info(f"[train_only] trainable: {list(keep)} = {n_train / 1e6:.2f}M params; "
-                    f"frozen {n_frozen / 1e6:.2f}M (weights and BN stats)")
-
-    def validate(self):
-        """Stock validation, but fitness = road-class pose mAP50-95 (+0.1 x road box
-        mAP50-95), and both are logged to results.csv as metrics/road_*."""
-        if self.ema and self.world_size > 1:
-            for buffer in self.ema.ema.buffers():
-                dist.broadcast(buffer, src=0)
-        metrics = self.validator(self)
-        if metrics is None:
-            return None, None
-        metrics.pop("fitness", None)
-        pm, bm = self.validator.metrics.pose, self.validator.metrics.box
-        pose_ap = {int(c): float(a) for c, a in zip(pm.ap_class_index, pm.ap)}   # per-class AP50-95
-        box_ap = {int(c): float(a) for c, a in zip(bm.ap_class_index, bm.ap)}
-        present = [c for c in ROAD_CLASSES if c in pose_ap]
-        road_pose = float(np.mean([pose_ap[c] for c in present])) if present else 0.0
-        road_box = float(np.mean([box_ap.get(c, 0.0) for c in present])) if present else 0.0
-        metrics["metrics/road_pose_mAP50-95"] = road_pose
-        metrics["metrics/road_box_mAP50-95"] = road_box
-        fitness = road_pose + 0.1 * road_box
-        if not self.best_fitness or self.best_fitness < fitness:
-            self.best_fitness = fitness
-        return metrics, fitness
-
-    def get_model(self, cfg=None, weights=None, verbose=True) -> PoseModel:
-        model = HybridPoseModel26(
-            cfg,
-            nc=self.data["nc"],
-            ch=self.data["channels"],
-            data_kpt_shape=self.data["kpt_shape"],
-            verbose=verbose and RANK == -1,
-        )
-        # Transfer YOLO26 detection weights (backbone+neck+box+cls); the keypoint
-        # head and flow model stay freshly initialized. ``setup_model`` resolves
-        # ``pretrained=...pt`` into a loaded model and passes it here as ``weights``.
-        if weights:
-            model.load(weights)
-        return model

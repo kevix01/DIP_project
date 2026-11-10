@@ -34,41 +34,7 @@ import numpy as np
 
 from homography_rt import apply_homography
 
-__all__ = ["BEVViewport", "fit_min_area_rect", "convex_overlap_fraction",
-           "DEFAULT_AUX_ASPECT"]
-
-# Footprint length / width priors by COCO class id (the default auxiliary
-# detector is COCO-trained). Used only to extrude a depth for the estimated
-# auxiliary footprint; everything else comes from the homography.
-DEFAULT_AUX_ASPECT = {
-    0: 1.0,    # person
-    1: 1.9,    # bicycle
-    2: 2.2,    # car
-    3: 1.9,    # motorcycle
-    5: 3.2,    # bus
-    7: 3.0,    # truck
-}
-_DEFAULT_ASPECT = 1.6
-
-
-def fit_min_area_rect(points: np.ndarray) -> np.ndarray:
-    """Return the 4 corners of the minimum-area rectangle around points."""
-    rect = cv2.minAreaRect(np.asarray(points, dtype=np.float32))
-    return cv2.boxPoints(rect)
-
-
-def convex_overlap_fraction(poly_a: np.ndarray, poly_b: np.ndarray) -> float:
-    """Intersection area of two convex polygons divided by ``poly_a``'s area.
-
-    Uses ``cv2.intersectConvexConvex`` so it needs no shapely dependency.
-    """
-    a = np.asarray(poly_a, dtype=np.float32)
-    b = np.asarray(poly_b, dtype=np.float32)
-    area_a = abs(cv2.contourArea(a))
-    if area_a < 1e-6:
-        return 0.0
-    inter, _ = cv2.intersectConvexConvex(a, b)
-    return float(inter) / area_a
+__all__ = ["BEVViewport"]
 
 
 @dataclass
@@ -328,16 +294,6 @@ class BEVViewport:
         cv2.fillPoly(overlay, [contour_int - [x0, y0]], bgr, cv2.LINE_AA)
         cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, roi)
 
-    def footprint_poly(self, image_quad: np.ndarray, H: np.ndarray,
-                       snap_rect: bool = True) -> Optional[np.ndarray]:
-        """Map an image-space ground quad to a canvas-space rectangle (or None)."""
-        if image_quad is None or len(image_quad) != 4:
-            return None
-        canvas_quad = self.to_canvas(image_quad, H)
-        if len(canvas_quad) != 4 or not np.all(np.isfinite(canvas_quad)):
-            return None
-        return fit_min_area_rect(canvas_quad) if snap_rect else canvas_quad
-
     def draw_footprint_poly(self, canvas: np.ndarray, poly: np.ndarray, color,
                             thickness: int = 2, fill_alpha: float = 0.25,
                             glow: bool = True) -> None:
@@ -364,56 +320,3 @@ class BEVViewport:
         if fill_alpha > 0.0:
             self._fill_alpha(canvas, rc, bgr, fill_alpha)
         cv2.polylines(canvas, [rc], True, bgr, thickness, cv2.LINE_AA)
-
-    def draw_footprint(self, canvas: np.ndarray, image_quad: np.ndarray,
-                       H: np.ndarray, color, snap_rect: bool = True,
-                       thickness: int = 2, fill_alpha: float = 0.25,
-                       label: Optional[str] = None, glow: bool = True
-                       ) -> Optional[np.ndarray]:
-        """Compute and draw a footprint; returns its canvas rectangle or None."""
-        poly = self.footprint_poly(image_quad, H, snap_rect)
-        if poly is None:
-            return None
-        self.draw_footprint_poly(canvas, poly, color, thickness, fill_alpha, glow)
-        return poly
-
-    def estimate_aux_footprint(self, box_xyxy: np.ndarray, H: np.ndarray,
-                               aspect: float, width_scale: float = 0.9,
-                               min_w: float = 4.0) -> Optional[np.ndarray]:
-        """Estimate a ground footprint for an auxiliary (box-only) detection.
-
-        We cannot recover the true cuboid corners from a 2D box, so we apply a
-        height/ground-plane decomposition: the box's bottom edge is taken to lie
-        on the ground (the standard inverse-perspective assumption), and the
-        rest of the box height is attributed to the object's vertical extent and
-        discarded. Mapping the two bottom corners through ``H`` gives the
-        footprint's near edge, width, and orientation on the ground. The depth
-        (length away from the camera) is not observable from one box, so it is
-        extruded from a class ``aspect`` (length/width) prior.
-
-        Returns a canvas-space ``(4, 2)`` rectangle, or ``None`` if degenerate.
-        """
-        x1, y1, x2, y2 = box_xyxy
-        bottom = np.array([[x1, y2], [x2, y2]], dtype=np.float64)
-        bc = self.to_canvas(bottom, H)
-        if len(bc) != 2 or not np.all(np.isfinite(bc)):
-            return None
-        bl, br = bc[0], bc[1]
-        u = br - bl
-        w = float(np.hypot(u[0], u[1]))
-        if w < min_w:
-            return None
-        u = u / w
-        w *= width_scale
-        # Re-centre the (possibly shrunk) near edge on its midpoint.
-        mid = 0.5 * (bl + br)
-        bl = mid - 0.5 * w * u
-        br = mid + 0.5 * w * u
-        v = np.array([-u[1], u[0]])                      # perpendicular
-        cam = np.array(self.camera_canvas, dtype=np.float64)
-        if np.dot(v, mid - cam) < 0:                     # point away from camera
-            v = -v
-        depth = max(aspect, 0.2) * w
-        far_l = bl + v * depth
-        far_r = br + v * depth
-        return np.array([bl, br, far_r, far_l])
