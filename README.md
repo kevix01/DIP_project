@@ -1,3 +1,194 @@
+# Guida alla consegna: estrazione dell’omografia e rilevamento delle violazioni
+
+Questa guida descrive gli script usati nel progetto:
+
+- **extract_homography.py** stima la trasformazione dal piano immagine al piano stradale BEV e la relativa scala.
+- **select_roi_bev.py** permette di disegnare e salvare la regione stradale d’interesse (ROI).
+- **violation_detector.py** contiene la logica che valuta i conflitti veicolo-pedone e registra le violazioni.
+- **bev_realtime_v2.py** esegue la pipeline di inferenza, tracking, BEV e rilevamento delle violazioni.
+- **debug_violations.py** esegue la pipeline con visualizzazioni diagnostiche, inclusa la tabella TTC.
+
+## Flusso di lavoro
+
+La sequenza tipica è: calibrare una scena, disegnare la ROI per quella stessa scena, quindi elaborare il video con la pipeline di rilevamento. I checkpoint del modello e i video sorgente sono file esterni: non sono inclusi in questa cartella.
+
+1. Estrarre omografia e scala dal video di calibrazione:
+
+    python extract_homography.py --input "video_calibrazione.mp4" --kp-model "weights/pose.pt" --output homography_bangkok.npy --device cuda:0
+
+2. Selezionare la ROI sul video, usando la coppia appena estratta:
+
+    python select_roi_bev.py --frame "video_calibrazione.mp4" --homography homography_bangkok.npy --bev-unit homography_bangkok_bev_unit.txt --output roi_bev.json
+
+3. Avviare il debug sul video da analizzare. Il valore numerico di bev_unit deve essere quello scritto nel file omonimo prodotto al punto 1:
+
+    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo_debug.mp4"
+
+Per elaborare senza la visualizzazione diagnostica, si può eseguire la pipeline normale:
+
+    python bev_realtime_v2.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
+
+Eseguire gli ultimi due comandi dalla cartella del progetto: la pipeline carica l’omografia statica dal percorso relativo **homography_bangkok.npy**. Per un’altra scena, mettere in quel percorso la matrice della calibrazione corrispondente e creare/aggiornare una ROI con la medesima calibrazione. Non abbinare una matrice H a una bev_unit o a una ROI prodotte con una calibrazione diversa.
+
+## Cosa fa ogni script
+
+### extract_homography.py
+
+Legge un video e inferisce le pose dei veicoli con un checkpoint YOLO pose. Filtra le footprint a terra attendibili, identifica i keypoint a terra, quindi stima una singola omografia globale con vincolo di ortogonalità. Non esegue tracking e non produce un video annotato.
+
+**Input:** video di calibrazione leggibile da OpenCV e checkpoint pose compatibile (.pt o .engine). È preferibile una telecamera fissa, con veicoli ben visibili distribuiti sulla scena.
+
+**Output:** con **--output homography_bangkok.npy** salva la matrice 3×3 in **homography_bangkok.npy**, una copia testuale in **homography_bangkok.txt** e la scala in **homography_bangkok_bev_unit.txt**. H e bev_unit sono una coppia: mantenerle insieme.
+
+| Opzione | Default | Descrizione |
+|---|---:|---|
+| **--input** | obbligatorio | Video da calibrare. |
+| **--kp-model** | obbligatorio | Checkpoint del modello pose (.pt o .engine). |
+| **--output** | homography.npy | Nome/percorso della matrice .npy; usare un nome che termini in .npy per ottenere anche il gemello .txt. |
+| **--imgsz** | 640 | Dimensione d’inferenza. |
+| **--device** | cuda:0 | Dispositivo, ad esempio cuda:0 o cpu. |
+| **--max-frames** | 1500 | Numero massimo di frame; 0 analizza tutto il video. |
+| **--no-robust** | disattivato | Disattiva la pesatura robusta degli outlier; usarlo solo per confronto diagnostico. |
+
+### select_roi_bev.py
+
+Avvia un’interfaccia web locale nel browser. L’utente carica o indica un’immagine/video, sceglie i vertici della regione sul frame e salva la ROI. L’applicazione calcola anche i vertici corrispondenti in coordinate BEV.
+
+**Input:** immagine o video (facoltativo da CLI, altrimenti caricabile nell’interfaccia), matrice H 3×3 e file di testo contenente un singolo valore bev_unit. Può anche caricare un JSON ROI esistente.
+
+**Output:** JSON (predefinito roi_bev.json) con almeno image_points e bev_points, oltre ai metadati della sorgente e della calibrazione. Il salvataggio avviene dal pulsante dell’interfaccia; **--output** imposta il nome/percorso suggerito.
+
+| Opzione | Default | Descrizione |
+|---|---:|---|
+| **--frame** | nessuno | File iniziale: immagine o video. |
+| **--homography** | nessuno | File H 3×3 in formato .npy o .txt. |
+| **--bev-unit** | nessuno | Percorso del file di testo con la bev_unit (in questo script non è un numero). |
+| **--roi** | nessuno | JSON ROI da caricare/modificare. |
+| **--output** | roi_bev.json | Nome/percorso suggerito per il JSON salvato. |
+| **--frame-index** | 1 | Frame iniziale del video, indice a partire da 1. |
+| **--port** | 8080 | Porta dell’interfaccia locale (127.0.0.1). |
+| **--no-browser** | disattivato | Avvia il server senza aprire automaticamente il browser. |
+| **--reset-calibration-from-roi** | disattivato | Opzione dichiarata dal parser; nella versione corrente il ripristino della calibrazione della ROI è già il comportamento predefinito. |
+| **--keep-session-calibration** | disattivato | Mantiene la calibrazione fornita nella sessione invece di ripristinare quella registrata nella ROI. |
+
+### violation_detector.py
+
+Questo file **non è un comando CLI autonomo**: definisce ZebraCrossingROI e ViolationDetector, usati da **bev_realtime_v2.py** e **debug_violations.py**. Riceve le tracce e i frame già elaborati dalla pipeline, valuta i conflitti nella ROI tramite TTC e informazioni sul moto/intento dei pedoni, quindi salva gli eventi confermati.
+
+La ROI JSON deve contenere image_points e bev_points (almeno tre punti per ciascun poligono). Le opzioni per configurare il rilevatore sono passate al programma che lo richiama:
+
+| Opzione della pipeline | Default | Descrizione |
+|---|---:|---|
+| **--roi-file** | obbligatorio | JSON della ROI da analizzare. |
+| **--ttc-thresh** | 2.5 secondi | Soglia TTC di conferma del conflitto. |
+| **--confirm-frames** | 3 | Frame consecutivi richiesti per confermare l’evento. |
+| **--clip-track-timeout-s** | 1.5 secondi | Attesa massima dopo la perdita del tracking del veicolo. |
+| **--clip-absolute-timeout-s** | 3.0 secondi | Durata massima assoluta della clip dell’evento. |
+| **--no-clip** | disattivato | Non scrive il filmato del singolo evento, ma mantiene il JSON. |
+| **--bev-unit** | stimata se omessa | Valore numerico che deve essere coerente con H e ROI. |
+
+Gli eventi sono scritti nella cartella **violations_<nome_video>/**, relativa alla cartella di lavoro. Per ciascun evento vengono prodotti un JSON con frame, timestamp, ID, TTC e dati della clip, e un MP4 con i marker dei soggetti coinvolti (salvo l’uso di **--no-clip**). Il programma principale può inoltre salvare un video annotato completo tramite **--output**.
+
+### debug_violations.py
+
+Esegue la pipeline BEV v2 e il rilevatore, aggiungendo un pannello diagnostico TTC. Richiede video/stream, checkpoint pose e ROI JSON; per la logica delle violazioni richiede anche una H invertibile e una bev_unit coerente con la ROI.
+
+**Output:** se si specifica **--output**, salva il video completo con annotazioni e pannello debug. Salva inoltre gli eventi nella cartella **violations_<nome_video>/**. Per il video completo è necessario FFmpeg con encoder libx264 disponibile nel PATH. Le clip dei singoli eventi sono scritte con OpenCV.
+
+Opzioni specifiche del debug:
+
+| Opzione | Default | Descrizione |
+|---|---:|---|
+| **--table-height** | 280 px | Altezza del pannello/tabella TTC. |
+| **--no-save-violations** | disattivato | Non salva gli artefatti degli eventi (JSON e clip); non disabilita il video debug passato a --output. |
+
+Oltre a queste due opzioni, lo script accetta le opzioni della pipeline base e quelle v2 riportate nelle tabelle seguenti. Il parser riconosce l’interfaccia completa del runtime, ma il ciclo di debug non applica ogni opzione avanzata: in particolare refinement offline, pseudo-label e detector ausiliario non fanno parte del flusso debug. Le opzioni di violazione elencate sopra valgono anche quando si lancia **bev_realtime_v2.py** direttamente.
+
+#### Opzioni base della pipeline (accettate da debug_violations.py)
+
+| Opzioni | Default / significato |
+|---|---|
+| **--input**, **--kp-model** | Obbligatorie: sorgente video/stream e checkpoint pose. |
+| **--kp-imgsz**, **--kp-conf** | 640, 0.25: dimensione e confidenza del detector pose. |
+| **--device**, **--export**, **--half** | cpu; none (engine, tensorrt, onnx disponibili); FP16 per l’export accelerato. |
+| **--ground-indices** | Automatico; altrimenti indici keypoint a terra separati da virgole, ad es. 0,1,2,3. |
+| **--homography** | ortho; modalità ortho, adam o none. |
+| **--no-3d**, **--no-snap-rect** | Disattivano cuboidi o rettangolarizzazione delle footprint. |
+| **--no-trails**, **--trail-len** | Scie BEV disattivate o lunghezza (16 frame). |
+| **--no-fov** | Nasconde il campo visivo della telecamera nella BEV. |
+| **--no-stabilize**, **--bev-window**, **--solver-ema** | Controllo stabilizzazione; finestra 512 footprint, EMA 0 (disattivata). |
+| **--track-alpha**, **--track-beta** | Parametri del tracker: 0.5, 0.08. |
+| **--max-age**, **--min-hits**, **--no-cmc** | Tracker: 30, 2; disabilita la compensazione del moto camera. |
+| **--output**, **--display**, **--max-frames** | Nessun file completo se --output è omesso; mostra la finestra se richiesto; 0 elabora tutto. |
+| **--smooth**, **--smooth-poly** | Finestra offline 0 (disattivata), ordine Savitzky-Golay 2. |
+| **--bev-freeze**, **--scale-lock**, **--fixed-camera** | Opzioni BEV offline; camera off di default (auto/on/off). |
+| **--online** | Attiva la stabilizzazione causale per stream. |
+| **--sync**, **--render-procs**, **--queue** | Rendering sincrono; processi 1 (valore 0 usa un thread); coda 4. |
+| **--aux-model**, **--aux-conf**, **--aux-every**, **--aux-footprint**, **--no-aux-box**, **--aux-overlap**, **--aux-width-scale**, **--aux-gate**, **--aux-gate-iou** | Flag riconosciuti dal parser base per il detector ausiliario (default: yolo26x.pt, confidenza 0.30, intervallo 1, overlap 0.12, scala 0.9, IoU 0.3); il percorso debug imposta il detector ausiliario a none e non lo usa. |
+
+#### Opzioni v2 e rendering (accettate da debug_violations.py)
+
+| Opzioni | Default / significato |
+|---|---|
+| **--kp-vis**, **--suppress-nested**, **--class-conf** | 0.5; 0 (disattivato); soglie per classe, ad es. 0:0.4,1:0.5,3:0.5. |
+| **--bev-canvas**, **--layout** | Dimensione pannello WxH; layout side oppure dashboard (default side). |
+| **--caption**, **--title** | Testo scena; tempi del titolo di apertura in secondi sorgente. |
+| **--object-px**, **--bev-fit**, **--bev-fit-min-px**, **--bev-fit-pct** | Zoom BEV 40 px per oggetto mediano; autofit disattivato, minimo 22 px, percentile 90. |
+| **--label-min-h**, **--coast-mark**, **--show-bev-ids** | Altezza minima etichetta 26 px; aggiunge ? alle tracce in coast; mostra gli ID BEV. |
+| **--source-type** | auto; selezionare video o stream per forzare il tipo. |
+| **--track-high-conf**, **--track-ocm-weight** | Soglia automatica; peso direzione tracker 0.25. |
+| **--refine** / **--track-cleanup** | Abilita refinement offline delle tracce nella pipeline v2. |
+| **--no-fill-box**, **--no-vel-heading**, **--no-rigid-cuboids** | Disattivano le rispettive correzioni geometriche del refinement. |
+| **--refine-fps**, **--speed-ratio**, **--max-reproj**, **--max-gap**, **--min-fill** | Parametri refinement: FPS sorgente automatico (0), rapporto velocità 3, reproiezione 0.10, gap 45, riempimento minimo 0.5. |
+| **--no-dedupe**, **--no-shape-smooth**, **--shape-win**, **--no-world-lock**, **--no-hold-still** | Controllano deduplicazione, smoothing (finestra 31), world lock e blocco dei veicoli fermi. |
+| **--min-track**, **--coast-tail**, **--merge-gap** | Refinement: 12, 8, 30 frame. |
+| **--labels**, **--labels-from**, **--labels-source** | Esportazione facoltativa geometria pseudo-label; frame iniziale 0, sorgente originale opzionale. |
+| **--bev-unit** | Valore numerico (default automatico): usare quello della calibrazione della ROI. |
+
+Le opzioni refinement in questa tabella sono quelle del parser generale e sono effettive nel normale runtime v2 quando il relativo percorso offline viene usato; il ciclo di **debug_violations.py** non esegue quel refinement. Le opzioni principali effettive per il rilevamento nel debug sono input, checkpoint, ROI, bev_unit, soglia TTC e conferma frame, oltre ai controlli di visualizzazione esplicitamente applicati.
+
+### bev_realtime_v2.py
+
+È il programma principale per eseguire il modello v2 su un video o uno stream. Rileva persone e veicoli, stima i cuboidi 3D dai keypoint, mantiene le tracce nel tempo, visualizza la scena in prospettiva e in BEV e, con una ROI, applica il rilevatore di violazioni. Non include la tabella diagnostica TTC di **debug_violations.py**.
+
+**Input:** video o stream supportato da OpenCV, checkpoint YOLO26 Pose26 compatibile con v2, file JSON ROI e omografia statica. Il file **homography_bangkok.npy** deve essere presente nella cartella di lavoro: il codice lo carica con quel nome. **--bev-unit**, se specificato, è un valore numerico e deve appartenere alla stessa calibrazione della ROI.
+
+**Output:** con **--output** salva il video completo annotato; con **--display** mostra la finestra durante l’elaborazione. Il default non salva il video completo. Il rilevatore salva comunque gli eventi confermati in **violations_<nome_video>/**: JSON e clip MP4, a meno che si specifichi **--no-clip**. Il salvataggio del video completo richiede FFmpeg con libx264 nel PATH.
+
+| Opzione | Default | Descrizione |
+|---|---:|---|
+| **--input** | obbligatorio | Percorso del video/stream in ingresso. |
+| **--kp-model** | obbligatorio | Checkpoint del modello pose v2. |
+| **--roi-file** | obbligatorio | JSON con la ROI e i suoi punti immagine/BEV. |
+| **--device** | cpu | Dispositivo per l’inferenza, per esempio cpu o cuda:0. |
+| **--kp-imgsz**, **--kp-conf** | 640, 0.25 | Dimensione d’inferenza e confidenza minima del modello. |
+| **--bev-unit** | automatica | Scala BEV numerica; passare quella usata per creare la ROI. |
+| **--ttc-thresh**, **--confirm-frames** | 2.5 s, 3 | Soglia TTC e numero di frame consecutivi necessari a confermare una violazione. |
+| **--clip-track-timeout-s**, **--clip-absolute-timeout-s** | 1.5 s, 3.0 s | Tempi di chiusura della clip dopo la perdita del track e durata massima dell’evento. |
+| **--no-clip** | disattivato | Non salva le clip dei singoli eventi; i JSON vengono comunque salvati. |
+| **--output** | nessuno | Percorso del video completo annotato. |
+| **--display** | disattivato | Mostra la finestra di output durante l’elaborazione. |
+| **--max-frames** | 0 | Limite di frame; 0 elabora tutta la sorgente. |
+| **--source-type** | auto | Forza la sorgente come video o stream, se necessario. |
+
+Il programma accetta inoltre le opzioni base e v2 elencate nelle due tabelle CLI della sezione **debug_violations.py** sopra. Sono gli stessi parser condivisi; **--table-height** e **--no-save-violations** sono invece specifici dello script di debug.
+
+Esempio:
+
+    python bev_realtime_v2.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
+
+## Dipendenze e file necessari all’esecuzione
+
+Installare le dipendenze Python con **python -m pip install -r requirements.txt**. L’estrazione e la pipeline di violazioni richiedono un checkpoint YOLO pose compatibile, non contenuto nel repository. Una GPU CUDA è consigliata; con un checkpoint e un ambiente compatibili si può usare **--device cpu**. Per salvare il video completo con **--output** serve anche FFmpeg con libx264.
+
+Per la calibrazione standalone servono **homography_rt.py** e il package **uod** (in particolare il modulo keypoints). Per l’applicazione e il debug v2 servono inoltre **bev_realtime.py**, **bev_realtime_v2.py**, **refine_v2.py**, **violation_detector.py**, **v2/__init__.py**, **v2/hybrid_v2.py** e **uod/**. **select_roi_bev.py** usa OpenCV, NumPy e la libreria standard Python.
+
+Il runtime v2 legge **homography_bangkok.npy** dalla cartella di lavoro, mentre la ROI è indicata con **--roi-file**. La coppia leggibile **homography_bangkok.txt** e **homography_bangkok_bev_unit.txt** è utile per controllo e per caricare la calibrazione nel selettore ROI; il valore passato alla pipeline con **--bev-unit** è invece numerico.
+
+## Nota sul README generale
+
+La sezione seguente conserva la documentazione generale del progetto UrbanOmniDetect da cui derivano i moduli runtime.
+
 <p align="center">
   <h1 align="center">UrbanOmniDetect</h1>
   <h3 align="center">Calibration-Free View-Agnostic Monocular 3D Object Detection for Urban Scenes</h3>

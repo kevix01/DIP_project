@@ -538,6 +538,24 @@ class ViolationDetector:
             if pid not in seen and (frame_idx - self.ped_intents[pid].last_seen_frame) > stale_after:
                 del self.ped_intents[pid]
 
+    def _format_timestamp(self, frame_idx: int) -> str:
+        """Converte il numero di frame nel minutaggio del video (es. 01m23s450ms)."""
+        total_sec = max(0.0, float(frame_idx - 1) / max(self.fps, 1e-6))
+        minutes = int(total_sec // 60)
+        seconds = int(total_sec % 60)
+        millis = int(round((total_sec - int(total_sec)) * 1000))
+        if millis >= 1000:
+            seconds += 1
+            millis -= 1000
+            if seconds >= 60:
+                minutes += 1
+                seconds -= 60
+        if minutes >= 60:
+            hours = minutes // 60
+            minutes = minutes % 60
+            return f"{hours:02d}h{minutes:02d}m{seconds:02d}s{millis:03d}ms"
+        return f"{minutes:02d}m{seconds:02d}s{millis:03d}ms"
+
     def bev_to_perspective(self, bev_pos: np.ndarray, H_inv: np.ndarray) -> list:
         """
         Riproietta un punto BEV (normalizzato per bev_unit) nella visuale prospettica.
@@ -632,22 +650,28 @@ class ViolationDetector:
         # 3. Gestione infrazioni attive: prosecuzione/terminazione della clip
         active_ids = list(self.active_violations.keys())
         veh_track_dict = {t.id: t for t in tracks if t.cls == 2}
+        ped_track_dict = {t.id: t for t in tracks if t.cls == 0}  # <--- AGGIUNTO
 
         for veh_id in active_ids:
+            # Evita di scrivere due volte il primo frame appena registrato in _trigger_violation
+            if veh_id in newly_triggered:
+                continue
+
             state = self.active_violations[veh_id]
             veh_t = veh_track_dict.get(veh_id)
+            ped_t = ped_track_dict.get(state.get('pedestrian_id'))  # <--- AGGIUNTO
 
             if veh_t is not None:
                 # Il veicolo e' ancora tracciato: la clip continua.
                 state['last_track_frame'] = frame_idx
                 state['track_lost_frame'] = None
-                self._append_clip_frame(state, frame, veh_t, H_inv)
+                self._append_clip_frame(state, frame, veh_t, ped_t, H_inv)  # <--- MODIFICATO
             else:
                 # Veicolo perso: si continua a registrare finche' non scade
                 # la finestra di fallback (in secondi).
                 if state.get('track_lost_frame') is None:
                     state['track_lost_frame'] = frame_idx
-                self._append_clip_frame(state, frame, None, H_inv)
+                self._append_clip_frame(state, frame, None, ped_t, H_inv)   # <--- MODIFICATO
                 lost_for = frame_idx - state['track_lost_frame']
                 if lost_for >= self.clip_track_timeout_s * self.fps:
                     state['close_reason'] = f"timeout_track_lost_{lost_for}_frames"
@@ -713,22 +737,29 @@ class ViolationDetector:
             return None
         return writer
 
-    def _append_clip_frame(self, state, frame, veh_t, H_inv):
-        """Appende un frame alla clip, marcando SOLO il centroide del veicolo infractor."""
+    def _append_clip_frame(self, state, frame, veh_t, ped_t, H_inv):
+        """Appende un frame alla clip, marcando il centroide del veicolo e del pedone coinvolto."""
         writer = state.get('writer')
         if writer is None:
             return
-        veh_persp = None
-        if veh_t is not None and H_inv is not None:
-            veh_persp = self.bev_to_perspective(veh_t.bev_pos, H_inv)
-        if veh_persp is None:
+
+        markers = []
+        if H_inv is not None:
+            if veh_t is not None:
+                veh_persp = self.bev_to_perspective(veh_t.bev_pos, H_inv)
+                markers.append((veh_persp, f"V{state['vehicle_id']}", (0, 0, 255)))      # Rosso (BGR)
+
+            if ped_t is not None:
+                ped_persp = self.bev_to_perspective(ped_t.bev_pos, H_inv)
+                markers.append((ped_persp, f"P{state['pedestrian_id']}", (0, 255, 255))) # Giallo (BGR)
+
+        if not markers:
             # Nessun marker da disegnare: si scrive il frame originale senza copia.
             writer.write(frame)
         else:
-            marked = self._draw_centroid_markers(frame.copy(), [
-                (veh_persp, f"V{state['vehicle_id']}", (0, 0, 255)),
-            ])
+            marked = self._draw_centroid_markers(frame.copy(), markers)
             writer.write(marked)
+
         state['clip_frames'] = state.get('clip_frames', 0) + 1
 
     def _trigger_violation(self, frame, frame_idx, veh, ped, ttc, H_inv):
@@ -737,7 +768,9 @@ class ViolationDetector:
         veh_persp = self.bev_to_perspective(veh.bev_pos, H_inv) if H_inv is not None else [0, 0]
         ped_persp = self.bev_to_perspective(ped.bev_pos, H_inv) if H_inv is not None else [0, 0]
 
-        prefix = f"violation_v{veh.id}_f{frame_idx}"
+        # --- MODIFICA 1: Minutaggio nel nome della clip anziché il numero di frame ---
+        ts_str = self._format_timestamp(frame_idx)
+        prefix = f"violation_v{veh.id}_t{ts_str}"
         json_path = os.path.join(self.out_dir, f"{prefix}.json")
         clip_name = f"{prefix}.mp4"
 
@@ -745,6 +778,7 @@ class ViolationDetector:
 
         data = {
             "video_frame": frame_idx,
+            "video_timestamp": ts_str,
             "vehicle_id": veh.id,
             "pedestrian_id": ped.id,
             "ttc_seconds": round(ttc, 3),
@@ -755,6 +789,7 @@ class ViolationDetector:
                 "file": clip_name,
                 "fps": round(self.fps, 3),
                 "start_frame": frame_idx,
+                "start_timestamp": ts_str,
                 "end_frame": None,
                 "frames": 0,
                 "exit_reason": "pending"
@@ -767,6 +802,7 @@ class ViolationDetector:
             "prefix": prefix,
             "data": data,
             "vehicle_id": veh.id,
+            "pedestrian_id": ped.id,  # <--- MODIFICA 2: salva l'ID del pedone coinvolto
             "writer": None,
             "clip_frames": 0,
             "last_track_frame": frame_idx,
@@ -779,14 +815,14 @@ class ViolationDetector:
             if writer is not None:
                 state['writer'] = writer
 
-        # Il frame di inizio entra nella clip (marca solo il veicolo).
-        self._append_clip_frame(state, frame, veh, H_inv)
+        # Il frame di inizio entra nella clip (marca sia il veicolo che il pedone).
+        self._append_clip_frame(state, frame, veh, ped, H_inv)
 
         if self.save_files:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
 
-        print(f"\n🚨 INFRAZIONE: Veicolo {veh.id} vs Pedone {ped.id} (TTC: {ttc:.2f}s) al frame {frame_idx}")
+        print(f"\n🚨 INFRAZIONE: Veicolo {veh.id} vs Pedone {ped.id} (TTC: {ttc:.2f}s) a {ts_str} (frame {frame_idx})")
 
     def close_all(self, reason: str = "end_of_stream"):
         """Chiude tutte le infrazioni ancora attive (rilascia i writer delle clip)."""
