@@ -259,8 +259,9 @@ class ViolationDetector:
                   lateral_pass_dlat: float = 0.45,
                   lateral_pass_cpa: float = 0.75,
                   lateral_pass_away: float = 0.05,
-                  conflict_dlong: float = 0.2,
-                  clip_video: bool = True,
+                   conflict_dlong: float = 0.2,
+                   lateral_gate_factor: float = 1.20,
+                   clip_video: bool = True,
                   clip_fourcc: str = "mp4v"):
         self.ttc_threshold = float(ttc_threshold)
         self.fps = float(fps) if fps and fps > 1e-6 else 30.0
@@ -273,6 +274,9 @@ class ViolationDetector:
         self.clip_video = bool(clip_video)
         self.clip_fourcc = str(clip_fourcc)
         self.conflict_radius = float(conflict_radius)  # Distanza max (in BEU) al punto di impatto (d_CPA)
+        # Gate laterale (-6.0): fattore moltiplicativo applicato a
+        # conflict_radius per la soglia d_lat "fuori corsia".
+        self.lateral_gate_radius = self.conflict_radius * float(lateral_gate_factor)
         self.bev_unit = float(bev_unit) if bev_unit and bev_unit > 1e-9 else 1.0
         self.save_files = bool(save_files)
         self.confirm_frames = max(1, int(confirm_frames))
@@ -407,8 +411,8 @@ class ViolationDetector:
             # taglia la corsia, ma il veicolo raggiunge la zona di conflitto
             # ben prima che il pedone ci arrivi: il conflitto e' solo
             # geometrico, non fisico.
-            if d_lat > self.conflict_radius:
-                return -6.0, "PEDONE FUORI CORRIDA"
+            if d_lat > self.lateral_gate_radius:
+                return -6.0, "PEDONE FUORI CORSIA"
 
             # Gate longitudinale: il pedone e' gia' stato superato dal
             # veicolo (o e' sullo stesso punto): qualunque conflitto con la

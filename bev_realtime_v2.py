@@ -327,6 +327,10 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             if d.cls == 2 and getattr(d, "geom_ok", True)
         ]
 
+        # Inizializzata SEMPRE: il blocco di soppressione cross-class e'
+        # condizionato, ma la maschera viene letta comunque piu' sotto.
+        suppress_person = np.zeros(len(person_indices), dtype=bool)
+
         if person_indices and vehicle_indices:
                 person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
                 vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
@@ -342,8 +346,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                 # (union dominated by the vehicle), so IoU alone misses false
                 # pedestrians that are really part of a vehicle. overlap-fraction
                 # (= inter / area_pedestrian) stays HIGH, catching these cases.
-                suppress_person = np.zeros(len(person_grounds), dtype=bool)
-
                 for p_idx, p_ground in enumerate(person_grounds):
                     if suppress_person[p_idx]:
                         continue
