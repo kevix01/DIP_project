@@ -47,7 +47,7 @@ downstream BEV placement is fixed separately (see ``uod.bev``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Sequence
+from typing import Optional
 
 import numpy as np
 
@@ -77,11 +77,6 @@ def rectangle_loss(quad: np.ndarray) -> float:
     e /= (np.linalg.norm(e, axis=1, keepdims=True) + 1e-12)
     d = np.sum(e * np.roll(e, -1, axis=0), axis=1)
     return float(np.sum(d ** 2))
-
-
-def total_rectangle_loss(quads: Sequence[np.ndarray], H: np.ndarray) -> float:
-    """Sum of ``L_rect`` over all transformed footprints (for diagnostics)."""
-    return float(sum(rectangle_loss(apply_homography(q, H)) for q in quads))
 
 
 # --------------------------------------------------------------------------- #

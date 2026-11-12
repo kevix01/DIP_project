@@ -245,7 +245,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                 bev_areas.append(area)
 
             # Sort by BEV area descending (keep largest footprints)
-            order = np.argsort(bev_areas)[::-1]
             keep = np.ones(len(group), dtype=bool)
 
             grounds = np.stack([d.ground_bev for d in group])
@@ -334,7 +333,6 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
         if person_indices and vehicle_indices:
                 person_grounds = np.stack([merged_with_ground[i].ground_bev for i in person_indices])
                 vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
-                cross_iou = _ground_iou_matrix(person_grounds, vehicle_grounds)  # (P, V)
                 person_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in person_grounds]
                 person_areas = [cv2.contourArea(h) for h in person_hulls]
                 veh_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in vehicle_grounds]
@@ -679,9 +677,9 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
 
             # --- case B: conducente 2D dentro il box 2D di un veicolo rilevato ---
             if not suppressed and veh_boxes and d.xyxy is not None:
-                x1, y1, x2, y2 = d.xyxy
+                y2 = d.xyxy[3]
                 for vb in veh_boxes:
-                    iou_v, cov_v = _iou_and_ped_cov(d.xyxy, vb)
+                    _, cov_v = _iou_and_ped_cov(d.xyxy, vb)
                     # Sopprimi se il box pedone è largamente contenuto nel veicolo e non poggia più in basso
                     if cov_v >= 0.75 and y2 <= vb[3] + 6.0:
                         suppressed = True
@@ -1235,7 +1233,7 @@ class V2Pipeline(rt.RealtimePipeline):
             
             if d.cls == 0:
                 # REGOLA PEDONI: usa il bottom-center della 2D box (ignora kp_ok rumoroso)
-                x1, y1, x2, y2 = d.xyxy
+                x1, _, x2, y2 = d.xyxy
                 cx = (x1 + x2) * 0.5
                 cy_bottom = float(y2)
                 w_2d = max(x2 - x1, 1.0)
@@ -1551,7 +1549,6 @@ class V2Pipeline(rt.RealtimePipeline):
                            fg=(232, 232, 238), opacity=opacity) + 10
         else:
             for dot, txt in reversed(items):
-                w, _ = _text_size(size, txt)
                 x -= _pill(ui, x, y, txt, size=size, dot=dot,
                            fg=(232, 232, 238), anchor="rm", opacity=opacity) + 10
 

@@ -618,7 +618,7 @@ class ViolationDetector:
                 lost_for = frame_idx - state['track_lost_frame']
                 if lost_for >= self.clip_track_timeout_s * self.fps:
                     state['close_reason'] = f"timeout_track_lost_{lost_for}_frames"
-                    self._close_violation(veh_id, frame, frame_idx, state['close_reason'])
+                    self._close_violation(veh_id, frame_idx, state['close_reason'])
                     continue
 
             frames_elapsed = frame_idx - state['start_frame']
@@ -629,11 +629,11 @@ class ViolationDetector:
                 else:
                     exited_roi = not self.roi.contains_point(veh_t.bev_pos)
                 if exited_roi:
-                    self._close_violation(veh_id, frame, frame_idx, "exited_roi")
+                    self._close_violation(veh_id, frame_idx, "exited_roi")
                     continue
 
             if frames_elapsed >= self.clip_absolute_timeout_s * self.fps:
-                self._close_violation(veh_id, frame, frame_idx, "absolute_timeout")
+                self._close_violation(veh_id, frame_idx, "absolute_timeout")
 
         return {
             "frame_idx": frame_idx,
@@ -772,9 +772,9 @@ class ViolationDetector:
         for veh_id in list(self.active_violations.keys()):
             state = self.active_violations.get(veh_id)
             frame_idx = state['start_frame'] if state else 0
-            self._close_violation(veh_id, None, frame_idx, reason)
+            self._close_violation(veh_id, frame_idx, reason)
 
-    def _close_violation(self, veh_id, frame, frame_idx, reason, tracks=None, H_inv=None):
+    def _close_violation(self, veh_id, frame_idx, reason):
         state = self.active_violations.pop(veh_id)
 
         data = state['data']

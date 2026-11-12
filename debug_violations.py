@@ -204,7 +204,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
     def _draw_debug_overlays(self, ui, composite, state, present, src_labels, bev_labels, bev_x):
         """Disegna gli ID di tutti i veicoli/pedoni rilevanti sia su Camera che su BEV."""
         T = style.THEME
-        Wc, Hc = composite.shape[1], composite.shape[0]
+        Wc, _ = composite.shape[1], composite.shape[0]
         head = 42
         ui.panel((0, 0), (Wc, head), (0, 0, 0), alpha=0.88, radius=0)
         ui.line((0, head), (Wc, head), T["separator"], width=1, alpha=1.0)
