@@ -54,10 +54,21 @@ file di omografia pre-esistente in input (il vecchio script terminava con
 
 ```bash
 .venv/bin/python extract_homography.py \
-  --input video_dataset_bangkok/video_041_tagliato_2.avi \
+  --input video_dataset_bangkok/video_041.avi \
   --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
-  --output homography.npy
+  --max-frames 0 \
+  --output homography_bangkok.npy \
+  --reproject-roi
 ```
+
+`--max-frames 0` legge **tutto** il video: il vincolo di rigidità per-traccia
+(§5.6) ha bisogno di più osservazioni dello stesso oggetto, e il risultato
+migliora nettamente con più dati (residuo ROI 0.074 BEU su 900 frame contro
+0.032 BEU su 9000 frame sul video Bangkok).
+
+`--reproject-roi` aggiorna anche `roi_bev.json` con la nuova calibrazione
+(§6.5): senza, il pannello BEV e quello in prospettiva mostrerebbero
+l'attraversamento pedonale in due posti diversi.
 
 ### Requisiti del video di calibrazione
 
@@ -70,8 +81,10 @@ Per una calibrazione affidabile il video deve avere:
   scena mai toccate da footprint affidabili degradano la rettifica locale.
 - **Almeno 128 footprint veicolo valide** (consigliato): sotto questa soglia lo
   script emette un `[ATTENZIONE]` e la bev_unit può risultare poco stabile.
-  Con 1500 frame a 30 fps (~50 s di traffico) si superano tipicamente le
-  5000+ footprint.
+- **Video più lungo possibile**: il raffinamento rigido per-traccia (§5.6)
+  ha bisogno di più osservazioni dello stesso oggetto. Su un video Bangkok da
+  900 frame il residuo sulla ROI è 0.074 BEU, su 9000 frame scende a
+  0.032 BEU.
 - Veicoli con keypoint 3D ben visibili: telecamere troppo angolate o con
   occlusioni pesanti riducono il numero di footprint affidabili.
 
@@ -87,6 +100,11 @@ Per una calibrazione affidabile il video deve avere:
 | `--imgsz` | `640` | Risoluzione di inferenza (deve corrispondere alla scala del checkpoint) |
 | `--device` | `cuda:0` | Device di inferenza |
 | `--max-frames` | `1500` | Stop automatico dopo N frame (`0` = tutto il video) |
+| `--refine-iters` | `5` | Iterazioni di raffinamento rigido per-traccia (§5.6). `0` = disabilitato |
+| `--rigid-pct` | `65` | Percentile del residuo di forma rigida sotto il quale un'osservazione viene conservata |
+| `--roi-file` | `roi_bev.json` | File ROI usato come riferimento diagnostico di coerenza (§6.4). Se assente, il check viene saltato |
+| `--reproject-roi` | *off* | Ricalcola i `bev_points` di `--roi-file` con la nuova calibrazione e li scrive in `--roi-out` (§6.5) |
+| `--roi-out` | = `--roi-file` | Dove scrivere la ROI ri-proiettata |
 | `--no-robust` | *off* | Disattiva i pesi IRLS Cauchy (`OrthoHomographySolver(robust=False)`): i corner outlier non vengono rigettati. Solo per confronto diagnostico — vedi §6.3 |
 
 ---
@@ -128,15 +146,64 @@ Il flusso, in ordine di esecuzione:
    dalla box 2D, privo di informazione geometrica utile alla rettifica).
 4. **GroundIndexResolver** — determina quali 4 degli 8 keypoint sono i
    vertici a terra (voto maggioritario sui primi frame, come in pipeline).
-5. **Solve globale** — `OrthoHomographySolver` (Levenberg-Marquardt su 4 DoF
-   essenziali, residui = coseni degli angoli delle footprint + parallelismo
-   opposto, pesi IRLS Cauchy) su **tutte** le footprint raccolte: una sola
-   omografia per tutto il video, come fa `_apply_global_homography` offline
-   nella pipeline. Il flag `--no-robust` disattiva i pesi IRLS Cauchy
-   (vedi §6.3).
-6. **bev_unit** — mediana di √(larghezza×lunghezza) delle footprint proiettate
+5. **Raggruppamento in tracce** — le detection sono raggruppate per IoU in
+   immagine (`_group_tracks`), così da sapere quali osservazioni appartengono
+   allo **stesso oggetto rigido**. È l'unica cosa che la calibrazione chiede
+   al tracking: un veicolo ha UNA sola forma di footprint.
+6. **Solve globale di bootstrap** — `OrthoHomographySolver`
+   (Levenberg-Marquardt su 4 DoF essenziali, residui = coseni degli angoli
+   delle footprint + parallelismo opposto, pesi IRLS Cauchy) su tutte le
+   footprint raccolte: una sola omografia per tutto il video, come fa
+   `_apply_global_homography` offline nella pipeline. Il flag `--no-robust`
+   disattiva i pesi IRLS Cauchy (vedi §6.3).
+7. **Raffinamento rigido per-traccia** (vedi §5.6) — ad ogni iterazione le
+   footprint proiettate nella gauge corrente vengono allineate alla **forma
+   rigida** della propria traccia (MLE Procrustes + snap a rettangolo, la
+   stessa stima della forma di `refine_v2`), e le osservazioni il cui
+   disaccordo con quella forma supera `--rigid-pct` percentile vengono
+   scartate. Il solve viene poi ripetuto sull'insieme pulito. Di default
+   5 iterazioni.
+8. **bev_unit** — mediana di √(larghezza×lunghezza) delle footprint proiettate
    con la H appena estratta (formula di `_class_footprint_dims`).
-7. **Salvataggio** dei tre file descritti sopra.
+9. **Salvataggio** dei tre file descritti sopra.
+
+### 5.6 Perché serve il vincolo di rigidità per-traccia
+
+Un veicolo è un oggetto rigido: la sua footprint a terra ha sempre la stessa
+forma. Ma una singola osservazione non lo dimostra — un'auto parzialmente
+occlusa o tagliata dal bordo del frame produce un quadrilatero più piccolo
+e deformato, e quel campio "infora" il piano stradale.
+
+Il vincolo è applicabile solo con più osservazioni dello **stesso** oggetto.
+Il bootstrap della H porta ogni footprint nel piano rettificato, dove la
+forma di ciascuna traccia può essere stimata (MLE Procrustes) e ogni
+osservazione confrontata con essa. Lo scarto fra la forma rigida e
+l'osservazione misura quanto quella vista è "pulita".
+
+Le osservazioni pulite formano un dataset omogeneo per il solver, che a
+quel punto vede solo quadrilateri realmente rettangolari. Questo è il
+contributo che la vecchia pipeline completa traeva da `refine_v2`
+(`_shape_mle` + `_best_alignment`); qui è espresso come **filtro**, così lo
+script resta standalone e non deve ricostruire la geometria 3D per riposare
+i footprint.
+
+La forma stimata **non** viene proiettata sul rettangolo migliore: il vincolo
+di rigidità serve a giudicare un'osservazione, non a correggerla, e
+proiettare sul rettangolo falserebbe il riferimento con cui le osservazioni
+sono confrontate. Misurato sull'intero video Bangkok, togliere lo snap fa
+scendere il residuo sulla ROI da 0.0336 a 0.0322 BEU.
+
+Misure sul video Bangkok `video_041.avi` (9000 frame, 36314 footprint,
+confronto similarity-invariant rispetto alla calibrazione in uso nel repo):
+
+| Configurazione | residuo ROI (BEU) | residuo footprint (BEU) | rettangularità `mean\|cos\|` |
+|---|---|---|---|
+| solve singolo (senza raffinamento) | 0.0508 | 0.1671 | 0.0933 |
+| **raffinamento rigido, 5 iterazioni** | **0.0322** | **0.1136** | **0.0812** |
+
+La calibrazione di riferimento già presente nel repo ha rettangularità
+0.0933: la nuova è oggettivamente più rettificata, non solo più vicina a
+quella esistente.
 
 ---
 
@@ -159,14 +226,31 @@ di libertà sono invisibili all'obiettivo di rettangolarità. Conseguenze:
 
 ### 6.2 Valori di riferimento misurati (video Bangkok)
 
-Estrazione eseguita su `video_dataset_bangkok/video_041_tagliato_2.avi`
-(900 frame, **6526 footprint** veicolo valide) con
-`--kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine`:
+Estrazione eseguita su `video_dataset_bangkok/video_041.avi` (video integrale,
+9000 frame, **36314 footprint** veicolo valide) con
+`--kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine`
+e `--max-frames 0`:
 
-| Solve | `robust` | loss | iterazioni | `bev_unit` |
+| Configurazione | `robust` | loss | iterazioni | `bev_unit` |
 |---|---|---|---|---|
-| Default (IRLS Cauchy) | `True` | `29.90` | 30 | **`0.373092117369`** |
-| `--no-robust` | `False` | `189.25` | 7 | `0.367480188935` |
+| Default (IRLS Cauchy + raffinamento rigido) | `True` | `137.83` | 29 | **`0.335545853435`** |
+| `--no-robust` | `False` | — | — | — |
+
+Su `video_041_tagliato_2.avi` (900 frame, 6526 footprint) il default produce
+`bev_unit = 0.380562035749` con loss `19.06`: il risultato peggiora sensibilmente
+con meno dati, perché il vincolo di rigidità per-traccia ha bisogno di più
+osservazioni dello stesso oggetto. **Calibrare sul video più lungo disponibile.**
+
+Confronto con la calibrazione già presente nel repo
+(`homography_bangkok.npy`, `bev_unit = 0.31147524796`), la nuova coppia è
+geometricamente equivalente ma espressa in gauge diverse (scala ≈ 0.885,
+rotazione ≈ 1.1°): come ricorda la regola d'oro sotto, **H e bev_unit vanno
+sempre usate insieme**.
+
+| Configurazione | `bev_unit` |
+|---|---|
+| Coppia in uso nel repo | `0.31147524796` |
+| Nuova coppia (video 041 integrale) | `0.335545853435` |
 
 La `bev_unit` della coppia già in uso nel repo
 (`homography_bangkok.npy` + `homography_bangkok_bev_unit.txt`) è
@@ -196,6 +280,56 @@ piccola, ma la rettifica è peggiore.
 la coppia `H` + `bev_unit` destinata alla pipeline, e i suoi numeri **non
 sono confrontabili** con quelli di un solve robusto (loss su insiemi di
 quad diversi, scale diverse).
+
+### 6.4 Check di coerenza con la ROI esistente
+
+Al termine dell'estrazione lo script ri-proietta i `image_points` della ROI
+(`roi_bev.json`) con la H appena estratta e li confronta con i `bev_points`
+memorizzati nel file. Poiché un'omografia è definita a meno di una similitudine
+del piano BEV, il confronto usa il **residuo similarity-invariant**: si stima la
+similitudine (scala + rotazione + traslazione) che porta la BEV candidata su
+quella memorizzata e si misura il residuo dei punti. Il gauge stimato (scala e
+rotazione) viene stampato a fianco, così le due calibrazioni sono confrontabili
+sullo stesso piano. Un residuo grande resta una campanella di allarme: la nuova
+calibrazione si discosta da quella su cui la ROI è stata disegnata.
+
+Su `video_041.avi` il residuo similarity-invariant della nuova calibrazione
+rispetto a quella in uso nel repo è **0.032 BEU medio, 0.068 BEU massimo** sui
+vertici della ROI (gauge: scala ≈ 0.885, rotazione ≈ 1.1°).
+
+Quando si cambia la calibrazione, la ROI in BEV va ri-proiettata con la nuova
+H: `roi_bev.json` memorizza infatti i `bev_points` assoluti calcolati con la
+calibrazione del momento in cui la ROI è stata disegnata.
+
+### 6.5 Ri-proiettare la ROI dopo un cambio di calibrazione
+
+`roi_bev.json` memorizza la ROI due volte:
+
+- `image_points` — la selezione fatta sul frame del video;
+- `bev_points` — gli stessi punti proiettati nel piano BEV **con la calibrazione
+  del momento in cui la ROI è stata salvata**.
+
+Cambiando calibrazione, i `bev_points` memorizzati restano quelli vecchi: il
+pannello BEV disegnerebbe l'attraversamento pedonale nella posizione
+sbagliata mentre il pannello in prospettiva lo disegnerebbe correctly — i due
+pannelli non concorderebbero, e il controllo "pedone fuori corsia" (che
+confronta la posizione BEV del pedone con la ROI) darebbe risultati arbitrari.
+
+La **selezione** della ROI non cambia: cambia solo la sua espressione nel
+piano BEV. Perciò basta ri-proiettare i `image_points` con la nuova H:
+
+```bash
+.venv/bin/python extract_homography.py \
+  --input video_dataset_bangkok/video_041.avi \
+  --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
+  --max-frames 0 --output homography_bangkok.npy \
+  --reproject-roi
+```
+
+Questo scrive `roi_bev.json` aggiornato (o nel file indicato da `--roi-out`)
+senza toccare nessun altro file del flusso. `select_roi_bev.py` applica la
+stessa regola quando salva una ROI: i `bev_points` vengono **sempre**
+ricalcolati dai `image_points` con la calibrazione in uso.
 
 ### Regola d'oro
 
