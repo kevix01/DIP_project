@@ -216,3 +216,4 @@ _work/
 runs/
 
 .playwright-mcp/
+.webapp/

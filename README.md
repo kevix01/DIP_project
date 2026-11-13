@@ -19,11 +19,11 @@ La sequenza tipica è: calibrare una scena, disegnare la ROI per quella stessa s
 
 2. Selezionare la ROI sul video, usando la coppia appena estratta:
 
-    python select_roi_bev.py --frame "video_calibrazione.mp4" --homography homography_bangkok.npy --bev-unit homography_bangkok_bev_unit.txt --output roi_bev.json
+    python select_roi_bev.py --frame "video_calibrazione.mp4" --homography homography_bangkok.npy --bev-unit-file homography_bangkok_bev_unit.txt --output roi_bev.json
 
-3. Avviare il debug sul video da analizzare. Il valore numerico di bev_unit deve essere quello scritto nel file omonimo prodotto al punto 1:
+3. Avviare il debug sul video da analizzare, indicando il file di testo con la bev_unit prodotto al punto 1:
 
-    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo_debug.mp4"
+    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit-file homography_bangkok_bev_unit.txt --device cuda:0 --output "demo_debug.mp4"
 
 Prima di elaborare, è consigliabile esportare il modello in engine FP16 (una volta sola):
 
@@ -32,7 +32,7 @@ Prima di elaborare, è consigliabile esportare il modello in engine FP16 (una vo
 
 Per elaborare senza la visualizzazione diagnostica, si può eseguire la pipeline normale:
 
-    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
+    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit-file homography_bangkok_bev_unit.txt --device cuda:0 --output "demo.mp4"
 
 Eseguire gli ultimi due comandi dalla cartella del progetto: la pipeline carica l’omografia statica dal percorso relativo **homography_bangkok.npy**. Per un’altra scena, mettere in quel percorso la matrice della calibrazione corrispondente e creare/aggiornare una ROI con la medesima calibrazione. Non abbinare una matrice H a una bev_unit o a una ROI prodotte con una calibrazione diversa.
 
@@ -68,7 +68,7 @@ Avvia un’interfaccia web locale nel browser. L’utente carica o indica un’i
 |---|---:|---|
 | **--frame** | nessuno | File iniziale: immagine o video. |
 | **--homography** | nessuno | File H 3×3 in formato .npy o .txt. |
-| **--bev-unit** | nessuno | Percorso del file di testo con la bev_unit (in questo script non è un numero). |
+| **--bev-unit-file** | nessuno | Percorso del file di testo con la bev_unit (un solo numero). |
 | **--roi** | nessuno | JSON ROI da caricare/modificare. |
 | **--output** | roi_bev.json | Nome/percorso suggerito per il JSON salvato. |
 | **--frame-index** | 1 | Frame iniziale del video, indice a partire da 1. |
@@ -91,7 +91,7 @@ La ROI JSON deve contenere image_points e bev_points (almeno tre punti per ciasc
 | **--clip-track-timeout-s** | 1.5 secondi | Attesa massima dopo la perdita del tracking del veicolo. |
 | **--clip-absolute-timeout-s** | 3.0 secondi | Durata massima assoluta della clip dell’evento. |
 | **--no-clip** | disattivato | Non scrive il filmato del singolo evento, ma mantiene il JSON. |
-| **--bev-unit** | stimata se omessa | Valore numerico che deve essere coerente con H e ROI. |
+| **--bev-unit-file** | stimata se omessa | File .txt con la bev_unit, coerente con H e ROI. |
 
 Gli eventi sono scritti nella cartella **violations_<nome_video>/**, relativa alla cartella di lavoro. Per ciascun evento vengono prodotti un JSON con frame, timestamp, ID, TTC e dati della clip, e un MP4 con i marker dei soggetti coinvolti — il centroide del veicolo (rosso, `V<id>`) e quello del pedone (giallo, `P<id>`) — salvo l’uso di **--no-clip**. Il nome di clip e JSON contiene il minutaggio del video (`violation_v<id>_t<MMmSSsMMMms>`). Il programma principale può inoltre salvare un video annotato completo tramite **--output**.
 
@@ -149,7 +149,7 @@ Oltre a queste due opzioni, lo script accetta le opzioni della pipeline base e q
 | **--no-dedupe**, **--no-shape-smooth**, **--shape-win**, **--no-world-lock**, **--no-hold-still** | Controllano deduplicazione, smoothing (finestra 31), world lock e blocco dei veicoli fermi. |
 | **--min-track**, **--coast-tail**, **--merge-gap** | Refinement: 12, 8, 30 frame. |
 | **--labels**, **--labels-from**, **--labels-source** | Esportazione facoltativa geometria pseudo-label; frame iniziale 0, sorgente originale opzionale. |
-| **--bev-unit** | Valore numerico (default automatico): usare quello della calibrazione della ROI. |
+| **--bev-unit-file** | nessuno (default automatico): file .txt con la bev_unit della calibrazione della ROI. |
 
 Le opzioni refinement in questa tabella sono quelle del parser generale e sono effettive nel normale runtime v2 quando il relativo percorso offline viene usato; il ciclo di **debug_violations.py** non esegue quel refinement. Le opzioni principali effettive per il rilevamento nel debug sono input, checkpoint, ROI, bev_unit, soglia TTC e conferma frame, oltre ai controlli di visualizzazione esplicitamente applicati.
 
@@ -157,7 +157,7 @@ Le opzioni refinement in questa tabella sono quelle del parser generale e sono e
 
 È il programma principale per eseguire il modello v2 su un video o uno stream. Rileva persone e veicoli, stima i cuboidi 3D dai keypoint, mantiene le tracce nel tempo, visualizza la scena in prospettiva e in BEV e, con una ROI, applica il rilevatore di violazioni. Non include la tabella diagnostica TTC di **debug_violations.py**.
 
-**Input:** video o stream supportato da OpenCV, checkpoint YOLO26 Pose26 compatibile con v2, file JSON ROI e omografia statica. Il file **homography_bangkok.npy** deve essere presente nella cartella di lavoro: il codice lo carica con quel nome. **--bev-unit**, se specificato, è un valore numerico e deve appartenere alla stessa calibrazione della ROI.
+**Input:** video o stream supportato da OpenCV, checkpoint YOLO26 Pose26 compatibile con v2, file JSON ROI e omografia statica. Il file **homography_bangkok.npy** deve essere presente nella cartella di lavoro: il codice lo carica con quel nome. **--bev-unit-file**, se specificato, è il file di testo con la bev_unit e deve provenire dalla stessa calibrazione della ROI.
 
 **Output:** con **--output** salva il video completo annotato; con **--display** mostra la finestra durante l’elaborazione. Il default non salva il video completo. Il rilevatore salva comunque gli eventi confermati in **violations_<nome_video>/**: JSON e clip MP4, a meno che si specifichi **--no-clip**. Il salvataggio del video completo richiede FFmpeg con libx264 nel PATH.
 
@@ -168,7 +168,7 @@ Le opzioni refinement in questa tabella sono quelle del parser generale e sono e
 | **--roi-file** | obbligatorio | JSON con la ROI e i suoi punti immagine/BEV. |
 | **--device** | cpu | Dispositivo per l’inferenza, per esempio cpu o cuda:0. |
 | **--kp-imgsz**, **--kp-conf** | 640, 0.25 | Dimensione d’inferenza e confidenza minima del modello. |
-| **--bev-unit** | automatica | Scala BEV numerica; passare quella usata per creare la ROI. |
+| **--bev-unit-file** | automatica | File .txt con la scala BEV; usare quello prodotto insieme alla ROI. |
 | **--ttc-thresh**, **--confirm-frames** | 2.5 s, 3 | Soglia TTC e numero di frame consecutivi necessari a confermare una violazione. |
 | **--clip-track-timeout-s**, **--clip-absolute-timeout-s** | 1.5 s, 3.0 s | Tempi di chiusura della clip dopo la perdita del track e durata massima dell’evento. |
 | **--no-clip** | disattivato | Non salva le clip dei singoli eventi; i JSON vengono comunque salvati. |
@@ -181,7 +181,27 @@ Il programma accetta inoltre le opzioni base e v2 elencate nelle due tabelle CLI
 
 Esempio:
 
-    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit 0.31147524796 --device cuda:0 --output "demo.mp4"
+    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit-file homography_bangkok_bev_unit.txt --device cuda:0 --output "demo.mp4"
+
+## Webapp di debug
+
+La cartella **webapp/** contiene un’interfaccia web locale (FastAPI + uvicorn) che riunisce le quattro fasi del flusso in schede: export del modello, estrazione dell’omografia, selezione della ROI e debug live con overlay delle infrazioni.
+
+**Compatibilità:** Linux, macOS e Windows. Il codice usa solo percorsi tramite `pathlib`, non invoca shell e non dipende da utility UNIX: il selettore ROI viene avviato come subprocess con la stessa procedura su ogni piattaforma e il launcher non usa `setsid`, `nohup` o `curl`.
+
+Avvio:
+
+```bash
+# Linux / macOS
+webapp/run_server.sh
+
+# Windows (o qualsiasi piattaforma)
+python webapp\run_server.py
+```
+
+Variabili d’ambiente riconosciute: **DIP_WEB_HOST**, **DIP_WEB_PORT** (default 8099), **DIP_WEB_DEVICE**, **DIP_WEB_WEIGHTS**, **DIP_WEB_HOMOGRAPHY**, **DIP_WEB_BEV_UNIT**, **DIP_WEB_ROI**, **DIP_WEB_WORKDIR**, **DIP_WEB_LOG**, **DIP_WEB_PID**. Il percorso dei pesi viene cercato automaticamente in **checkpoints/**, **weights/** e in un checkout fratello **DIP_new/urbanomnidetect/**; su Windows l’ambiente virtuale viene rilevato sia in **.venv\\Scripts\\python.exe** sia in **.venv/bin/python**.
+
+Il launcher accetta anche `--foreground` (server in primo piano) e `--stop` (arresta il server registrato nel pidfile).
 
 ## Dipendenze e file necessari all’esecuzione
 
@@ -189,7 +209,7 @@ Installare le dipendenze Python con **python -m pip install -r requirements.txt*
 
 Per la calibrazione standalone servono **homography_rt.py** e il package **uod** (in particolare il modulo keypoints). Per l’applicazione e il debug v2 servono inoltre **bev_realtime.py**, **bev_realtime_v2.py**, **refine_v2.py**, **violation_detector.py**, **v2/__init__.py**, **v2/hybrid_v2.py** e **uod/**. **select_roi_bev.py** usa OpenCV, NumPy e la libreria standard Python.
 
-Il runtime v2 legge **homography_bangkok.npy** dalla cartella di lavoro, mentre la ROI è indicata con **--roi-file**. La coppia leggibile **homography_bangkok.txt** e **homography_bangkok_bev_unit.txt** è utile per controllo e per caricare la calibrazione nel selettore ROI; il valore passato alla pipeline con **--bev-unit** è invece numerico.
+Il runtime v2 legge **homography_bangkok.npy** dalla cartella di lavoro (o dal file indicato con **--homography-file**), mentre la ROI è indicata con **--roi-file**. La coppia leggibile **homography_bangkok.txt** e **homography_bangkok_bev_unit.txt** è utile per controllo e per caricare la calibrazione nel selettore ROI; la pipeline riceve la scala tramite **--bev-unit-file**, che indica il file di testo.
 
 ## Nota sul README generale
 
@@ -281,7 +301,7 @@ Video, with tracking, the bird's-eye view, and the violation detector:
 python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
     --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 \
     --smooth 11 --device cuda:0 --output out.mp4 \
-    --bev-unit 0.31147524796 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
+    --bev-unit-file homography_bangkok_bev_unit.txt --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
 ```
 
  - `--kp-imgsz 640` matches the engine input. On drone footage a larger input (960/1280) recovers far, small traffic and the cuboids stay tight.

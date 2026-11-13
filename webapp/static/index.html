@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rilevatore di Infrazioni in Attraversamento Pedonale</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="healthDot"></span>
+    <strong>Rilevatore di Infrazioni in Attraversamento Pedonale</strong>
+    <span class="muted" id="healthInfo">—</span>
+  </div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="export">1 · Engine</button>
+    <button class="tab" data-tab="calib">2 · Omografia</button>
+    <button class="tab" data-tab="roi">3 · ROI</button>
+    <button class="tab" data-tab="debug">4 · Debug</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ================= ENGINE ================= -->
+  <section class="panel active" id="tab-export">
+    <div class="grid">
+      <div class="card">
+        <h2>Esportazione TensorRT / ONNX</h2>
+        <label>Pesi (.pt)
+          <input type="text" id="ex-weights" placeholder="checkpoints/...pt">
+        </label>
+        <div class="row">
+          <label>imgsz<input type="number" id="ex-imgsz" value="640" step="32"></label>
+          <label>Formato
+            <select id="ex-format">
+              <option value="engine">TensorRT engine</option>
+              <option value="onnx">ONNX</option>
+            </select>
+          </label>
+          <label>Precisione
+            <select id="ex-precision">
+              <option value="fp16">FP16</option>
+              <option value="fp32">FP32</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label>Device<input type="text" id="ex-device" value="cuda:0"></label>
+          <label class="chk"><input type="checkbox" id="ex-dynamic"> shape dinamiche</label>
+          <label class="chk"><input type="checkbox" id="ex-force"> forza rigenerazione</label>
+        </div>
+        <div class="actions">
+          <button class="primary" id="ex-run">Esporta</button>
+          <span class="muted" id="ex-status"></span>
+        </div>
+        <pre class="log" id="ex-log"></pre>
+      </div>
+      <div class="card">
+        <h2>Artifact disponibili</h2>
+        <div id="ex-artifacts" class="list">—</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= CALIBRATION ================= -->
+  <section class="panel" id="tab-calib">
+    <div class="grid">
+      <div class="card">
+        <h2>Estrazione omografia</h2>
+        <label>Video di calibrazione
+          <input type="text" id="cal-input" placeholder="video_dataset_bangkok/...avi">
+        </label>
+        <label>Modello keypoints
+          <input type="text" id="cal-model" placeholder="checkpoints/....engine">
+        </label>
+        <div class="row">
+          <label>Nome output<input type="text" id="cal-output" value="homography_web.npy"></label>
+          <label>Device<input type="text" id="cal-device" value="cuda:0"></label>
+          <label>max frames<input type="number" id="cal-maxframes" value="1500"></label>
+        </div>
+        <div class="row">
+          <label>refine iters<input type="number" id="cal-refine" value="5"></label>
+          <label>rigid pct<input type="number" id="cal-rigid" value="65" step="0.5"></label>
+          <label class="chk"><input type="checkbox" id="cal-reproject"> riproietta ROI</label>
+        </div>
+        <div class="actions">
+          <button class="primary" id="cal-run">Calibra</button>
+          <span class="muted" id="cal-status"></span>
+        </div>
+        <pre class="log" id="cal-log"></pre>
+      </div>
+      <div class="card">
+        <h2>Risultato</h2>
+        <div id="cal-result" class="list">—</div>
+        <div class="actions">
+          <a class="btn" id="cal-dl-h" style="display:none" download>Omografia (.npy)</a>
+          <a class="btn" id="cal-dl-t" style="display:none" download>Omografia (.txt)</a>
+          <a class="btn" id="cal-dl-b" style="display:none" download>bev_unit</a>
+        </div>
+        <h2 class="mt">Usa nel selettore ROI</h2>
+        <div class="actions">
+          <button id="cal-use-roi">Invia omografia e bev_unit alla tab ROI</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= ROI ================= -->
+  <section class="panel" id="tab-roi">
+    <div class="roi-layout">
+      <div class="card side">
+        <h2>Sorgente</h2>
+        <label>Sorgente (video o immagine)
+          <input type="text" id="roi-path" placeholder="video_dataset_bangkok/video_041.avi">
+        </label>
+        <div class="actions" style="margin-top:0">
+          <button id="roi-load-path">Avvia selettore</button>
+          <button id="roi-stop">Ferma selettore</button>
+        </div>
+        <div class="actions" style="margin-top:8px">
+          <button id="roi-pick-file">Sfoglia file…</button>
+        </div>
+        <input type="file" id="roi-file" accept="video/*,image/*" style="display:none">
+        <div id="roi-source-info" class="muted small" style="margin-top:12px">nessun selettore avviato</div>
+
+        <h2 class="mt">ROI salvata</h2>
+        <div id="roi-cal-info" class="muted small">nessuna ROI salvata</div>
+        <div class="actions">
+          <a class="btn" id="roi-download" style="display:none" download>Download roi_bev.json</a>
+        </div>
+        <div id="roi-status" class="muted small" style="margin-top:8px"></div>
+      </div>
+
+      <div class="card grow">
+        <h2>Selettore ROI integrato</h2>
+        <div class="muted small" id="roi-bev-info">
+          Avvia il selettore: i vertici si selezionano direttamente nel frame,
+          la ROI viene proiettata in BEV e salvata lato server.
+        </div>
+        <div class="canvas-wrap">
+          <iframe id="roi-frame-el" title="Selettore ROI" src="/roi/app/"></iframe>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= DEBUG ================= -->
+  <section class="panel" id="tab-debug">
+    <div class="debug-layout">
+      <div class="card side">
+        <h2>Sorgente</h2>
+        <label>Video
+          <input type="text" id="dbg-input" placeholder="video_dataset_bangkok/....avi">
+        </label>
+        <div class="actions" style="margin-top:0">
+          <button id="dbg-pick-video">Sfoglia video…</button>
+        </div>
+        <input type="file" id="dbg-file" accept="video/*" style="display:none">
+
+        <h2 class="mt">Modello e calibrazione</h2>
+        <label>Engine<input type="text" id="dbg-engine"></label>
+        <label>Omografia<input type="text" id="dbg-homography"></label>
+        <label>bev_unit (file .txt)<input type="text" id="dbg-bevunit" placeholder="homography_bangkok_bev_unit.txt"></label>
+        <label>ROI (json)<input type="text" id="dbg-roi"></label>
+        <div class="actions">
+          <button id="dbg-use-roi">Usa ultima ROI salvata</button>
+        </div>
+
+        <h2 class="mt">Parametri</h2>
+        <div class="row">
+          <label>kp-conf<input type="number" id="dbg-kpconf" value="0.1" step="0.05"></label>
+          <label>kp-vis<input type="number" id="dbg-kpvis" value="0.6" step="0.05"></label>
+          <label>imgsz<input type="number" id="dbg-imgsz" value="640" step="32"></label>
+        </div>
+        <label>class-conf (COCO id:conf)
+          <input type="text" id="dbg-classconf" value="0:0.4,1:0.5,3:0.5">
+        </label>
+        <div class="row">
+          <label>object-px<input type="number" id="dbg-objectpx" value="80"></label>
+          <label>smooth<input type="number" id="dbg-smooth" value="11"></label>
+          <label>max frames<input type="number" id="dbg-maxframes" value="0"></label>
+        </div>
+        <div class="row">
+          <label>ttc-thresh<input type="number" id="dbg-ttc" value="2.5" step="0.1"></label>
+          <label>confirm-frames<input type="number" id="dbg-confirm" value="6"></label>
+          <label>ocm-weight<input type="number" id="dbg-ocm" value="2" step="0.05"></label>
+        </div>
+        <div class="row">
+          <label>track-high-conf<input type="number" id="dbg-highconf" value="0.45" step="0.05"></label>
+          <label>table-height<input type="number" id="dbg-tableh" value="280"></label>
+          <label>source-type
+            <select id="dbg-sourcetype">
+              <option value="auto">auto</option>
+              <option value="video">video</option>
+              <option value="stream">stream</option>
+            </select>
+          </label>
+        </div>
+        <div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
+          <label class="chk"><input type="checkbox" id="dbg-saveviol" checked> salva JSON/clip infrazioni</label>
+          <label class="chk"><input type="checkbox" id="dbg-savevideo"> salva video annotato</label>
+        </div>
+        <div class="actions">
+          <button class="primary" id="dbg-run">Avvia</button>
+          <button id="dbg-stop" disabled>Ferma</button>
+          <span class="muted" id="dbg-status"></span>
+        </div>
+      </div>
+
+      <div class="grow col">
+        <div class="card">
+          <div class="stats">
+            <div class="stat"><span>FPS</span><b id="st-fps">—</b></div>
+            <div class="stat"><span>Frame</span><b id="st-frame">—</b></div>
+            <div class="stat"><span>Rendered</span><b id="st-rendered">—</b></div>
+            <div class="stat"><span>Infrazioni</span><b id="st-violations">0</b></div>
+            <div class="stat"><span>Stato</span><b id="st-state">idle</b></div>
+          </div>
+          <div class="viewer">
+            <img id="dbg-image" alt="stream video" style="display:none">
+            <div id="dbg-placeholder" class="viewer-placeholder">
+              <svg viewBox="0 0 64 48" class="ph-icon" aria-hidden="true">
+                <rect x="2" y="6" width="44" height="32" rx="3"></rect>
+                <path d="M46 18 L60 10 v24 L46 26 z"></path>
+              </svg>
+              <div class="ph-title">Nessuno stream attivo</div>
+              <div class="ph-sub">Carica un video e premi <b>Avvia</b> per avviare il debug</div>
+            </div>
+            <div id="dbg-alert" class="alert" style="display:none">INFRAZIONE ORA!</div>
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="card">
+            <h2>Eventi</h2>
+            <div id="dbg-events" class="list small">—</div>
+          </div>
+          <div class="card">
+            <h2>Log</h2>
+            <pre class="log" id="dbg-log"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/api.js"></script>
+<script src="/static/stream.js"></script>
+<script src="/static/main.js"></script>
+</body>
+</html>

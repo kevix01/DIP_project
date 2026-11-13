@@ -35,6 +35,8 @@ def main(argv=None):
                    help="FP16 engine (default on)")
     p.add_argument("--fp32", dest="half", action="store_false", help="FP32 engine")
     p.add_argument("--dynamic", action="store_true", help="dynamic input shapes")
+    p.add_argument("--force", action="store_true",
+                   help="rigenera l'artifact anche se esiste gia'")
     p.add_argument("--device", default="cuda:0", help="export device (default cuda:0)")
     args = p.parse_args(argv)
 
@@ -42,7 +44,8 @@ def main(argv=None):
         p.error(f"weights not found: {args.weights}")
 
     out = maybe_export(args.weights, imgsz=args.imgsz, device=args.device,
-                       fmt=args.format, half=args.half, dynamic=args.dynamic)
+                       fmt=args.format, half=args.half, dynamic=args.dynamic,
+                       force=args.force)
     print(f"Exported artifact: {out}")
     return 0
 

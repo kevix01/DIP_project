@@ -245,6 +245,9 @@ canvas { display: block; cursor: crosshair; }
 
 <script>
 const INITIAL = %%INITIAL%%;
+// Prefisso delle route HTTP: vuoto in standalone, "/roi/app" quando la pagina
+// è incorporata in un iframe del frontend web.
+const BASE_PATH = %%BASE_PATH%%;
 
 let HOMOGRAFIA = INITIAL.homography;
 let BEV_UNIT = INITIAL.bev_unit;
@@ -540,7 +543,7 @@ function clearROI() { points = []; ROI_DEFINED = false; POINTS_CLEARED = true; s
 async function loadFrame(idx) {
   // idx è 1-based (numero frame utente); l'API backend è 0-based
   CURRENT_FRAME_INDEX = idx;
-  loadImage('/frame?index=' + (idx - 1) + '&t=' + Date.now());
+  loadImage(BASE_PATH + '/frame?index=' + (idx - 1) + '&t=' + Date.now());
 }
 
 async function uploadSource() {
@@ -549,7 +552,7 @@ async function uploadSource() {
   setStatus('Caricamento sorgente...', 'info');
   const fd = new FormData(); fd.append('file', file);
   try {
-    const res = await fetch('/upload-source', {method:'POST', body: fd});
+    const res = await fetch(BASE_PATH + '/upload-source', {method:'POST', body: fd});
     const info = await res.json();
     if (info.error) { setStatus(info.error, 'err'); return; }
     IS_VIDEO = info.is_video;
@@ -586,7 +589,7 @@ async function uploadHomography() {
   if (!file) return;
   const fd = new FormData(); fd.append('file', file);
   try {
-    const res = await fetch('/upload-homography', {method:'POST', body: fd});
+    const res = await fetch(BASE_PATH + '/upload-homography', {method:'POST', body: fd});
     const info = await res.json();
     if (info.error) { setStatus(info.error, 'err'); return; }
     HOMOGRAFIA = info.matrix;
@@ -604,7 +607,7 @@ async function uploadBevUnit() {
   if (!file) return;
   const fd = new FormData(); fd.append('file', file);
   try {
-    const res = await fetch('/upload-bev-unit', {method:'POST', body: fd});
+    const res = await fetch(BASE_PATH + '/upload-bev-unit', {method:'POST', body: fd});
     const info = await res.json();
     if (info.error) { setStatus(info.error, 'err'); return; }
     BEV_UNIT = info.bev_unit;
@@ -655,6 +658,26 @@ async function saveROI() {
   }
   const jsonStr = JSON.stringify(payload, null, 2);
 
+  // Server-side persistence (enabled by the web frontend via --save-path).
+  // In standalone mode this returns saved=false and the browser download
+  // below is used as before.
+  let savedServerSide = false;
+  try {
+    const res = await fetch(BASE_PATH + '/save-roi', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: jsonStr,
+    });
+    const info = await res.json();
+    if (info.error) { setStatus('Errore salvataggio server: ' + info.error, 'err'); return; }
+    savedServerSide = !!info.saved;
+    if (savedServerSide) {
+      setStatus('Salvato lato server: ' + (info.filename || ''), 'ok');
+      try { window.parent.postMessage({type: 'roi-saved'}, '*'); } catch (e) {}
+      return;
+    }
+  } catch (e) { /* fall back to the browser download */ }
+
   if (window.showSaveFilePicker) {
     try {
       const handle = await window.showSaveFilePicker({
@@ -681,7 +704,7 @@ async function saveROI() {
 }
 function quitApp() {
   if (!confirm('Uscire dall&#39;applicazione?')) return;
-  fetch('/quit', {method:'POST'}).catch(()=>{}).then(() => {
+  fetch(BASE_PATH + '/quit', {method:'POST'}).catch(()=>{}).then(() => {
     document.body.innerHTML =
       '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
       'color:#888;font-family:sans-serif;font-size:14px;">Chiusura in corso...</div>';
@@ -697,7 +720,7 @@ document.getElementById('loadRoiFile').addEventListener('change', async e => {
   setStatus('Caricamento ROI...', 'info');
   try {
     const fd = new FormData(); fd.append('file', file);
-    const res = await fetch('/load-roi', {method:'POST', body: fd});
+    const res = await fetch(BASE_PATH + '/load-roi', {method:'POST', body: fd});
     const info = await res.json();
     if (info.error) { setStatus('File JSON non valido: ' + info.error, 'err'); return; }
     points = info.points.map(p => ({x: p[0], y: p[1]}));
@@ -1025,6 +1048,10 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
     active_homography_source = 'session'   # 'session' | 'roi'
     active_bev_unit_source = 'session'     # 'session' | 'roi'
     warnings = []
+    # When set, the ROI is ALSO persisted server-side on save (used by the
+    # web frontend to pick it up). None keeps the standalone behaviour of
+    # downloading the file to the browser only.
+    save_path = None
 
     def log_message(self, fmt, *args):
         pass
@@ -1151,6 +1178,24 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
                 ROIHandler.bev_unit = val
                 ROIHandler.bev_unit_file = f.get('filename') or ''
                 self._send_json({'bev_unit': val, 'filename': ROIHandler.bev_unit_file})
+            except Exception as e:
+                self._send_json({'error': str(e)}, 500)
+
+        elif parsed.path == '/save-roi':
+            if ROIHandler.save_path is None:
+                self._send_json({'saved': False})
+                return
+            try:
+                length = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(length) if length else b'{}'
+                data = json.loads(raw.decode('utf-8'))
+                if not data.get('image_points'):
+                    self._send_json({'error': 'formato errato: mancano image_points'}, 400)
+                    return
+                out = Path(ROIHandler.save_path)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(data, indent=2), encoding='utf-8')
+                self._send_json({'saved': True, 'filename': out.name, 'path': str(out)})
             except Exception as e:
                 self._send_json({'error': str(e)}, 500)
 
@@ -1346,8 +1391,8 @@ def build_arg_parser():
                     help='File iniziale (opzionale, caricabile anche da UI)')
     ap.add_argument('--homography', default=None,
                     help='File omografia 3x3 (.npy/.txt, opzionale)')
-    ap.add_argument('--bev-unit', default=None,
-                    help='File bev_unit (opzionale)')
+    ap.add_argument('--bev-unit-file', default=None,
+                    help='File di testo con la bev_unit (opzionale)')
     ap.add_argument('--roi', default=None,
                     help='File ROI JSON da pre-caricare (opzionale)')
     ap.add_argument('--output', default='roi_bev.json',
@@ -1365,11 +1410,18 @@ def build_arg_parser():
                          'sessione (default: attivo)')
     ap.add_argument('--keep-session-calibration', action='store_true',
                     help='Non ripristinare la calibrazione di provenienza della ROI')
+    ap.add_argument('--save-path', default=None,
+                    help='Se impostato, salva la ROI anche lato server in questo '
+                         'percorso (usato dal frontend web)')
+    ap.add_argument('--base-path', default='',
+                    help='Prefisso delle route HTTP usato dalla pagina (default: '
+                         'vuoto; il frontend web passa /roi/app)')
     return ap
 
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    base_path = (args.base_path or '').rstrip('/')
 
     initial = {
         'has_source': False, 'is_video': False, 'total_frames': 1,
@@ -1398,14 +1450,14 @@ def main(argv=None):
             print(f'[warn] omografia non caricata: {e}')
 
     # bev_unit (opzionale)
-    if args.bev_unit and Path(args.bev_unit).exists():
+    if args.bev_unit_file and Path(args.bev_unit_file).exists():
         try:
-            val = float(Path(args.bev_unit).read_text().strip())
+            val = float(Path(args.bev_unit_file).read_text().strip())
             ROIHandler.bev_unit = val
-            ROIHandler.bev_unit_file = Path(args.bev_unit).name
+            ROIHandler.bev_unit_file = Path(args.bev_unit_file).name
             initial['has_bev_unit'] = True
             initial['bev_unit'] = val
-            initial['bev_unit_file'] = Path(args.bev_unit).name
+            initial['bev_unit_file'] = Path(args.bev_unit_file).name
             print(f'[info] bev_unit: {val}')
         except Exception as e:
             print(f'[warn] bev_unit non caricato: {e}')
@@ -1535,8 +1587,12 @@ def main(argv=None):
             print(f'[warn] ROI non caricata: {e}')
 
     ROIHandler.output_path = args.output
+    ROIHandler.save_path = args.save_path
+    if args.save_path:
+        print(f'[info] la ROI verra\' salvata anche lato server in: {args.save_path}')
 
     html = HTML_TEMPLATE.replace('%%INITIAL%%', json.dumps(initial))
+    html = html.replace('%%BASE_PATH%%', json.dumps(base_path))
     ROIHandler.html_content = html
 
     server = ROIHTTPServer(('127.0.0.1', args.port), ROIHandler)

@@ -539,6 +539,11 @@ def main(argv=None):
     bev_v2.V2Viewport.DEFAULT_OBJECT_PX = float(v2args.object_px)
     smooth_win = int(args.smooth) if (args.smooth and args.smooth >= 3) else 11
 
+    bev_unit = None
+    if v2args.bev_unit_file:
+        bev_unit = bev_v2.load_bev_unit_file(v2args.bev_unit_file)
+        print(f"bev_unit caricato da {v2args.bev_unit_file}: {bev_unit}")
+
     # Assegna a bev_v2.V2Pipeline.CONFIG perché V2Pipeline.__init__ legge da lì
     bev_v2.V2Pipeline.CONFIG = dict(
         total_frames=src.total_frames,
@@ -553,7 +558,8 @@ def main(argv=None):
         title=(0.0, 0.0, 0.0, 0.0),
         track_high_conf=v2args.track_high_conf,
         track_ocm_weight=v2args.track_ocm_weight,
-        bev_unit=v2args.bev_unit,
+        bev_unit=bev_unit,
+        homography_path=v2args.homography_file,
         show_bev_ids=True,
     )
 

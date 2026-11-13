@@ -262,8 +262,8 @@ Il rapporto fra le due gauge è **0.373092117369 / 0.31147524796 = 1.1978**:
 le due omografie sono geometricamente equivalenti ma espresse in gauge
 diverse (differiscono per una similitudine di scala ≈ 1.20–1.24 e una
 rotazione di pochi gradi). Come ricorda la regola d'oro, **H e bev_unit
-devono essere usate insieme**: passare `--bev-unit 0.31147524796` con la H
-nuova (o viceversa) introduce un errore di gauge del ~20 % sulle dimensioni
+devono essere usate insieme**: passare `--bev-unit-file homography_bangkok_bev_unit.txt`
+con la H nuova (o viceversa) introduce un errore di gauge del ~20 % sulle dimensioni
 delle footprint in BEV, che si traduce in errori sulle distanze di conflitto
 usate dal rilevatore TTC.
 
@@ -353,14 +353,14 @@ La pipeline real-time consuma la coppia in due punti:
    Per usare una nuova calibrazione: sostituire quel file (o adattare il
    percorso) con il proprio `--output`.
 
-2. **bev_unit** — passata via CLI come parametro:
+2. **bev_unit** — indicata via CLI come file di testo:
 
    ```bash
-   .venv/bin/python bev_realtime_v2.py ... --bev-unit 0.31147524796
+   .venv/bin/python bev_realtime_v2.py ... --bev-unit-file homography_bangkok_bev_unit.txt
    ```
 
-   (valore letto dal file `*_bev_unit.txt`, **dello stesso `--output`** con cui
-   è stata prodotta la H in uso).
+   (il valore viene letto dal file `*_bev_unit.txt`, **dello stesso `--output`**
+   con cui è stata prodotta la H in uso).
 
    La coppia **attualmente in uso nel repo** è:
 
@@ -370,8 +370,8 @@ La pipeline real-time consuma la coppia in due punti:
    | `homography_bangkok_bev_unit.txt` | `0.31147524796` |
 
    Se si estrae una nuova coppia (es. `--output homography.npy` →
-   `bev_unit = 0.373092117369`), vanno **sostituiti entrambi i file insieme**
-   e il valore di `--bev-unit` deve passare a quello nuovo.
+   `bev_unit = 0.373092117369`), vanno **sostituiti entrambi i file insieme** e
+   `--bev-unit-file` deve puntare al nuovo file `*_bev_unit.txt`.
 
 Il confronto con la vecchia coppia Bangkok (`H` con `bev_unit ≈ 0.311`) è
 invariante: la pipeline rende la BEV adattando il viewport alla gauge, quindi
@@ -388,7 +388,7 @@ coppie coerenti diverse producono la stessa vista, a scala di gauge ribaltata.
 | `[ATTENZIONE] Solo N footprint valide (< 128)` | Clip corta o traffico scarso | Aumentare `--max-frames` o usare un video più lungo; la bev_unit può essere poco stabile |
 | Loss finale alta (`info.loss` grande nel log) | Troppi outlier, scene miste, camera che si muove | Preferire camera fissa e traffico distribuito; la loss cresce col numero di quad: confrontarla **per quad** |
 | Checkpoint `.engine` fallisce | TensorRT non compatibile con la GPU/driver | Usare il checkpoint `.pt` equivalente |
-| Distanze/TTC anomali dopo aver cambiato omografia | Gauge incoerente: H nuova con `bev_unit` vecchio (o viceversa) | Sostituire **sempre** `homography_bangkok.npy` e `homography_bangkok_bev_unit.txt` insieme e aggiornare `--bev-unit` (§6.2, §7) |
+| Distanze/TTC anomali dopo aver cambiato omografia | Gauge incoerente: H nuova con `bev_unit` vecchio (o viceversa) | Sostituire **sempre** `homography_bangkok.npy` e `homography_bangkok_bev_unit.txt` insieme e aggiornare `--bev-unit-file` (§6.2, §7) |
 | `loss` molto più alta del previsto con `--no-robust` | Comportamento atteso: gli outlier non sono rigettati | Usare il solve robusto (default); `--no-robust` è solo diagnostico (§6.3) |
 
 ### Verifica rapida di una estrazione

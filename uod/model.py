@@ -13,12 +13,14 @@ __all__ = ["load_detector", "maybe_export"]
 
 
 def maybe_export(weights: str, imgsz: int, device: str, fmt: str = "engine",
-                 half: bool = True, dynamic: bool = False) -> str:
+                 half: bool = True, dynamic: bool = False,
+                 force: bool = False) -> str:
     """Export ``weights`` to an accelerated format if not already present.
 
     Returns the path to the exported artifact (e.g. a ``.engine`` file), or the
     original ``weights`` if ``fmt`` is falsy. The export is skipped when a
-    matching artifact already exists next to the weights.
+    matching artifact already exists next to the weights, unless ``force`` is
+    set.
     """
     if not fmt or fmt in ("torch", "pytorch", "none"):
         return weights
@@ -29,7 +31,7 @@ def maybe_export(weights: str, imgsz: int, device: str, fmt: str = "engine",
     base = os.path.splitext(weights)[0]
     tag = f"_{imgsz}{'_fp16' if half else '_fp32'}{'_dyn' if dynamic else ''}"
     out = f"{base}{tag}{ext}"
-    if os.path.exists(out):
+    if os.path.exists(out) and not force:
         return out
     from ultralytics import YOLO
     m = YOLO(weights)
@@ -39,6 +41,8 @@ def maybe_export(weights: str, imgsz: int, device: str, fmt: str = "engine",
     # Ultralytics writes a default name; rename to the parameterised cache name.
     if os.path.exists(exported) and os.path.abspath(exported) != os.path.abspath(out):
         try:
+            if force and os.path.exists(out):
+                os.remove(out)
             os.replace(exported, out)
         except OSError:
             return exported

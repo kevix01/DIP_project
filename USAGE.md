@@ -14,7 +14,7 @@ entry point; `bev_realtime_v2.py` / `bev_realtime.py` are libraries it drives.
 python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
     --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 \
     --smooth 11 --device cuda:0 --output out.mp4 \
-    --bev-unit 0.31147524796 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
+    --bev-unit-file homography_bangkok_bev_unit.txt --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
 ```
 
 | Flag | Default | Meaning |
@@ -31,7 +31,7 @@ python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidete
 | `--source-type auto|video|stream` | auto | input kind |
 | `--track-high-conf F` | | high-confidence track gate |
 | `--track-ocm-weight F` | | OCM weight in the tracker |
-| `--bev-unit F` | | meters per BEV pixel (meters per ground unit) |
+| `--bev-unit-file PATH` | | text file holding the bev_unit (meters per BEV pixel) |
 | `--show-bev-ids` | off | draw track ids on the BEV radar |
 
 Recommended on aerial footage: `--kp-imgsz 960` (or 1280). The models are trained at 640; a

@@ -4,7 +4,7 @@ Questo documento illustra le modifiche architetturali apportate al meccanismo di
 
 **Lo script va eseguito con i seguenti argomenti**:
 
-python debug_violations.py --input video_dataset_bangkok/video_041_primo_minuto.avi --source-type video --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 --object-px 80 --smooth 11 --device cuda:0 --output output_videos/debug_041_ttc.avi --track-ocm-weight 2 --bev-unit 0.31147524796 --track-high-conf 0.45 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
+python debug_violations.py --input video_dataset_bangkok/video_041_primo_minuto.avi --source-type video --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 --object-px 80 --smooth 11 --device cuda:0 --output output_videos/debug_041_ttc.avi --track-ocm-weight 2 --bev-unit-file homography_bangkok_bev_unit.txt --track-high-conf 0.45 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
 
 ## 🎯 Problemi Risolti
 

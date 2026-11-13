@@ -82,7 +82,7 @@ stessa estrazione**: vedi `docs/extract_homography.md`.
 .venv/bin/python select_roi_bev.py \
     --frame video_dataset_bangkok/video_041_tagliato_2.avi \
     --homography homography_bangkok.npy \
-    --bev-unit homography_bangkok_bev_unit.txt \
+    --bev-unit-file homography_bangkok_bev_unit.txt \
     --output roi_bev.json
 
 # Modifica di una ROI esistente: la calibrazione di provenienza viene
@@ -104,7 +104,7 @@ stessa estrazione**: vedi `docs/extract_homography.md`.
 .venv/bin/python select_roi_bev.py \
     --frame video_dataset_bangkok/video_041_tagliato_2.avi \
     --homography homography_bangkok.npy \
-    --bev-unit homography_bangkok_bev_unit.txt \
+    --bev-unit-file homography_bangkok_bev_unit.txt \
     --output roi_bev.json
 
 # 3. Se la ROI va ritoccata: riaprire con --roi
@@ -121,13 +121,13 @@ stessa estrazione**: vedi `docs/extract_homography.md`.
 |---|---|---|
 | `--frame` | – | Video o immagine iniziale. Può anche essere caricata dalla UI. Se è un video, il percorso assoluto viene salvato nel JSON come `source_video`. |
 | `--homography` | – | File dell'omografia 3x3. Accettati `.npy` e `.txt` (3 righe di 3 valori). Se non viene dato e c'è una ROI, la calibrazione di provenienza viene ripristinata. |
-| `--bev-unit` | – | File di testo con la `bev_unit` (un solo numero). Stessa logica dell'omografia. |
+| `--bev-unit-file` | – | File di testo con la `bev_unit` (un solo numero). Stessa logica dell'omografia. |
 | `--roi` | – | ROI JSON da pre-caricare. Vengono caricati i vertici, la calibrazione di provenienza e la posizione della sorgente. |
 | `--output` | `roi_bev.json` | Nome suggerito per il file di output (mostrato nel dialog di salvataggio). |
 | `--frame-index` | `1` | Frame iniziale per i video, **1-based** (stessa base del JSON: 1 = primo frame). Con `--roi`, se non viene indicato un valore esplicito, l'app si posiziona sul frame di riferimento della ROI. |
 | `--port` | `8080` | Porta del server HTTP locale. |
 | `--no-browser` | – | Non aprire il browser automaticamente. |
-| `--keep-session-calibration` | – | Quando si pre-carica una ROI, **non** ripristinare la calibrazione di provenienza: si usa quella passata a `--homography`/`--bev-unit`. |
+| `--keep-session-calibration` | – | Quando si pre-carica una ROI, **non** ripristinare la calibrazione di provenienza: si usa quella passata a `--homography`/`--bev-unit-file`. |
 
 ---
 
@@ -252,7 +252,7 @@ Registra **da dove** è arrivata la calibrazione usata per il salvataggio:
 | Valore | Significato |
 |---|---|
 | `"roi"` | La componente è stata ripristinata dal file ROI in editing (è la calibrazione con cui la ROI era stata creata). |
-| `"session"` | La componente proviene dalla sessione corrente: caricata da `--homography`/`--bev-unit` o da drag & drop nella UI. |
+| `"session"` | La componente proviene dalla sessione corrente: caricata da `--homography`/`--bev-unit-file` o da drag & drop nella UI. |
 
 I due campi sono indipendenti: se l'utente sostituisce solo l'omografia,
 si avrà `{"homography": "session", "bev_unit": "roi"}`.

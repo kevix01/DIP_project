@@ -1007,7 +1007,7 @@ class V2Pipeline(rt.RealtimePipeline):
                         layout="side", caption="", label_min_h=26.0, src_fps=30.0,
                         title=(0.0, 0.0, 0.0, 0.0), total_frames=0, smooth_win=11,
                         track_high_conf=None, track_ocm_weight=0.25,
-                        bev_unit=None)
+                        bev_unit=None, homography_path=None)
 
     def __init__(self, pose_model, aux_model=None, **kw):
         cfg = dict(V2Pipeline.CONFIG)
@@ -1028,13 +1028,14 @@ class V2Pipeline(rt.RealtimePipeline):
         if configured_bev_unit is not None:
             configured_bev_unit = float(configured_bev_unit)
             if not np.isfinite(configured_bev_unit) or configured_bev_unit <= 1e-9:
-                raise ValueError("--bev-unit deve essere un numero finito maggiore di zero")
+                raise ValueError("bev_unit deve essere un numero finito maggiore di zero")
             self._bev_unit_locked = configured_bev_unit
         self.show_bev_ids = bool(cfg.get("show_bev_ids", False))
 
         # Carica l'omografia statica calibrata
+        homography_path = cfg.get("homography_path") or "homography_bangkok.npy"
         try:
-            self.static_H = np.load("homography_bangkok.npy").astype(np.float64)
+            self.static_H = np.load(homography_path).astype(np.float64)
             print("Omografia statica caricata con successo.")
             try:
                 self.static_H_inv = np.linalg.inv(self.static_H)
@@ -1043,7 +1044,7 @@ class V2Pipeline(rt.RealtimePipeline):
                 print("Non è stato possibile invertire la matrice di omografia." \
                 "Le infrazioni non verranno rilevate!!!")
         except Exception:
-            print("Errore: homography_bangkok.npy non trovato.")
+            print(f"Errore: {homography_path} non trovato.")
             sys.exit(1)
 
         # Inizializza il tracker OC-SORT in BEV e il Buffer Circolare Fixed-Lag
@@ -1760,6 +1761,24 @@ class V2Pipeline(rt.RealtimePipeline):
                     alpha=0.92)
 
 
+def load_bev_unit_file(path: str) -> float:
+    """Read the calibrated ``bev_unit`` from a text file.
+
+    The file holds a single number (extra whitespace/newlines are ignored).
+    """
+    from pathlib import Path as _Path
+    text = _Path(path).read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"file bev_unit vuoto: {path}")
+    try:
+        value = float(text.split()[0])
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"bev_unit non numerico in {path}: {text!r}") from exc
+    if not np.isfinite(value) or value <= 1e-9:
+        raise ValueError(f"bev_unit deve essere un numero finito maggiore di zero: {value}")
+    return value
+
+
 def build_v2_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--kp-vis", type=float, default=0.5,
@@ -1790,9 +1809,12 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="peso della direzione di moto; valori >=1 rifiutano anche "
                         "associazioni chiaramente controcorrente",
     )
-    p.add_argument("--bev-unit", type=float, default=None,
-                   help="bev_unit calibrato per la telecamera; evita la stima iniziale",
-    )
+    p.add_argument("--bev-unit-file", type=str, default=None,
+                   help="File .txt con il valore di bev_unit calibrato; evita la "
+                        "stima iniziale della scala BEV")
+    p.add_argument("--homography-file", type=str, default=None,
+                   help="File .npy con l'omografia statica calibrata (default: "
+                        "homography_bangkok.npy)")
     p.add_argument("--show-bev-ids", action="store_true",
                    help="mostra gli ID delle tracce al centro delle footprint BEV")
     p.add_argument("--roi-file", type=str, required=True,

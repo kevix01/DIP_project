@@ -261,8 +261,10 @@ class ViolationDetector:
                   lateral_pass_away: float = 0.05,
                    conflict_dlong: float = 0.2,
                    lateral_gate_factor: float = 1.20,
-                   clip_video: bool = True,
-                  clip_fourcc: str = "mp4v"):
+                    clip_video: bool = True,
+                   clip_fourcc: str = "mp4v",
+                   event_callback=None,
+                   output_dir: str = None):
         self.ttc_threshold = float(ttc_threshold)
         self.fps = float(fps) if fps and fps > 1e-6 else 30.0
 
@@ -279,6 +281,7 @@ class ViolationDetector:
         self.lateral_gate_radius = self.conflict_radius * float(lateral_gate_factor)
         self.bev_unit = float(bev_unit) if bev_unit and bev_unit > 1e-9 else 1.0
         self.save_files = bool(save_files)
+        self.event_callback = event_callback
         self.confirm_frames = max(1, int(confirm_frames))
         self.intent_retreat_cos = float(intent_retreat_cos)
 
@@ -313,7 +316,10 @@ class ViolationDetector:
 
         # Setup cartella di output
         v_name = os.path.splitext(os.path.basename(video_name))[0]
-        self.out_dir = os.path.join("violations_" + v_name)
+        if output_dir:
+            self.out_dir = os.path.abspath(output_dir)
+        else:
+            self.out_dir = os.path.join("violations_" + v_name)
         if self.save_files:
             os.makedirs(self.out_dir, exist_ok=True)
 
@@ -767,6 +773,28 @@ class ViolationDetector:
 
         print(f"\n🚨 INFRAZIONE: Veicolo {veh.id} vs Pedone {ped.id} (TTC: {ttc:.2f}s) a {ts_str} (frame {frame_idx})")
 
+        if self.event_callback is not None:
+            self._emit_event({
+                "type": "violation",
+                "vehicle_id": int(veh.id),
+                "pedestrian_id": int(ped.id),
+                "ttc_seconds": round(float(ttc), 3),
+                "frame_idx": int(frame_idx),
+                "timestamp": ts_str,
+                "json_path": json_path if self.save_files else None,
+                "clip_path": os.path.join(self.out_dir, clip_name) if (self.save_files and self.clip_video) else None,
+                "data": data,
+            })
+
+    def _emit_event(self, event: dict):
+        cb = self.event_callback
+        if cb is None:
+            return
+        try:
+            cb(event)
+        except Exception:
+            pass
+
     def close_all(self, reason: str = "end_of_stream"):
         """Chiude tutte le infrazioni ancora attive (rilascia i writer delle clip)."""
         for veh_id in list(self.active_violations.keys()):
@@ -797,3 +825,13 @@ class ViolationDetector:
                 json.dump(data, f, indent=4)
 
         print(f"\n✅ INFRAZIONE CHIUSA: Veicolo {veh_id} al frame {frame_idx} (Motivo: {reason})")
+
+        if self.event_callback is not None:
+            self._emit_event({
+                "type": "violation_closed",
+                "vehicle_id": int(veh_id),
+                "frame_idx": int(frame_idx),
+                "reason": str(reason),
+                "json_path": state.get('json_path') if self.save_files else None,
+                "clip_path": os.path.join(self.out_dir, data['clip'].get('file')) if data['clip'].get('file') else None,
+            })
