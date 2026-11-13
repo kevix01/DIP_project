@@ -14,25 +14,83 @@ entry point; `bev_realtime_v2.py` / `bev_realtime.py` are libraries it drives.
 python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
     --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 \
     --smooth 11 --device cuda:0 --output out.mp4 \
-    --bev-unit-file homography_bangkok_bev_unit.txt --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
+    --homography-file homography_bangkok.npy \
+    --bev-unit-file homography_bangkok_bev_unit.txt --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 4
 ```
+
+`debug_violations.py` unisce due parser: quello della pipeline (`bev_realtime.py`) e
+quello v2 (`bev_realtime_v2.py`). Le tabelle seguenti elencano **tutte** le flag
+accettate, con il default effettivo.
+
+#### Flag della pipeline base
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--input PATH\|DIR\|N` | obbligatorio | video path, image directory, or webcam index |
+| `--kp-model PATH` | obbligatorio | checkpoint pose (Ultralytics YOLO) |
+| `--kp-imgsz N` | 640 | inference size |
+| `--kp-conf F` | 0.25 | minimum detection confidence |
+| `--homography ortho\|adam\|none` | ortho | BEV solver ('adam' è alias CLI del solver ortogonale veloce) |
+| `--device DEV` | cpu | device di inferenza (`cuda:0`, `cpu`, …) |
+| `--export none\|engine\|tensorrt\|onnx` | none | esporta il checkpoint a TensorRT/ONNX e lo ricarica |
+| `--half` | off | FP16 per l'engine esportato |
+| `--ground-indices 0,1,2,3` | auto | indici keypoint a terra forzati (altrimenti votati) |
+| `--no-3d` | off | disegna solo i quadrilateri a terra, senza cuboidi |
+| `--no-snap-rect` | off | mostra le footprint BEV grezze, non rettangularizzate |
+| `--no-trails` | off | disabilita le scie di movimento in BEV |
+| `--trail-len N` | 16 | frame di scia BEV mantenuti |
+| `--no-stabilize` | off | risolve l'omografia BEV per frame invece che sul buffer rolling |
+| `--bev-window N` | 512 | dimensione del buffer rolling (footprint) per un asse BEV stabile |
+| `--no-fov` | off | non disegna il campo visivo della telecamera nella BEV |
+| `--max-age N` | 30 | frame persi tollerati prima di considerare una traccia persa |
+| `--min-hits N` | 2 | hit minimi per considerare una traccia confermata |
+| `--smooth N` | 0 | finestra di smoothing offline zero-phase (0 = off, streaming live); si consiglia un numero dispari (es. 11) |
+| `--output PATH` | nessuno | scrive il video completo annotato |
+| `--display` | off | mostra una finestra live |
+| `--max-frames N` | 0 | limite di frame; 0 = tutti |
+
+#### Flag v2 (pipeline e rendering)
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--kp-vis F` | 0.5 | min per-corner cuboid confidence (3rd keypoint channel) to draw a cuboid; below it the object is tracked box-only |
 | `--class-conf 'id:conf,...'` | none | per-class minimum confidence, COCO ids (`0:0.4,1:0.5,3:0.5` keeps traffic lights from becoming bikes) |
-| `--layout side|dashboard` | side | `side`: camera and BEV side by side; `dashboard`: 16:9 composite with info strip (landscape sources) |
+| `--layout side\|dashboard` | side | `side`: camera and BEV side by side; `dashboard`: 16:9 composite with info strip (landscape sources) |
 | `--bev-canvas WxH` | source size | BEV panel size (dashboard: 640x1080) |
 | `--caption TEXT` | | scene caption in the UI; the static/moving camera tag is appended automatically |
 | `--title s,in,hold,out` | | opening titles over this clip, timings in source seconds |
 | `--object-px PX` | 40 | BEV zoom: fixed px per median footprint |
 | `--label-min-h PX` | 26 | no id chip on boxes shorter than this; the cuboid is still drawn |
-| `--fps F` | from source | frame rate the intent/timeout thresholds assume (in seconds) |
-| `--source-type auto|video|stream` | auto | input kind |
-| `--track-high-conf F` | | high-confidence track gate |
-| `--track-ocm-weight F` | | OCM weight in the tracker |
-| `--bev-unit-file PATH` | | text file holding the bev_unit (meters per BEV pixel) |
+| `--fps F` / `--refine-fps F` | 0 (da sorgente) | frame rate the intent/timeout thresholds assume (in seconds) |
+| `--source-type auto\|video\|stream` | auto | input kind |
+| `--track-high-conf F` | `max(--kp-conf, 0.35)` | high-confidence track gate |
+| `--track-ocm-weight F` | 0.25 | OCM weight in the tracker |
 | `--show-bev-ids` | off | draw track ids on the BEV radar |
+| `--homography-file PATH` | `homography_bangkok.npy` | file `.npy` con l'omografia statica calibrata |
+| `--bev-unit-file PATH` | nessuno (stima automatica) | file `.txt` con la `bev_unit` calibrata (metri per pixel BEV) |
+
+#### Flag del rilevatore di infrazioni
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--roi-file PATH` | obbligatorio | JSON con i punti BEV (`bev_points`) e immagine (`image_points`) della zona strisce |
+| `--ttc-thresh S` | 2.5 | soglia TTC (secondi) per considerare il conflitto un'infrazione |
+| `--confirm-frames N` | 4 | frame consecutivi di conflitto TTC richiesti per confermare l'infrazione |
+| `--clip-track-timeout-s S` | 1.5 | secondi di registrazione della clip **dopo** la perdita del tracking del veicolo; la clip continua anche senza il veicolo tracciato |
+| `--clip-absolute-timeout-s S` | 3.0 | durata massima (secondi) della clip di un'infrazione |
+| `--no-clip` | off | non genera il mini filmato: salva solo il JSON |
+
+#### Flag specifiche del debug
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--table-height PX` | 280 | altezza in pixel della tabella TTC in basso |
+| `--no-save-violations` | off | disabilita il salvataggio su disco di JSON e clip |
+
+**Abbreviazioni disabilitate**: i parser usano `allow_abbrev=False`. Il flag accettato
+per la scala BEV è **solo `--bev-unit-file`** (file di testo con la `bev_unit`);
+`--bev-unit` e `--bev-un` vengono rifiutati con un errore argparse.
+
 
 Recommended on aerial footage: `--kp-imgsz 960` (or 1280). The models are trained at 640; a
 larger input recovers far and small traffic and the cuboids stay tight.
@@ -83,7 +141,7 @@ Quando si passa `--roi-file roi_bev.json`, la pipeline valuta i conflitti veicol
 
 ```bash
 python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
-    --device cuda:0 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6 \
+    --device cuda:0 --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 4 \
     --output out.mp4
 ```
 
@@ -91,10 +149,14 @@ python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidete
 |---|---|---|
 | `--roi-file PATH` | required | JSON con i punti BEV (`bev_points`) e immagine (`image_points`) della zona strisce |
 | `--ttc-thresh S` | 2.5 | soglia TTC (secondi) per considerare il conflitto un'infrazione |
-| `--confirm-frames N` | 3 | frame consecutivi di conflitto richiesti per confermare l'infrazione |
+| `--confirm-frames N` | 4 | frame consecutivi di conflitto richiesti per confermare l'infrazione |
 | `--clip-track-timeout-s S` | 1.5 | secondi di registrazione della clip **dopo** la perdita del tracking del veicolo; la clip continua anche senza il veicolo tracciato |
 | `--clip-absolute-timeout-s S` | 3.0 | durata massima (secondi) della clip di un'infrazione |
 | `--no-clip` | off | non genera il mini filmato: salva solo il JSON |
+
+**Flag con abbreviazione disabilitata**: i parser di `debug_violations.py` usano
+`allow_abbrev=False`. Il flag accettato è **solo `--bev-unit-file`** (file di testo
+con la `bev_unit`); `--bev-unit` e `--bev-un` vengono rifiutati con un errore argparse.
 
 **La clip** (`violation_v<veicolo>_t<MMmSSsMMMms>.mp4`; per video di almeno
 un'ora il minutaggio è preceduto da `HHh`) viene scritta in streaming durante
@@ -121,21 +183,11 @@ frame e motivo di chiusura.
 
 These two modules are libraries, not standalone entry points: they expose the
 argparse fragments used by `debug_violations.py` (`build_argparser()` and
-`build_v2_argparser()`) and the pipeline/rendering classes it drives.
-
-```
---input PATH|DIR|N          video path, image directory or webcam index
---kp-model PATH             checkpoint
---kp-imgsz N  --kp-conf F   inference size and confidence
---homography ortho|adam|none   BEV solver
---device DEV  --export none|engine|tensorrt|onnx  --half
---ground-indices 0,1,2,3    force the ground keypoint indices (auto-detected by vote otherwise)
---no-3d  --no-snap-rect  --no-trails  --trail-len N  --no-fov
---no-stabilize  --bev-window N     homography smoothing / rolling footprint buffer
---max-age N  --min-hits N     tracker
---smooth N   offline zero-phase smoothing of every track and the homography (odd N, e.g. 11; 0 = live)
---output PATH  --display  --max-frames N
-```
+`build_v2_argparser()`) and the pipeline/rendering classes it drives. The full
+flag tables with defaults are in the "Flag della pipeline base" and "Flag v2"
+sections above; the v2 fragment adds `--roi-file`, `--ttc-thresh`,
+`--confirm-frames`, `--clip-track-timeout-s`, `--clip-absolute-timeout-s`,
+`--no-clip`, `--homography-file` and `--bev-unit-file` to the base ones.
 
 ## ROI / homography tools
 
@@ -172,6 +224,65 @@ di installare. Verificate la build con
 .venv/bin/python webapp/run_server.py --stop       # ferma il server (pidfile)
 ```
 
-Il launcher usa l'interprete della venv del progetto (`.venv/bin/python` o
-`.venv/Scripts/python.exe`) e avvia uvicorn in background; i processi figli
-(export, omografia, selettore ROI) usano la stessa venv.
+Il launcher usa l'interprete con cui è stato invocato: se la webapp viene avviata
+da dentro un ambiente virtuale (qualsiasi venv: `.venv`, `venv`, `env`, conda),
+server, export, calibrazione, selettore ROI e debug live usano **quella** venv.
+La cartella `.venv` del progetto è usata solo come fallback quando il comando
+viene lanciato con l'interprete di sistema. I processi figli (export, omografia,
+selettore ROI) usano lo stesso interprete; il debug live gira in-process.
+
+### Dove la webapp salva i file
+
+Ogni sessione di debug crea una cartella sotto `.webapp/sessions/{session_id}/`
+(configurabile con `DIP_WEB_WORKDIR`):
+
+| Output | Percorso | Abilitato da |
+|---|---|---|
+| JSON infrazioni | `.webapp/sessions/{session_id}/violations/violation_v<veicolo>_t<MMmSSsMMMms>.json` | "salva JSON + clip video infrazioni" |
+| clip video infrazioni | `.webapp/sessions/{session_id}/violations/violation_v<veicolo>_t<MMmSSsMMMms>.mp4` | "salva JSON + clip video infrazioni" |
+| video annotato | `.webapp/sessions/{session_id}/annotated.mp4` | "salva video annotato" |
+
+Nella tab **4 · Debug** il pannello "File salvati in (sessione corrente)" mostra
+questi percorsi in tempo reale: le voci disattivate sono marcate "(non attivo)".
+
+### Parametri della sessione debug (API `POST /api/debug/sessions`)
+
+La tab Debug invia questi campi JSON all'endpoint; i valori indicati sono i
+default applicati dal server (`webapp/main.py`) e dal `DebugConfig`
+(`webapp/debug_runner.py`).
+
+| Campo | Default | Meaning |
+|---|---|---|
+| `input_path` | obbligatorio | video/stream da elaborare |
+| `engine_path` | `DIP_WEB_ENGINE` / `config.DEFAULT_ENGINE` | checkpoint pose |
+| `roi_path` | obbligatorio | JSON della ROI |
+| `homography_path` | `DIP_WEB_HOMOGRAPHY` / `config.DEFAULT_HOMOGRAPHY` | file `.npy` dell'omografia statica calibrata |
+| `bev_unit_file` | `null` (la UI precompila `DIP_WEB_BEV_UNIT` / `config.DEFAULT_BEV_UNIT_FILE`) | file `.txt` con la `bev_unit` calibrata |
+| `device` | `DIP_WEB_DEVICE` / `config.DEFAULT_DEVICE` | device di inferenza |
+| `source_type` | `auto` | `auto`, `video` o `stream` |
+| `kp_imgsz` | 640 | dimensione di inferenza |
+| `kp_conf` | 0.1 | confidenza minima del detector |
+| `kp_vis` | 0.6 | confidenza per-cuboide |
+| `class_conf` | `0:0.4,1:0.5,3:0.5` | soglie per classe COCO |
+| `object_px` | 80 | zoom BEV (px per footprint mediana) |
+| `smooth` | 11 | finestra di smoothing offline (0 = live) |
+| `track_ocm_weight` | 2.0 | peso della direzione nel tracker |
+| `track_high_conf` | 0.45 | soglia per avviare una nuova traccia |
+| `ttc_thresh` | 2.5 | soglia TTC (secondi) |
+| `confirm_frames` | 4 | frame consecutivi di conflitto TTC per confermare l'infrazione |
+| `table_height` | 280 | altezza in px della tabella TTC |
+| `max_frames` | 0 | limite di frame; 0 = tutti |
+| `save_violations` | true | salva JSON + clip delle infrazioni |
+| `no_clip` | false | se true, salva solo il JSON (senza clip) |
+| `save_video` | false | salva il video completo annotato |
+| `no_3d`, `no_snap_rect`, `no_trails`, `no_fov` | false | disattivano cuboidi, rettangularizzazione, scie BEV e campo visivo |
+| `ground_indices` | `null` | indici keypoint a terra forzati (es. `0,1,2,3`) |
+| `label_min_h` | 26 | altezza minima (px) per mostrare l'id chip |
+| `bev_canvas` | `null` | dimensione pannello BEV `WxH` (default: dimensione sorgente) |
+| `caption` | `""` | didascalia della scena |
+
+Endpoint di lettura: `GET /api/debug/sessions` (elenco), `GET /api/debug/sessions/{id}`
+(stato), `GET /api/debug/sessions/{id}/violations` (eventi con `json_path_url` e
+`clip_path_url`), `GET /api/debug/outputs` (percorsi della sessione corrente) e
+`GET /api/files/{name}` (download dei file prodotti).
+

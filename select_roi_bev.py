@@ -92,7 +92,8 @@ input[type=number] {
 input[type=range] { width: 100%; accent-color: #0e639c; }
 .status-msg {
   font-size: 12px; padding: 7px 9px; border-radius: 4px; min-height: 20px;
-  word-break: break-word;
+  word-break: break-word; overflow-wrap: anywhere; white-space: pre-wrap;
+  max-width: 100%; line-height: 1.5;
 }
 .status-msg:empty { padding: 0; min-height: 0; }
 .status-msg.ok { background: #143a14; color: #7f7; }
@@ -100,8 +101,9 @@ input[type=range] { width: 100%; accent-color: #0e639c; }
 .status-msg.info { background: #14223a; color: #7cf; }
 .bev-info {
   font-size: 11px; color: #ccc; background: #1a1a1a; padding: 8px;
-  border-radius: 4px; max-height: 140px; overflow-y: auto;
+  border-radius: 4px; max-height: 140px; overflow-y: auto; overflow-x: hidden;
   font-family: 'SF Mono', Consolas, 'Liberation Mono', monospace;
+  overflow-wrap: anywhere; word-break: break-word;
 }
 .bev-info::-webkit-scrollbar { width: 6px; }
 .bev-info::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 3px; }
@@ -1469,6 +1471,14 @@ def build_arg_parser():
     return ap
 
 
+def _path_exists(path):
+    try:
+        return Path(path).exists()
+    except (OSError, ValueError) as exc:
+        print(f'[warn] percorso non utilizzabile: {path} ({exc})')
+        return False
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     base_path = (args.base_path or '').rstrip('/')
@@ -1486,7 +1496,7 @@ def main(argv=None):
     }
 
     # omografia (opzionale)
-    if args.homography and Path(args.homography).exists():
+    if args.homography and _path_exists(args.homography):
         try:
             H = load_homography_from_bytes(Path(args.homography).read_bytes(), args.homography)
             if H.shape == (3, 3):
@@ -1500,7 +1510,7 @@ def main(argv=None):
             print(f'[warn] omografia non caricata: {e}')
 
     # bev_unit (opzionale)
-    if args.bev_unit_file and Path(args.bev_unit_file).exists():
+    if args.bev_unit_file and _path_exists(args.bev_unit_file):
         try:
             val = float(Path(args.bev_unit_file).read_text().strip())
             ROIHandler.bev_unit = val
@@ -1513,7 +1523,7 @@ def main(argv=None):
             print(f'[warn] bev_unit non caricato: {e}')
 
     # sorgente (opzionale)
-    if args.frame and Path(args.frame).exists():
+    if args.frame and _path_exists(args.frame):
         try:
             info = probe_source(args.frame)
             if info['is_video']:
@@ -1546,7 +1556,7 @@ def main(argv=None):
             print(f'[warn] sorgente non caricata: {e}')
 
     # ROI esistente (opzionale)
-    if args.roi and Path(args.roi).exists():
+    if args.roi and _path_exists(args.roi):
         try:
             data = json.loads(Path(args.roi).read_text(encoding='utf-8'))
             pts = data.get('image_points', [])

@@ -21,6 +21,15 @@ PROJECT_ROOT = HERE.parent
 
 
 def _venv_python() -> str:
+    """Interpreter to use for this process and for its children.
+
+    If the current interpreter already runs inside a virtual environment, it is
+    used as-is, so the whole webapp (server, export, calibration, ROI selector,
+    in-process debug) stays on a single environment. The project-local ``.venv``
+    is used only as a fallback when the current interpreter is the system one.
+    """
+    if sys.prefix != sys.base_prefix:
+        return sys.executable
     for rel in (Path(".venv") / "Scripts" / "python.exe",
                 Path(".venv") / "bin" / "python"):
         candidate = PROJECT_ROOT / rel

@@ -248,7 +248,7 @@ class ViolationDetector:
                  clip_track_timeout_s: float = 1.5,
                  clip_absolute_timeout_s: float = 3.0,
                  conflict_radius: float = 1.1, save_files: bool = True,
-                 fps: float = 30.0, confirm_frames: int = 3,
+                 fps: float = 30.0, confirm_frames: int = 4,
                  intent_long_s: float = 1.2, intent_short_s: float = 0.5,
                  intent_moving_speed: float = 0.25,
                  intent_stopped_speed: float = 0.08,

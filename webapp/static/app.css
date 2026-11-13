@@ -98,6 +98,40 @@ label.chk {
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
 
+/* status messages: wrap long paths inside their container */
+.status {
+  display: block; width: 100%; min-width: 0;
+  margin-top: var(--sp-1); line-height: 1.5;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.status.ok { color: var(--good); }
+.status.bad { color: var(--bad); }
+.status.run { color: var(--accent); }
+.status.warn { color: var(--warn); }
+
+/* free-text info blocks (paths, error details) must stay inside the card */
+#roi-status, #roi-source-info, #roi-cal-info, #roi-bev-info, #ex-artifacts {
+  overflow-wrap: anywhere; word-break: break-word;
+}
+#roi-status { white-space: pre-wrap; font-size: 11px; }
+.outputs {
+  margin-top: var(--sp-3); padding: var(--sp-2) var(--sp-3);
+  background: var(--card-soft); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); line-height: 1.6;
+}
+.outputs:empty { display: none; }
+.outputs .out-row { display: flex; flex-direction: column; gap: 1px; }
+.outputs .out-label { color: var(--text); font-size: 11px; }
+.outputs .out-path {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 10px;
+  color: var(--muted); overflow-wrap: anywhere; word-break: break-all;
+}
+.outputs .out-off { opacity: .45; }
+#healthInfo { overflow-wrap: anywhere; word-break: break-word; min-width: 0; }
+.brand { flex-wrap: wrap; }
+#ex-artifacts .item { flex-wrap: wrap; }
+#ex-artifacts .item .growx { overflow: visible; text-overflow: clip; white-space: normal; word-break: break-word; }
+
 /* ---------------- inputs ---------------- */
 input[type=text], input[type=number], select, input[type=file] {
   width: 100%; margin-top: var(--sp-1); background: #171a20; color: var(--text);
@@ -122,6 +156,7 @@ select { cursor: pointer; }
   margin-top: var(--sp-4);
 }
 .actions > .muted { font-size: 11px; margin-left: var(--sp-1); }
+.actions > .status { flex: 1 1 100%; margin-left: 0; }
 
 button, .btn {
   background: #303645; color: var(--text); border: 1px solid var(--line);
@@ -143,10 +178,11 @@ button:disabled:hover { border-color: var(--line); }
   background: #12141a; border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: var(--sp-3); margin-top: var(--sp-3); max-height: 300px; overflow: auto;
   font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px;
-  line-height: 1.55; white-space: pre-wrap; word-break: break-word; color: #a9b2c3;
+  line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  overflow-wrap: anywhere; max-width: 100%; color: #a9b2c3;
 }
 .log:empty { display: none; }
-.list { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 340px; overflow: auto; }
+.list { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 340px; overflow: auto; overflow-wrap: anywhere; word-break: break-word; }
 .list .item {
   background: var(--card-soft); border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 8px 10px; font-size: 11px; display: flex; gap: var(--sp-2); align-items: center;

@@ -70,7 +70,15 @@ svg { width: 64px; height: 48px; fill: none; stroke: #4a5164; stroke-width: 2; }
 # helpers
 # --------------------------------------------------------------------------- #
 def _venv_python() -> str:
-    """Return the interpreter of the project venv, on POSIX and Windows."""
+    """Interpreter used for the child processes started by the webapp.
+
+    The current interpreter is kept when it already runs inside a virtual
+    environment, so server, export, calibration and ROI selector all share the
+    same environment. The project-local ``.venv`` is only a fallback for the
+    case where the webapp is started with the system interpreter.
+    """
+    if sys.prefix != sys.base_prefix:
+        return sys.executable
     for rel in (Path(".venv") / "Scripts" / "python.exe",
                 Path(".venv") / "bin" / "python"):
         candidate = PROJECT_ROOT / rel
@@ -153,6 +161,38 @@ def health() -> Dict[str, Any]:
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+
+
+@app.get("/api/debug/outputs")
+def debug_outputs() -> Dict[str, Any]:
+    """Describe where the debug session writes JSON, clips and the annotated video."""
+    session_root = config.SESSION_DIR
+    return {
+        "session_root": str(session_root),
+        "violations_dir": str(session_root / "<session_id>" / "violations"),
+        "violations_dir_template": str(session_root / "{session_id}" / "violations"),
+        "annotated_video": str(session_root / "{session_id}" / "annotated.mp4"),
+        "outputs": [
+            {
+                "key": "json",
+                "label": "JSON infrazioni",
+                "path": str(session_root / "{session_id}" / "violations" / "violation_v<veicolo>_t<MMmSSsMMMms>.json"),
+                "enabled_by": "save_violations",
+            },
+            {
+                "key": "clip",
+                "label": "clip video infrazioni",
+                "path": str(session_root / "{session_id}" / "violations" / "violation_v<veicolo>_t<MMmSSsMMMms>.mp4"),
+                "enabled_by": "save_violations",
+            },
+            {
+                "key": "video",
+                "label": "video annotato",
+                "path": str(session_root / "{session_id}" / "annotated.mp4"),
+                "enabled_by": "save_video",
+            },
+        ],
+    }
 
 
 @app.get("/api/files/{name}")
@@ -253,44 +293,50 @@ def get_engine_job(job_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/engine/artifacts")
-def list_artifacts() -> List[Dict[str, Any]]:
+def list_artifacts(weights: Optional[str] = None) -> List[Dict[str, Any]]:
     out = []
-    ckpt = PROJECT_ROOT / "checkpoints"
-    if ckpt.exists():
-        for p in sorted(ckpt.glob("*.engine")):
-            out.append({
-                "name": p.name,
-                "path": str(p),
-                "size": p.stat().st_size,
-                "mtime": p.stat().st_mtime,
-                "kind": "engine",
-            })
-        for p in sorted(ckpt.glob("*.onnx")):
-            out.append({
-                "name": p.name,
-                "path": str(p),
-                "size": p.stat().st_size,
-                "mtime": p.stat().st_mtime,
-                "kind": "onnx",
-            })
-    for p in sorted(config.ARTIFACT_DIR.glob("*.engine")):
-        out.append({
-            "name": p.name, "path": str(p), "size": p.stat().st_size,
-            "mtime": p.stat().st_mtime, "kind": "engine",
-        })
-    for p in sorted(config.ARTIFACT_DIR.glob("*.onnx")):
-        out.append({
-            "name": p.name, "path": str(p), "size": p.stat().st_size,
-            "mtime": p.stat().st_mtime, "kind": "onnx",
-        })
-    weights = Path(config.DEFAULT_WEIGHTS).parent
-    if weights.exists() and weights.resolve() != ckpt.resolve():
+    seen = set()
+
+    def collect(folder: Optional[Path]) -> None:
+        if folder is None or not folder.exists():
+            return
+        try:
+            resolved = folder.resolve()
+        except OSError:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
         for kind, pattern in (("engine", "*.engine"), ("onnx", "*.onnx")):
-            for p in sorted(weights.glob(pattern)):
+            for p in folder.glob(pattern):
+                try:
+                    stat = p.stat()
+                except OSError:
+                    continue
                 out.append({
-                    "name": p.name, "path": str(p), "size": p.stat().st_size,
-                    "mtime": p.stat().st_mtime, "kind": kind,
+                    "name": p.name,
+                    "path": str(p),
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "kind": kind,
                 })
+
+    ckpt = PROJECT_ROOT / "checkpoints"
+    collect(ckpt)
+    collect(config.ARTIFACT_DIR)
+    collect(Path(config.DEFAULT_WEIGHTS).parent)
+    # The export writes next to the checkpoint it was given: include the folder
+    # of the weights currently requested by the UI, so a newly exported engine
+    # shows up immediately even when it lives outside the project tree.
+    if weights:
+        collect(Path(weights).parent)
+    for job in jobs.list("engine_export"):
+        result = job.result or {}
+        artifact = result.get("artifact")
+        if artifact:
+            collect(Path(artifact).parent)
+
+    out.sort(key=lambda it: it["mtime"], reverse=True)
     return out
 
 
@@ -588,10 +634,10 @@ async def create_session(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             track_ocm_weight=float(payload.get("track_ocm_weight", 2.0)),
             track_high_conf=float(payload.get("track_high_conf", 0.45)),
             ttc_thresh=float(payload.get("ttc_thresh", 2.5)),
-            confirm_frames=int(payload.get("confirm_frames", 6)),
+            confirm_frames=int(payload.get("confirm_frames", 4)),
             table_height=int(payload.get("table_height", 280)),
             max_frames=int(payload.get("max_frames", 0)),
-            no_clip=bool(payload.get("no_clip", True)),
+            no_clip=bool(payload.get("no_clip", False)),
             save_violations=bool(payload.get("save_violations", True)),
             save_video=bool(payload.get("save_video", False)),
             no_3d=bool(payload.get("no_3d", False)),

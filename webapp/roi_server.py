@@ -35,7 +35,15 @@ def _free_port() -> int:
 
 
 def _venv_python() -> str:
-    """Interpreter of the project venv, on POSIX and Windows."""
+    """Interpreter used to start the embedded ROI selector.
+
+    Keeps the current interpreter when it already runs inside a virtual
+    environment, so the selector shares the same environment as the webapp.
+    The project-local ``.venv`` is only a fallback when the webapp runs with
+    the system interpreter.
+    """
+    if sys.prefix != sys.base_prefix:
+        return sys.executable
     for rel in (Path(".venv") / "Scripts" / "python.exe",
                 Path(".venv") / "bin" / "python"):
         candidate = PROJECT_ROOT / rel

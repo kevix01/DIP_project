@@ -1,5 +1,5 @@
 # Core runtime
-ultralytics>=8.4.61   # v2 checkpoints need the YOLO26 Pose26 head; 8.4.61 is the tested version
+ultralytics==8.4.138
 # PyTorch con build CUDA: cambiare la versione di CUDA nel --extra-index-url se si usa
 # una CUDA diversa (es. cu128, cu130) e scegliere la build corretta per il proprio OS.
 --extra-index-url https://download.pytorch.org/whl/cu126
@@ -21,8 +21,6 @@ fastapi>=0.110
 uvicorn>=0.27
 python-multipart>=0.0.9
 websockets>=12.0
-# ffmpeg with libx264 must be on PATH for bev_realtime_v2.py --output and the reel builder
-# Optional, for --export tensorrt/onnx. TensorRT must be 10.x: 11.x removed BuilderFlag.FP16.
-# tensorrt>=10,<11
-# onnx
-# onnxruntime-gpu
+tensorrt==11.2.1.2
+onnx==1.21.0
+onnxruntime-gpu==1.22.0

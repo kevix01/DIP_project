@@ -52,6 +52,11 @@ Legge un video e inferisce le pose dei veicoli con un checkpoint YOLO pose. Filt
 | **--imgsz** | 640 | Dimensione d’inferenza. |
 | **--device** | cuda:0 | Dispositivo, ad esempio cuda:0 o cpu. |
 | **--max-frames** | 1500 | Numero massimo di frame; 0 analizza tutto il video. |
+| **--roi-file** | roi_bev.json | ROI JSON usata come riferimento diagnostico di coerenza; se assente il check viene saltato. |
+| **--refine-iters** | 5 | Iterazioni di raffinamento rigido per-traccia; 0 disabilita il refinement. |
+| **--rigid-pct** | 65 | Percentile del residuo di forma rigida sotto il quale un’osservazione viene conservata. |
+| **--reproject-roi** | disattivato | Ricalcola i `bev_points` di `--roi-file` con la nuova calibrazione e li scrive in `--roi-out`. |
+| **--roi-out** | = `--roi-file` | File di output della ROI ri-proiettata. |
 | **--no-robust** | disattivato | Disattiva la pesatura robusta degli outlier; usarlo solo per confronto diagnostico. |
 
 ### select_roi_bev.py
@@ -72,8 +77,10 @@ Avvia un’interfaccia web locale nel browser. L’utente carica o indica un’i
 | **--frame-index** | 1 | Frame iniziale del video, indice a partire da 1. |
 | **--port** | 8080 | Porta dell’interfaccia locale (127.0.0.1). |
 | **--no-browser** | disattivato | Avvia il server senza aprire automaticamente il browser. |
-| **--reset-calibration-from-roi** | disattivato | Opzione dichiarata dal parser; nella versione corrente il ripristino della calibrazione della ROI è già il comportamento predefinito. |
+| **--reset-calibration-from-roi** | disattivato | Flag legacy attualmente senza effetto: il ripristino della calibrazione di provenienza della ROI è già il comportamento predefinito ed è controllato da `--keep-session-calibration`. |
 | **--keep-session-calibration** | disattivato | Mantiene la calibrazione fornita nella sessione invece di ripristinare quella registrata nella ROI. |
+| **--save-path** | nessuno | Percorso esatto del JSON scritto dal server a `/save-roi`; usato dalla webapp. |
+| **--base-path** | vuoto | Prefisso delle rotte HTTP del selettore (la webapp usa `/roi/app`). |
 
 ### violation_detector.py
 
@@ -85,7 +92,7 @@ La ROI JSON deve contenere image_points e bev_points (almeno tre punti per ciasc
 |---|---:|---|
 | **--roi-file** | obbligatorio | JSON della ROI da analizzare. |
 | **--ttc-thresh** | 2.5 secondi | Soglia TTC di conferma del conflitto. |
-| **--confirm-frames** | 3 | Frame consecutivi richiesti per confermare l’evento. |
+| **--confirm-frames** | 4 | Frame consecutivi richiesti per confermare l’evento. |
 | **--clip-track-timeout-s** | 1.5 secondi | Attesa massima dopo la perdita del tracking del veicolo. |
 | **--clip-absolute-timeout-s** | 3.0 secondi | Durata massima assoluta della clip dell’evento. |
 | **--no-clip** | disattivato | Non scrive il filmato del singolo evento, ma mantiene il JSON. |
@@ -137,8 +144,18 @@ Oltre a queste due opzioni, lo script accetta le opzioni della pipeline base e q
 | **--source-type** | auto; selezionare video o stream per forzare il tipo. |
 | **--track-high-conf**, **--track-ocm-weight** | Se omesso, soglia `max(--kp-conf, 0.35)`; peso direzione tracker 0.25. |
 | **--fps** / **--refine-fps** | 0: letta dai metadati della sorgente. |
-| **--homography-file** | nessuno: default `homography_bangkok.npy`. |
+| **--homography-file** | nessuno: default `homography_bangkok.npy`. File `.npy` con l’omografia statica calibrata. |
 | **--bev-unit-file** | nessuno (default automatico): file .txt con la bev_unit della calibrazione della ROI. |
+| **--roi-file** | obbligatorio: JSON con i punti immagine/BEV della ROI da analizzare. |
+| **--ttc-thresh** | 2.5 secondi: soglia TTC per considerare il conflitto un’infrazione. |
+| **--confirm-frames** | 4: frame consecutivi di conflitto TTC richiesti per confermare l’infrazione. |
+| **--clip-track-timeout-s** | 1.5 secondi: attesa di registrazione della clip dopo la perdita del tracking del veicolo. |
+| **--clip-absolute-timeout-s** | 3.0 secondi: durata massima assoluta della clip di un’infrazione. |
+| **--no-clip** | disattivato: non genera il mini filmato dell’infrazione, salva solo il JSON. |
+
+Le flag `--bev-unit` e `--bev-un` **non esistono**: i parser usano `allow_abbrev=False`,
+quindi l’unico flag accettato per la scala BEV è **`--bev-unit-file`** (file di testo
+con un solo numero).
 
 Le opzioni principali effettive per il rilevamento nel debug sono input, checkpoint, ROI, bev_unit, soglia TTC e conferma frame, oltre ai controlli di visualizzazione esplicitamente applicati.
 
@@ -158,7 +175,8 @@ Le opzioni principali effettive per il rilevamento nel debug sono input, checkpo
 | **--device** | cpu | Dispositivo per l’inferenza, per esempio cpu o cuda:0. |
 | **--kp-imgsz**, **--kp-conf** | 640, 0.25 | Dimensione d’inferenza e confidenza minima del modello. |
 | **--bev-unit-file** | automatica | File .txt con la scala BEV; usare quello prodotto insieme alla ROI. |
-| **--ttc-thresh**, **--confirm-frames** | 2.5 s, 3 | Soglia TTC e numero di frame consecutivi necessari a confermare una violazione. |
+| **--homography-file** | `homography_bangkok.npy` | File `.npy` con l’omografia statica calibrata. |
+| **--ttc-thresh**, **--confirm-frames** | 2.5 s, 4 | Soglia TTC e numero di frame consecutivi necessari a confermare una violazione. |
 | **--clip-track-timeout-s**, **--clip-absolute-timeout-s** | 1.5 s, 3.0 s | Tempi di chiusura della clip dopo la perdita del track e durata massima dell’evento. |
 | **--no-clip** | disattivato | Non salva le clip dei singoli eventi; i JSON vengono comunque salvati. |
 | **--output** | nessuno | Percorso del video completo annotato. |
@@ -193,7 +211,7 @@ Il launcher avvia uvicorn in background e scrive il pidfile e il log; con `--for
 .venv/bin/python webapp/run_server.py --stop
 ```
 
-**Interprete e venv:** `run_server.py` cerca l’ambiente virtuale del progetto in **.venv\\Scripts\\python.exe** (Windows) o **.venv/bin/python** (Linux/macOS) e usa quell’interprete per avviare uvicorn. Se la venv non esiste viene usato l’interprete corrente (`sys.executable`). Gli stessi script lanciano con la stessa venv i processi figli: export dell’engine, estrazione dell’omografia e `select_roi_bev.py` (in locale: `webapp/main.py`, `webapp/roi_server.py`); il debug live viene invece eseguito **in-process** in un thread worker (`webapp/debug_runner.py`).
+**Interprete e venv:** se l’interprete corrente **è già dentro un ambiente virtuale**, viene usato per tutto (server, export, calibrazione, selettore ROI e debug live in-process): il nome della venv non conta, quindi `.venv`, `venv`, `env` o un ambiente conda funzionano allo stesso modo. Solo se il webapp viene avviato con l’interprete di sistema viene usato come fallback il progetto locale **.venv\\Scripts\\python.exe** (Windows) o **.venv/bin/python** (Linux/macOS); in assenza anche di questo, si usa `sys.executable`. Gli stessi script avviano con lo stesso interprete i processi figli: export dell’engine, estrazione dell’omografia e `select_roi_bev.py` (in locale: `webapp/main.py`, `webapp/roi_server.py`); il debug live viene invece eseguito **in-process** in un thread worker (`webapp/debug_runner.py`).
 
 Tra le variabili d’ambiente riconosciute: **DIP_WEB_HOST**, **DIP_WEB_PORT** (default 8099), **DIP_WEB_DEVICE**, **DIP_WEB_WEIGHTS**, **DIP_WEB_ENGINE**, **DIP_WEB_HOMOGRAPHY**, **DIP_WEB_BEV_UNIT**, **DIP_WEB_ROI**, **DIP_WEB_WORKDIR**, **DIP_WEB_LOG**, **DIP_WEB_PID**, **DIP_WEB_RUNTIME_DIR**, **DIP_WEB_MAX_UPLOAD**, **DIP_WEB_JPEG_QUALITY**, **DIP_WEB_FRAME_QUEUE**. Il percorso dei pesi viene cercato automaticamente in **checkpoints/**, **weights/** e in un checkout fratello **DIP_new/urbanomnidetect/** (per `urbanomnidetect_v2_x_640.pt` o `pose.pt`); la venv viene rilevata sia in **.venv\\Scripts\\python.exe** sia in **.venv/bin/python**.
 
@@ -297,7 +315,8 @@ Video, with tracking, the bird's-eye view, and the violation detector:
 python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
     --kp-imgsz 640 --kp-conf 0.1 --kp-vis 0.6 --class-conf 0:0.4,1:0.5,3:0.5 \
     --smooth 11 --device cuda:0 --output out.mp4 \
-    --bev-unit-file homography_bangkok_bev_unit.txt --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 6
+    --bev-unit-file homography_bangkok_bev_unit.txt --homography-file homography_bangkok.npy \
+    --roi-file roi_bev.json --ttc-thresh 2.5 --confirm-frames 4
 ```
 
  - `--kp-imgsz 640` matches the engine input. On drone footage a larger input (960/1280) recovers far, small traffic and the cuboids stay tight.

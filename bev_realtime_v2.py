@@ -1780,7 +1780,7 @@ def load_bev_unit_file(path: str) -> float:
 
 
 def build_v2_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(add_help=False)
+    p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     p.add_argument("--kp-vis", type=float, default=0.5,
                    help="min per-corner keypoint visibility to draw a cuboid")
     p.add_argument("--class-conf", default="",
@@ -1828,6 +1828,6 @@ def build_v2_argparser() -> argparse.ArgumentParser:
                    help="Durata massima (secondi) della clip di un'infrazione.")
     p.add_argument("--no-clip", action="store_true",
                    help="Non genera il mini filmato (.mp4) dell'infrazione: salva solo il JSON.")
-    p.add_argument("--confirm-frames", type=int, default=3,
+    p.add_argument("--confirm-frames", type=int, default=4,
                    help="Frame consecutivi di conflitto TTC richiesti per confermare l'infrazione.")
     return p

@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -39,10 +40,10 @@ class DebugConfig:
     track_ocm_weight: float = 2.0
     track_high_conf: float = 0.45
     ttc_thresh: float = 2.5
-    confirm_frames: int = 6
+    confirm_frames: int = 4
     table_height: int = 280
     max_frames: int = 0
-    no_clip: bool = True
+    no_clip: bool = False
     save_violations: bool = True
     save_video: bool = False
     output_video: Optional[str] = None

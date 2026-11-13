@@ -210,7 +210,8 @@ class RealtimePipeline:
 # --------------------------------------------------------------------------- #
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                allow_abbrev=False)
     p.add_argument("--input", required=True, help="video path, image dir, or webcam index")
     p.add_argument("--kp-model", required=True, help="UrbanOmniDetect pose checkpoint")
     p.add_argument("--kp-imgsz", type=int, default=640)

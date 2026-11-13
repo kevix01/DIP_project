@@ -5,6 +5,7 @@
   function switchTab(name) {
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
     document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+    if (name === 'export') loadArtifacts();
   }
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
@@ -37,7 +38,11 @@
   async function loadArtifacts() {
     const box = $('ex-artifacts');
     try {
-      const items = await API.get('/api/engine/artifacts');
+      const weights = val('ex-weights');
+      const url = weights
+        ? '/api/engine/artifacts?weights=' + encodeURIComponent(weights)
+        : '/api/engine/artifacts';
+      const items = await API.get(url);
       if (!items.length) { box.textContent = 'nessun artifact'; return; }
       box.textContent = '';
       items.forEach(it => {
@@ -71,7 +76,7 @@
         } else {
           if (job.status === 'completed') {
             setStatus('ex-status', 'completato: ' + (job.result.artifact_name || ''), 'ok');
-            loadArtifacts();
+            await loadArtifacts();
           } else {
             setStatus('ex-status', job.error || 'fallito', 'bad');
           }
@@ -321,6 +326,7 @@
         table_height: num('dbg-tableh', 280),
         max_frames: num('dbg-maxframes', 0),
         save_violations: checked('dbg-saveviol'),
+        no_clip: !checked('dbg-saveviol'),
         save_video: checked('dbg-savevideo')
       };
       const session = await API.post('/api/debug/sessions', payload);
@@ -339,6 +345,57 @@
     Stream.stop();
     setStatus('dbg-status', 'arresto in corso…');
   });
+
+  /* ---------------- debug output paths ---------------- */
+  let debugOutputs = null;
+
+  async function loadDebugOutputs() {
+    try {
+      debugOutputs = await API.get('/api/debug/outputs');
+    } catch (err) {
+      debugOutputs = null;
+    }
+    renderDebugOutputs();
+  }
+
+  function renderDebugOutputs() {
+    const box = $('dbg-outputs');
+    if (!box) return;
+    box.textContent = '';
+    if (!debugOutputs) return;
+    const saveViol = checked('dbg-saveviol');
+    const saveVideo = checked('dbg-savevideo');
+    const rows = [
+      { label: 'JSON infrazioni', path: debugOutputs.outputs[0].path, on: saveViol },
+      { label: 'clip video infrazioni', path: debugOutputs.outputs[1].path, on: saveViol },
+      { label: 'video annotato', path: debugOutputs.outputs[2].path, on: saveVideo }
+    ];
+    const head = document.createElement('div');
+    head.className = 'out-label';
+    head.textContent = 'File salvati in (sessione corrente):';
+    box.appendChild(head);
+    rows.forEach(r => {
+      const row = document.createElement('div');
+      row.className = 'out-row' + (r.on ? '' : ' out-off');
+      const lab = document.createElement('span');
+      lab.className = 'out-label';
+      lab.textContent = r.label + (r.on ? '' : ' (non attivo)');
+      const p = document.createElement('span');
+      p.className = 'out-path';
+      p.textContent = r.path;
+      row.appendChild(lab);
+      row.appendChild(p);
+      box.appendChild(row);
+    });
+  }
+
+  ['dbg-saveviol', 'dbg-savevideo'].forEach(id => {
+    const el = $(id);
+    if (el) el.addEventListener('change', renderDebugOutputs);
+  });
+  loadDebugOutputs();
+
+  $('ex-weights').addEventListener('change', loadArtifacts);
 
   /* ---------------- init ---------------- */
   loadHealth();

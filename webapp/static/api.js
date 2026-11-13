@@ -7,7 +7,7 @@ const API = {
     try { data = text ? JSON.parse(text) : null; } catch (e) { data = { detail: text }; }
     if (!res.ok) {
       const detail = (data && (data.detail || data.message)) || res.statusText;
-      throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      throw new Error(formatError(detail));
     }
     return data;
   },
@@ -31,6 +31,22 @@ const API = {
   }
 };
 
+function formatError(detail) {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(d => {
+      if (!d || typeof d !== 'object') return String(d);
+      const loc = Array.isArray(d.loc) ? d.loc.filter(x => x !== 'body').join('.') : '';
+      const msg = d.msg || d.message || 'errore';
+      return loc ? `${loc}: ${msg}` : msg;
+    }).join(' · ');
+  }
+  if (detail && typeof detail === 'object') {
+    return Object.entries(detail).map(([k, v]) => `${k}: ${formatError(v)}`).join(' · ');
+  }
+  return String(detail || 'errore');
+}
+
 function $(id) { return document.getElementById(id); }
 function val(id) { const el = $(id); return el ? el.value : ''; }
 function num(id, fallback) {
@@ -42,7 +58,8 @@ function setStatus(id, text, kind) {
   const el = $(id);
   if (!el) return;
   el.textContent = text || '';
-  el.className = 'muted' + (kind ? ' ' + kind : '');
+  el.className = 'muted status' + (kind ? ' ' + kind : '');
+  el.title = kind === 'bad' ? (text || '') : '';
 }
 function appendLog(id, text) {
   const el = $(id);

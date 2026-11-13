@@ -15,6 +15,9 @@ import argparse
 import os
 import sys
 
+# Blocchiamo gli auto-update
+os.environ["YOLO_AUTOINSTALL"] = "false"
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
