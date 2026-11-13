@@ -41,6 +41,7 @@ fails to load.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import subprocess
 import sys
@@ -62,7 +63,8 @@ from uod.bev import BEVViewport  # noqa: E402
 from uod.keypoints import Detection  # noqa: E402
 from uod.textdraw import UILayer  # noqa: E402
 from uod.classes import to_unified
-from uod.viz import draw_cuboid, draw_dashed_polyline  # noqa: E402
+from uod.viz import (draw_cuboid, draw_dashed_polyline,  # noqa: E402
+                     fill_poly_alpha_bgr)
 from homography_rt import apply_homography  # noqa: E402
 import threading
 from uod.bev_ocsort import BEVObservation, BEVOCSortTracker, FixedLagBuffer
@@ -123,18 +125,41 @@ POSE_CATEGORY_V2: Dict[int, str] = {
 }
 
 
+def _hull_contains(hull_outer: np.ndarray, poly_inner: np.ndarray) -> bool:
+    """Check if poly_inner is completely inside the already-built hull.
+
+    ``hull_outer`` is the convex hull of poly_outer (as produced by
+    ``cv2.convexHull``); poly_inner is a (4, 2) footprint. Uses
+    pointPolygonTest on all vertices.
+    """
+    for pt in poly_inner:
+        if cv2.pointPolygonTest(hull_outer, tuple(pt.astype(np.float32)), False) < 0:
+            return False
+    return True
+
+
 def _polygon_contains(poly_outer: np.ndarray, poly_inner: np.ndarray) -> bool:
     """Check if poly_inner is completely inside poly_outer.
-    
+
     Both are (4, 2) ground footprints. Uses pointPolygonTest on all vertices.
     """
     if poly_outer.shape != (4, 2) or poly_inner.shape != (4, 2):
         return False
     hull_outer = cv2.convexHull(poly_outer.astype(np.float32).reshape(-1, 1, 2))
-    for pt in poly_inner:
-        if cv2.pointPolygonTest(hull_outer, tuple(pt.astype(np.float32)), False) < 0:
-            return False
-    return True
+    return _hull_contains(hull_outer, poly_inner)
+
+
+def _bbox_disjoint(ba: Tuple[int, int, int, int], bb: Tuple[int, int, int, int]) -> bool:
+    """True when two axis-aligned boxes do not overlap at all.
+
+    Two convex hulls whose bounding boxes are disjoint cannot intersect, so
+    their intersection area (and therefore their IoU and overlap fraction) is
+    exactly zero. Skipping the polygon intersection in that case is exact,
+    not an approximation, and removes the bulk of the per-pair work.
+    """
+    ax, ay, aw, ah = ba
+    bx, by, bw, bh = bb
+    return (ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay)
 
 
 def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray:
@@ -148,15 +173,21 @@ def _ground_iou_matrix(ground_a: np.ndarray, ground_b: np.ndarray) -> np.ndarray
     # Convert to convex hulls for polygon intersection
     hulls_a = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in ground_a]
     hulls_b = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in ground_b]
-    
+
     iou_mat = np.zeros((len(hulls_a), len(hulls_b)))
+    rects_a = [cv2.boundingRect(h) for h in hulls_a]
+    rects_b = [cv2.boundingRect(h) for h in hulls_b]
+    areas_a = [cv2.contourArea(h) for h in hulls_a]
+    areas_b = [cv2.contourArea(h) for h in hulls_b]
     for i, ha in enumerate(hulls_a):
-        area_a = cv2.contourArea(ha)
+        area_a = areas_a[i]
         if area_a <= 1e-6:
             continue
         for j, hb in enumerate(hulls_b):
-            area_b = cv2.contourArea(hb)
+            area_b = areas_b[j]
             if area_b <= 1e-6:
+                continue
+            if _bbox_disjoint(rects_a[i], rects_b[j]):
                 continue
             inter, _ = cv2.intersectConvexConvex(ha, hb)
             if inter > 0:
@@ -238,8 +269,15 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             for d in group:
                 g = d.ground_bev
                 if g.shape == (4, 2):
-                    x, y = g[:, 0], g[:, 1]
-                    area = 0.5 * abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+                    # Shoelace sui 4 vertici (equivalente a np.roll, ma senza
+                    # allocare array temporanei per ogni detection).
+                    x = g[:, 0]
+                    y = g[:, 1]
+                    area = 0.5 * abs(float(
+                        x[0] * y[1] - x[1] * y[0]
+                        + x[1] * y[2] - x[2] * y[1]
+                        + x[2] * y[3] - x[3] * y[2]
+                        + x[3] * y[0] - x[0] * y[3]))
                 else:
                     area = 0.0
                 bev_areas.append(area)
@@ -250,6 +288,7 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             grounds = np.stack([d.ground_bev for d in group])
             hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in grounds]
             areas = [cv2.contourArea(h) for h in hulls]
+            rects = [cv2.boundingRect(h) for h in hulls]
             iou_mat = _ground_iou_matrix(grounds, grounds)
 
             def _overlap_frac_ha(ha, area_a, hb, area_b) -> float:
@@ -275,16 +314,28 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
             overlap = np.zeros((n, n), dtype=bool)
             for a in range(n):
                 for b in range(a + 1, n):
-                    iou_high = iou_mat[a, b] >= (0.35 if ucls == 0 else 0.50)
-                    contains = (_polygon_contains(grounds[a], grounds[b]) or
-                                _polygon_contains(grounds[b], grounds[a]))
-                    mostly_covered = _overlap_frac_ha(hulls[a], areas[a], hulls[b], areas[b]) >= 0.65
+                    # Il box 2D immagine e' indipendente dalla geometria BEV:
+                    # va valutato sempre.
                     iou_2d, cov_2d = _box_overlap_2d(group[a].xyxy, group[b].xyxy)
                     if ucls == 0:
                         dup_2d = (iou_2d >= 0.35) or (cov_2d >= 0.70)
                     else:
                         dup_2d = (iou_2d >= 0.55) or (cov_2d >= 0.80)
-                    if iou_high or contains or mostly_covered or dup_2d:
+                    if dup_2d:
+                        overlap[a, b] = True
+                        overlap[b, a] = True
+                        continue
+                    # Coppie con bounding box BEV disgiunti non possono
+                    # intersecarsi: IoU, contenimento e overlap fraction sono
+                    # tutti esattamente zero, quindi si puo' saltare il
+                    # calcolo geometrico (nessuna approssimazione).
+                    if _bbox_disjoint(rects[a], rects[b]):
+                        continue
+                    iou_high = iou_mat[a, b] >= (0.35 if ucls == 0 else 0.50)
+                    contains = (_hull_contains(hulls[a], grounds[b]) or
+                                _hull_contains(hulls[b], grounds[a]))
+                    mostly_covered = _overlap_frac_ha(hulls[a], areas[a], hulls[b], areas[b]) >= 0.65
+                    if iou_high or contains or mostly_covered:
                         overlap[a, b] = True
                         overlap[b, a] = True
 
@@ -335,8 +386,10 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                 vehicle_grounds = np.stack([merged_with_ground[i].ground_bev for i in vehicle_indices])
                 person_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in person_grounds]
                 person_areas = [cv2.contourArea(h) for h in person_hulls]
+                person_rects = [cv2.boundingRect(h) for h in person_hulls]
                 veh_hulls = [cv2.convexHull(g.astype(np.float32).reshape(-1, 1, 2)) for g in vehicle_grounds]
                 veh_areas = [cv2.contourArea(h) for h in veh_hulls]
+                veh_rects = [cv2.boundingRect(h) for h in veh_hulls]
 
                 # Suppress person if any vehicle footprint mostly covers the
                 # pedestrian footprint in BEV. IoU = inter/union stays LOW when a
@@ -350,6 +403,11 @@ def _deduplicate_unified(dets: List[Detection], H: Optional[np.ndarray] = None,
                     ha = person_hulls[p_idx]
                     area_p = person_areas[p_idx]
                     for v_idx, v_ground in enumerate(vehicle_grounds):
+                        # Criterio 0: bounding box disgiunti => nessuna
+                        # intersezione e nessun punto del pedone dentro il
+                        # veicolo (il centro del pedone sta nel suo bbox).
+                        if _bbox_disjoint(person_rects[p_idx], veh_rects[v_idx]):
+                            continue
                         # Criterio 1: overlap frazione >= 0.05 (cattura quando il veicolo
                         # copre la maggior parte del pedone, o viceversa).
                         smaller = min(area_p, veh_areas[v_idx])
@@ -750,6 +808,7 @@ def _instance_color(cls: int, instance_id: int, source: str = "pose"):
 style.instance_color = _instance_color
 
 
+@functools.lru_cache(maxsize=8192)
 def _text_size(size: int, s: str, font: str = "regular"):
     """Measured width/height of a string in the UI font."""
     try:
@@ -898,9 +957,7 @@ class V2Viewport(BEVViewport):
         if poly is None or len(poly) < 3:
             return
         pts = poly.astype(np.int32)
-        ov = canvas.copy()
-        cv2.fillPoly(ov, [pts], (16, 16, 18), cv2.LINE_AA)
-        cv2.addWeighted(ov, 0.9, canvas, 0.1, 0, canvas)
+        fill_poly_alpha_bgr(canvas, pts, (16, 16, 18), 0.9)
         cv2.polylines(canvas, [pts], True, (54, 54, 60), 1, cv2.LINE_AA)
 
     def draw_footprint_poly(self, canvas: np.ndarray, poly: np.ndarray, color,
@@ -1408,9 +1465,7 @@ class V2Pipeline(rt.RealtimePipeline):
             roi_persp = self.roi_image_points
             
             cv2.polylines(src, [roi_persp], isClosed=True, color=(0, 255, 255), thickness=2, lineType=cv2.LINE_AA)
-            overlay = src.copy()
-            cv2.fillPoly(overlay, [roi_persp], color=(0, 255, 255))
-            cv2.addWeighted(overlay, 0.15, src, 0.85, 0, src)
+            fill_poly_alpha_bgr(src, roi_persp, (0, 255, 255), 0.15)
         # ----------------------------------
         src_labels = []
         if self.draw_aux_box:
@@ -1438,9 +1493,7 @@ class V2Pipeline(rt.RealtimePipeline):
             if len(roi_canvas) > 0 and np.all(np.isfinite(roi_canvas)):
                 roi_canvas_pts = np.round(roi_canvas).astype(np.int32)
                 cv2.polylines(bev, [roi_canvas_pts], isClosed=True, color=(0, 255, 255), thickness=2, lineType=cv2.LINE_AA)
-                overlay_bev = bev.copy()
-                cv2.fillPoly(overlay_bev, [roi_canvas_pts], color=(0, 255, 255))
-                cv2.addWeighted(overlay_bev, 0.15, bev, 0.85, 0, bev)
+                fill_poly_alpha_bgr(bev, roi_canvas_pts, (0, 255, 255), 0.15)
         # --------------------------
         if self.use_homography and self.show_fov:
             self.viewport.draw_fov(bev, H, state.img_wh)

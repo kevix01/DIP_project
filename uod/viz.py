@@ -14,6 +14,7 @@ BGR happens here.
 
 from __future__ import annotations
 
+import functools
 from typing import Optional, Sequence
 
 import cv2
@@ -21,23 +22,15 @@ import numpy as np
 
 from . import style
 
-__all__ = ["stroke_polyline", "fill_poly_alpha", "draw_cuboid",
-            "draw_ground_quad", "draw_dashed_polyline", "stack_side_by_side",
-            "rounded_contour"]
+__all__ = ["stroke_polyline", "fill_poly_alpha", "fill_poly_alpha_bgr",
+            "draw_cuboid", "draw_ground_quad", "draw_dashed_polyline",
+            "stack_side_by_side", "rounded_contour"]
 
 
-def rounded_contour(pts, radius, steps=4):
-    """Return a dense contour that rounds the corners of a convex polygon.
-
-    Each sharp vertex is replaced by a short quadratic-bezier fillet (the corner
-    is the control point), so it works for rotated rectangles, not just
-    axis-aligned ones. ``radius`` is clamped per corner to half the shorter
-    adjacent edge.
-    """
-    pts = np.asarray(pts, dtype=np.float64)
+@functools.lru_cache(maxsize=4096)
+def _rounded_contour_cached(pts_bytes, radius, steps):
+    pts = np.frombuffer(pts_bytes, dtype=np.float64).reshape(-1, 2)
     n = len(pts)
-    if n < 3 or radius <= 0:
-        return pts
     out = []
     for i in range(n):
         prev, cur, nxt = pts[(i - 1) % n], pts[i], pts[(i + 1) % n]
@@ -52,6 +45,26 @@ def rounded_contour(pts, radius, steps=4):
         for t in np.linspace(0.0, 1.0, steps + 1):
             out.append((1 - t) ** 2 * a + 2 * (1 - t) * t * cur + t ** 2 * b)
     return np.asarray(out)
+
+
+def rounded_contour(pts, radius, steps=4):
+    """Return a dense contour that rounds the corners of a convex polygon.
+
+    Each sharp vertex is replaced by a short quadratic-bezier fillet (the corner
+    is the control point), so it works for rotated rectangles, not just
+    axis-aligned ones. ``radius`` is clamped per corner to half the shorter
+    adjacent edge.
+
+    The result is memoised: the same footprint polygon is rounded every frame
+    (and often more than once per frame), and the fillet computation is pure.
+    The returned array is shared between callers, so it must not be mutated.
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    n = len(pts)
+    if n < 3 or radius <= 0:
+        return pts
+    key = (np.ascontiguousarray(pts).tobytes(), float(radius), int(steps))
+    return _rounded_contour_cached(*key)
 
 _GROUND_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0)]
 _TOP_EDGES = [(4, 5), (5, 6), (6, 7), (7, 4)]
@@ -97,6 +110,28 @@ def fill_poly_alpha(img, pts, color_rgb, alpha):
     roi = img[y0:y1, x0:x1]
     ov = roi.copy()
     cv2.fillPoly(ov, [p - [x0, y0]], _bgr(color_rgb), cv2.LINE_AA)
+    cv2.addWeighted(ov, alpha, roi, 1 - alpha, 0, roi)
+
+
+def fill_poly_alpha_bgr(img, pts, color_bgr, alpha):
+    """Translucent polygon fill (BGR colour) blended over just its ROI.
+
+    Equivalent to filling a full-frame copy and blending the whole frame,
+    but touches only the polygon's bounding box.
+    """
+    if alpha <= 0:
+        return
+    p = np.round(np.asarray(pts)).astype(np.int32)
+    ch, cw = img.shape[:2]
+    bx, by, bw, bh = cv2.boundingRect(p)
+    pad = 2
+    x0, y0 = max(bx - pad, 0), max(by - pad, 0)
+    x1, y1 = min(bx + bw + pad, cw), min(by + bh + pad, ch)
+    if x1 <= x0 or y1 <= y0:
+        return
+    roi = img[y0:y1, x0:x1]
+    ov = roi.copy()
+    cv2.fillPoly(ov, [p - [x0, y0]], color_bgr, cv2.LINE_AA)
     cv2.addWeighted(ov, alpha, roi, 1 - alpha, 0, roi)
 
 

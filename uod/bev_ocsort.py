@@ -715,6 +715,27 @@ class BEVOCSortTracker:
         return float(inter / (ua + ub - inter))
 
     @staticmethod
+    def _box_iou_2d_vec(a: np.ndarray, obs_boxes: np.ndarray) -> np.ndarray:
+        """Vectorised ``_box_iou_2d`` of one box against many boxes.
+
+        ``a`` is a single (4,) box, ``obs_boxes`` is (N, 4). Returns (N,) with
+        exactly the same values the scalar version would produce.
+        """
+        ix = np.minimum(a[2], obs_boxes[:, 2]) - np.maximum(a[0], obs_boxes[:, 0])
+        np.maximum(ix, 0.0, out=ix)
+        iy = np.minimum(a[3], obs_boxes[:, 3]) - np.maximum(a[1], obs_boxes[:, 1])
+        np.maximum(iy, 0.0, out=iy)
+        inter = ix * iy
+        ua = max(float(a[2] - a[0]) * float(a[3] - a[1]), 1.0)
+        ub = np.maximum((obs_boxes[:, 2] - obs_boxes[:, 0]) *
+                        (obs_boxes[:, 3] - obs_boxes[:, 1]), 1.0)
+        union = ua + ub - inter
+        out = np.zeros(len(obs_boxes), dtype=np.float64)
+        ok = inter > 0.0
+        out[ok] = inter[ok] / union[ok]
+        return out
+
+    @staticmethod
     def _is_near_border(box: np.ndarray, img_wh: Tuple[int, int], margin_frac: float = 0.020) -> bool:
         W, H = float(img_wh[0]), float(img_wh[1])
         if W <= 0 or H <= 0:
@@ -773,8 +794,21 @@ class BEVOCSortTracker:
             return empty, empty
 
         INF = 1e6
-        total_cost = np.full((M, N), INF, dtype=np.float64)
-        gate_cost = np.full((M, N), INF, dtype=np.float64)
+        # Un'unica allocazione per entrambe le matrici: il valore di default
+        # (costo "vietato") e' lo stesso, quindi si risparmia una memset.
+        both = np.full((2, M, N), INF, dtype=np.float64)
+        total_cost = both[0]
+        gate_cost = both[1]
+
+        # Raggruppa le osservazioni per classe: il costo e' definito solo
+        # fra classi uguali, quindi il loop interno puo' iterare sulle sole
+        # osservazioni compatibili (stessa semantica del check per classe,
+        # senza pagare il confronto per ogni coppia).
+        obs_by_cls: Dict[int, List[int]] = {}
+        for j, o in enumerate(obs_list):
+            obs_by_cls.setdefault(int(o.cls), []).append(j)
+        obs_boxes_all = np.asarray([o.box_xyxy for o in obs_list],
+                                   dtype=np.float64).reshape(N, 4)
 
         for i, t in enumerate(trks):
             tsu = max(1, int(t.time_since_update))
@@ -789,13 +823,18 @@ class BEVOCSortTracker:
             trk_at_border = self._is_near_border(last_box, img_wh, margin_frac=0.030)
             v_dir = t.ocm_direction()
 
-            for j, o in enumerate(obs_list):
-                if int(t.cls) != int(o.cls):
-                    continue
+            cand = obs_by_cls.get(int(t.cls), ())
+            if not cand:
+                continue
+            cand_arr = np.asarray(cand, dtype=np.intp)
+            cand_boxes = obs_boxes_all[cand_arr]
+            iou_last_v = self._box_iou_2d_vec(last_box, cand_boxes)
+            iou_pred_v = self._box_iou_2d_vec(pred_box_2d, cand_boxes)
 
-                iou_last = self._box_iou_2d(last_box, o.box_xyxy)
-                iou_pred = self._box_iou_2d(pred_box_2d, o.box_xyxy)
-                iou_2d = max(iou_last, iou_pred)
+            for jj, j in enumerate(cand):
+                o = obs_list[j]
+
+                iou_2d = max(iou_last_v[jj], iou_pred_v[jj])
 
                 # Una traccia nata al bordo senza cuboide si riaggancia con il
                 # box 2D anche quando la nuova osservazione ha già una shape 3D.

@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 
 from homography_rt import apply_homography
+from .viz import fill_poly_alpha_bgr
 
 __all__ = ["BEVViewport"]
 
@@ -195,9 +196,7 @@ class BEVViewport:
         if poly is None or len(poly) < 3:
             return
         pts = poly.astype(np.int32)
-        ov = canvas.copy()
-        cv2.fillPoly(ov, [pts], (44, 46, 50), cv2.LINE_AA)   # faint lift over bg
-        cv2.addWeighted(ov, 0.45, canvas, 0.55, 0, canvas)
+        fill_poly_alpha_bgr(canvas, pts, (44, 46, 50), 0.45)   # faint lift over bg
         ego = style.THEME["ego"]
         cv2.polylines(canvas, [pts], True, (ego[2], ego[1], ego[0]), 1, cv2.LINE_AA)
 
@@ -283,16 +282,7 @@ class BEVViewport:
 
     @staticmethod
     def _fill_alpha(canvas, contour_int, bgr, alpha):
-        ch, cw = canvas.shape[:2]
-        bx, by, bw, bh = cv2.boundingRect(contour_int)
-        x0, y0 = max(bx, 0), max(by, 0)
-        x1, y1 = min(bx + bw, cw), min(by + bh, ch)
-        if x1 <= x0 or y1 <= y0:
-            return
-        roi = canvas[y0:y1, x0:x1]
-        overlay = roi.copy()
-        cv2.fillPoly(overlay, [contour_int - [x0, y0]], bgr, cv2.LINE_AA)
-        cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, roi)
+        fill_poly_alpha_bgr(canvas, contour_int, bgr, alpha)
 
     def draw_footprint_poly(self, canvas: np.ndarray, poly: np.ndarray, color,
                             thickness: int = 2, fill_alpha: float = 0.25,

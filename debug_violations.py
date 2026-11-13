@@ -26,7 +26,8 @@ import bev_realtime as rt
 import bev_realtime_v2 as bev_v2
 from uod import style
 from uod.textdraw import UILayer
-from uod.viz import draw_cuboid, draw_dashed_polyline, stack_side_by_side
+from uod.viz import (draw_cuboid, draw_dashed_polyline, fill_poly_alpha_bgr,
+                     stack_side_by_side)
 from violation_detector import ViolationDetector
 
 
@@ -55,9 +56,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
         # --- 1. DISEGNO ROI IN PROSPETTIVA ---
         if self.roi_image_points is not None:
             roi_persp = self.roi_image_points
-            overlay = src.copy()
-            cv2.fillPoly(overlay, [roi_persp], color=(0, 255, 255))
-            cv2.addWeighted(overlay, 0.18, src, 0.82, 0, src)
+            fill_poly_alpha_bgr(src, roi_persp, (0, 255, 255), 0.18)
             cv2.polylines(src, [roi_persp], isClosed=True, color=(0, 255, 255),
                           thickness=2, lineType=cv2.LINE_AA)
 
@@ -101,9 +100,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
                     g_pts = t.kpts[list(gi)]
                 if g_pts is not None and np.all(np.isfinite(g_pts)):
                     poly_2d = np.round(g_pts).astype(np.int32)
-                    ov_fp = src.copy()
-                    cv2.fillPoly(ov_fp, [poly_2d], fp_bgr, lineType=cv2.LINE_AA)
-                    cv2.addWeighted(ov_fp, fill_alpha, src, 1.0 - fill_alpha, 0, src)
+                    fill_poly_alpha_bgr(src, poly_2d, fp_bgr, fill_alpha)
                     cv2.polylines(src, [poly_2d], isClosed=True, color=fp_border_bgr,
                                   thickness=2, lineType=cv2.LINE_AA)
 
@@ -126,9 +123,7 @@ class DebugV2Pipeline(bev_v2.V2Pipeline):
             roi_canvas = self.viewport.rect_to_canvas(roi_scaled)
             if len(roi_canvas) > 0 and np.all(np.isfinite(roi_canvas)):
                 roi_canvas_pts = np.round(roi_canvas).astype(np.int32)
-                overlay_bev = bev.copy()
-                cv2.fillPoly(overlay_bev, [roi_canvas_pts], color=(0, 255, 255))
-                cv2.addWeighted(overlay_bev, 0.18, bev, 0.82, 0, bev)
+                fill_poly_alpha_bgr(bev, roi_canvas_pts, (0, 255, 255), 0.18)
                 cv2.polylines(bev, [roi_canvas_pts], isClosed=True, color=(0, 255, 255),
                               thickness=2, lineType=cv2.LINE_AA)
 
