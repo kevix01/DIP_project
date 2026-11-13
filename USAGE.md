@@ -96,11 +96,12 @@ python debug_violations.py --input clip.mp4 --kp-model checkpoints/urbanomnidete
 | `--clip-absolute-timeout-s S` | 3.0 | durata massima (secondi) della clip di un'infrazione |
 | `--no-clip` | off | non genera il mini filmato: salva solo il JSON |
 
-**La clip** (`violation_v<veicolo>_f<frame>.mp4`) viene scritta in streaming durante
+**La clip** (`violation_v<veicolo>_t<MMmSSsMMMms>.mp4`; per video di almeno
+un'ora il minutaggio è preceduto da `HHh`) viene scritta in streaming durante
 l'elaborazione: contiene esattamente i frame dal trigger dell'infrazione alla sua chiusura, alla
-**risoluzione nativa del video sorgente**, con il **solo centroide del veicolo infractor**
-(marker rosso + etichetta `V<id>`) sovrapposto in ogni frame in cui il veicolo è tracciato.
-Non viene generato nessun JPG.
+**risoluzione nativa del video sorgente**, con i **centroidi dei soggetti coinvolti**
+sovrapposti in ogni frame in cui sono tracciati: veicolo infractor (marker rosso + etichetta `V<id>`)
+e pedone (marker giallo + etichetta `P<id>`). Non viene generato nessun JPG.
 
 **Chiusura dell'infrazione** (e quindi fine della clip):
 
@@ -111,12 +112,16 @@ Non viene generato nessun JPG.
 | durata massima | `absolute_timeout` | durata superiore a `--clip-absolute-timeout-s` |
 | fine stream | `end_of_stream` | il video è terminato con l'infrazione ancora attiva |
 
-**JSON** (`violation_v<veicolo>_f<frame>.json`): frame del trigger, id veicolo e pedone, TTC,
+**JSON** (`violation_v<veicolo>_t<MMmSSsMMMms>.json`): frame del trigger, id veicolo e pedone, TTC,
 centroide prospettico del veicolo e del pedone **al frame dell'infrazione**, stato e velocità
 dell'intento del pedone, e il blocco `clip` con nome file, fps, frame iniziale/finale, numero di
 frame e motivo di chiusura.
 
-## `bev_realtime.py` / `bev_realtime_v2.py` — shared pipeline flags (libraries of `debug_violations.py`)
+## `bev_realtime.py` / `bev_realtime_v2.py` — shared pipeline flags (libraries driven by `debug_violations.py`)
+
+These two modules are libraries, not standalone entry points: they expose the
+argparse fragments used by `debug_violations.py` (`build_argparser()` and
+`build_v2_argparser()`) and the pipeline/rendering classes it drives.
 
 ```
 --input PATH|DIR|N          video path, image directory or webcam index
@@ -139,6 +144,22 @@ python select_roi_bev.py     # pick the zebra-crossing ROI on a frame -> roi_bev
 python extract_homography.py # solve the image->ground homography -> homography_bangkok.npy
 python homography_rt.py      # runtime homography helper
 ```
+
+`extract_homography.py` and `select_roi_bev.py` require the YOLO pose checkpoint
+(`--kp-model`) and the homography/`bev_unit` pair; see `README.md` for the full
+flag tables and `docs/extract_homography.md` / `docs/select_roi_bev.md` for details.
+
+## Installazione (PyTorch con CUDA)
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` abilita l'indice NVIDIA CUDA 12.6 tramite
+`--extra-index-url https://download.pytorch.org/whl/cu126`. Se la vostra GPU
+richiede una CUDA diversa, modificate quella URL (es. `cu128`, `cu130`) prima
+di installare. Verificate la build con
+`python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`.
 
 ## Webapp di debug
 

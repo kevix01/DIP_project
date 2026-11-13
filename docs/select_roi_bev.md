@@ -1,7 +1,7 @@
 # select_roi_bev.py
 
 Selettore di ROI (regione di interesse) su un frame video o su un'immagine,
-con anteprima BEV e salvataggio in JSON.
+con elenco delle coordinate BEV dei vertici e salvataggio in JSON.
 
 La ROI BEV delimita l'area della strada "di interesse" su cui il pipeline
 conta le violazioni. I punti vengono selezionati in coordinate immagine e
@@ -66,11 +66,14 @@ rotta `/download-roi`. Questo è il comportamento introdotto per supportare
 Windows, dove il download del browser può fallire silenziosamente.
 
 - **Standalone** (`python select_roi_bev.py ...`): il file viene scritto
-  nella cartella di `--output` (per `--output roi_bev.json` è la cartella
-  di lavoro), con il nome scelto nel campo "Nome file JSON".
-- **Tramite webapp**: il file viene scritto nel percorso indicato da
-  `--save-path` (usato dal frontend per il flusso "estrai ROI dalla
-  webapp").
+  nella cartella che contiene `--output` (per `--output roi_bev.json` è la
+  cartella di lavoro), con il nome scelto nel campo "Nome file JSON".
+- **Tramite webapp**: il selettore viene avviato con `--save-path`, quindi il
+  file viene scritto in quel percorso (di default
+  `.webapp/artifacts/roi_selector_pending.json`). La webapp importa poi il
+  payload e ne conserva una copia normalizzata in
+  `.webapp/artifacts/roi_<roi_id>.json`; il download esposto dalla webapp usa
+  il nome `roi_bev.json`.
 
 In entrambi i casi il nome è sanitizzato: vengono rimossi eventuali
 percorsi e il nome viene forzato con estensione `.json`.
@@ -114,8 +117,9 @@ stessa estrazione**: vedi `docs/extract_homography.md`.
 ```bash
 # 1. Estrarre la calibrazione (produce omografia + bev_unit coerenti)
 .venv/bin/python extract_homography.py \
-    --video video_dataset_bangkok/video_041_tagliato_2.avi \
-    --out homography_bangkok
+    --input video_dataset_bangkok/video_041_tagliato_2.avi \
+    --kp-model checkpoints/urbanomnidetect_v2_x_640_640_fp16.engine \
+    --output homography_bangkok.npy
 
 # 2. Selezionare la ROI usando quella calibrazione
 .venv/bin/python select_roi_bev.py \
@@ -140,11 +144,14 @@ stessa estrazione**: vedi `docs/extract_homography.md`.
 | `--homography` | – | File dell'omografia 3x3. Accettati `.npy` e `.txt` (3 righe di 3 valori). Se non viene dato e c'è una ROI, la calibrazione di provenienza viene ripristinata. |
 | `--bev-unit-file` | – | File di testo con la `bev_unit` (un solo numero). Stessa logica dell'omografia. |
 | `--roi` | – | ROI JSON da pre-caricare. Vengono caricati i vertici, la calibrazione di provenienza e la posizione della sorgente. |
-| `--output` | `roi_bev.json` | Nome/percorso del file di output. In modalità standalone il server scrive il file salvato nella cartella di `--output`; il nome è anche precompilato nel campo "Nome file JSON" dell'interfaccia. |
-| `--frame-index` | `1` | Frame iniziale per i video, **1-based** (stessa base del JSON: 1 = primo frame). Con `--roi`, se non viene indicato un valore esplicito, l'app si posiziona sul frame di riferimento della ROI. |
+| `--output` | `roi_bev.json` | Nome/percorso del file di output: il nome viene precompilato nel campo "Nome file JSON" dell'interfaccia e la sua cartella è la destinazione predefinita in modalità standalone (standalone scrive sempre nella cartella di `--output`, con il nome scelto nella UI). |
+| `--frame-index` | `1` | Frame iniziale per i video, **1-based** (stessa base del JSON: 1 = primo frame). Con `--roi`, l'app si posiziona sul frame di riferimento della ROI quando il valore è `1` (che è anche il default: un `--frame-index 1` esplicito non è distinguibile dal default). |
 | `--port` | `8080` | Porta del server HTTP locale. |
 | `--no-browser` | – | Non aprire il browser automaticamente. |
-| `--keep-session-calibration` | – | Quando si pre-carica una ROI, **non** ripristinare la calibrazione di provenienza: si usa quella passata a `--homography`/`--bev-unit-file`. |
+| `--keep-session-calibration` | – | Quando si pre-carica una ROI con `--roi`, **non** ripristinare la calibrazione di provenienza: si usa quella passata a `--homography`/`--bev-unit-file`. Non si applica al caricamento di una ROI JSON dalla UI, che ripristina sempre la calibrazione di provenienza. |
+| `--save-path` | – | Percorso esatto del file JSON scritto dal server a `/save-roi`. Se impostato, ha precedenza sulla cartella derivata da `--output`; il nome file scelto nella UI non viene applicato a questo percorso. Usato dalla webapp. |
+| `--base-path` | `""` | Prefisso delle rotte HTTP del selettore (usato dalla webapp: `/roi/app`). |
+| `--reset-calibration-from-roi` | – | Flag legacy attualmente senza effetto: il ripristino della calibrazione di provenienza è già il comportamento predefinito ed è controllato da `--keep-session-calibration`. |
 
 ---
 
@@ -168,7 +175,7 @@ browser su quella pagina.
 |---|---|
 | Click su sfondo | Aggiunge un vertice |
 | Click su maniglia + drag | Sposta il vertice |
-| Right-click su maniglia | Rimuove il vertice |
+| Right-click su maniglia | Rimuove il vertice (solo se ci sono più di 4 vertici) |
 | Click su un lato | Inserisce un vertice su quel lato |
 | Rotella | Zoom |
 | Alt + drag sinistro | Pan della vista |
@@ -181,7 +188,7 @@ browser su quella pagina.
 | `+` / `=` | Zoom in |
 | `−` / `_` | Zoom out |
 | `0` | Reset zoom e vista |
-| `Canc` | Rimuove il vertice selezionato |
+| `Canc` / `Backspace` | Rimuove il vertice selezionato (solo se ci sono più di 4 vertici) |
 | `S` | Salva la ROI |
 
 ---
@@ -192,9 +199,9 @@ browser su quella pagina.
 
 | Campo | Tipo | Obbligatorio | Significato |
 |---|---|---|---|
-| `homography_file` | string | sì | Nome del file dell'omografia usata per la proiezione. |
-| `bev_unit_file` | string | sì | Nome del file da cui proviene la `bev_unit`. |
-| `bev_unit` | float | sì | Scala metri/pixel applicata ai pixel BEV. |
+| `homography_file` | string | sì | Nome (o percorso, nella webapp) del file dell'omografia usata per la proiezione. |
+| `bev_unit_file` | string | no | Nome del file da cui proviene la `bev_unit` (vuoto se non disponibile). |
+| `bev_unit` | float | no | Scala metri/pixel applicata ai pixel BEV. Se assente o zero, i `bev_points` restano in pixel BEV e non in metri. |
 | `image_points` | list[[x, y]] | sì | Vertici del poligono in **pixel immagine**. |
 | `bev_points` | list[[x, y]] | sì | Vertici del poligono in **metri**, nel piano BEV. |
 | `calibration_source` | object | no | Da dove arriva la calibrazione usata (`"roi"` o `"session"`). |
@@ -213,7 +220,7 @@ Esempio reale (abbreviato):
 {
   "homography_file": "homography_bangkok.npy",
   "bev_unit_file": "homography_bangkok_bev_unit.txt",
-  "bev_unit": 0.31147524796,
+  "bev_unit": 0.33554585343482757,
   "image_points": [[29.87, 196.86], [1023.02, 192.31], "..."],
   "bev_points": [[-4.12, -3.20], [3.03, -3.36], "..."],
   "calibration_source": {"homography": "roi", "bev_unit": "roi"},
@@ -491,7 +498,7 @@ ROI.
 ```python
 from violation_detector import ZebraCrossingROI
 
-roi = ZebraCrossingROI("roi_bev.json", bev_unit=0.31147524796)
+roi = ZebraCrossingROI("roi_bev.json", bev_unit=0.33554585343482757)
 ```
 
 `ZebraCrossingROI` richiede esattamente due chiavi: **`bev_points`** e
@@ -532,7 +539,7 @@ riproducibilità.
 
 ## Note
 
-- L'anteprima BEV usa la calibrazione in uso; con una ROI caricata la
+- L'elenco delle coordinate BEV usa la calibrazione in uso; con una ROI caricata la
   calibrazione di provenienza ha la precedenza.
 - La coppia `(homography, bev_unit)` deve provenire dalla **stessa**
   estrazione: vedi `docs/extract_homography.md`.

@@ -1,5 +1,8 @@
 # Core runtime
 ultralytics>=8.4.61   # v2 checkpoints need the YOLO26 Pose26 head; 8.4.61 is the tested version
+# PyTorch con build CUDA: cambiare la versione di CUDA nel --extra-index-url se si usa
+# una CUDA diversa (es. cu128, cu130) e scegliere la build corretta per il proprio OS.
+--extra-index-url https://download.pytorch.org/whl/cu126
 torch>=2.1
 numpy>=1.24
 opencv-python>=4.8

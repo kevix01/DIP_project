@@ -5,9 +5,10 @@ Questo documento descrive come usare `extract_homography.py` per calibrare la
 (scala media delle footprint in BEV) a partire da un video di calibrazione.
 
 Lo script è **standalone**: non usa la pipeline real-time (`bev_realtime_v2`),
-non fa tracking né rendering. Esegue solo l'inferenza pose, filtra le
-footprint affidabili dei veicoli e risolve una singola omografia globale con
-l'ottimizzatore a vincolo di ortogonalità (`homography_rt.py`).
+non fa tracking completo né rendering. Esegue solo l'inferenza pose, filtra le
+footprint affidabili dei veicoli, raggruppa le detection in tracce minime per
+IoU (serve al raffinamento rigido, §5.6) e risolve una singola omografia
+globale con l'ottimizzatore a vincolo di ortogonalità (`homography_rt.py`).
 
 ---
 
@@ -37,12 +38,14 @@ l'ottimizzatore a vincolo di ortogonalità (`homography_rt.py`).
 
 | Libreria | Ruolo |
 |---|---|
-| `ultralytics` | Inferenza del modello pose (YOLO) |
+| `ultralytics` | Inferenza del modello pose (YOLO); richiede PyTorch a runtime |
+| `torch` | Runtime di PyTorch per l'inferenza Ultralytics (non importato direttamente dallo script) |
 | `opencv-python` | Lettura video e test di convessità |
 | `numpy` | Calcolo numerico |
 
-Lo script **non dipende più** da `bev_realtime_v2`, `bev_realtime`, `refine_v2`
-né da nessun altro modulo della pipeline real-time. Non richiede nemmeno un
+Lo script **non dipende più** da `bev_realtime_v2`, `bev_realtime` né da altri
+moduli della pipeline real-time (il refinement rigido è implementato dentro
+lo script stesso). Non richiede nemmeno un
 file di omografia pre-esistente in input (il vecchio script terminava con
 `sys.exit(1)` se `homography_bangkok.npy` mancava).
 
@@ -132,24 +135,31 @@ Il flusso, in ordine di esecuzione:
 1. **Inferenza pose** (YOLO) su ogni frame del video.
 2. **Filtro qualità dei keypoint** — replica fedelmente i controlli della
    pipeline v2 (`V2Pipeline._detect_pose`):
-   - soglia di confidenza per classe (`class_conf`: person 0.4, bike 0.5, moto 0.5);
-   - visibilità dei keypoint (`kp_vis = 0.5`);
+   - soglia di confidenza effettiva 0.25 per le classi ammesse alla calibrazione
+     (person 0.4, bike 0.5, moto 0.5 sono i valori nominali, ma per le classi
+     veicolo la soglia effettiva resta `KP_CONF = 0.25`);
+   - visibilità dei keypoint (`kp_vis = 0.5`): accettata se tutti i keypoint
+     hanno visibilità ≥ 0.5, oppure se la media ≥ 0.5, i keypoint a terra ≥ 0.425
+     e il minimo ≥ 0.35;
    - keypoint dentro la box 2D (tolleranza 0.75) e non collassati a (0,0);
    - **convessità** della footprint (un quad auto-intersecante scarta la detection);
    - area minima della footprint (≥ max(16 px², 0.3% della box 2D));
    - keypoint **tutti dentro il frame** (gli estremi estrapolati non sono affidabili);
-   - box non tagliata dal bordo immagine;
+   - scarto del centro dei keypoint dalla box ≤ 0.5 × diagonale della box;
+   - box non tagliata dal bordo immagine (margine `max(15 px, 1% della diagonale)`);
    - rapporto area keypoint/box tra 0.12 e 2.5.
 3. **Selezione classi** — entrano in calibrazione solo veicoli con ground
    affidabile: car (2), bus (5), truck (7), bicycle (1), motorcycle (3). I
    pedoni sono esclusi (la pipeline li rappresenta con un quad sintetico
    dalla box 2D, privo di informazione geometrica utile alla rettifica).
 4. **GroundIndexResolver** — determina quali 4 degli 8 keypoint sono i
-   vertici a terra (voto maggioritario sui primi frame, come in pipeline).
+   vertici a terra: vota per 5 frame osservati (frame in cui sono state
+   accettate detection di calibrazione) e si blocca a maggioranza stretta.
 5. **Raggruppamento in tracce** — le detection sono raggruppate per IoU in
-   immagine (`_group_tracks`), così da sapere quali osservazioni appartengono
-   allo **stesso oggetto rigido**. È l'unica cosa che la calibrazione chiede
-   al tracking: un veicolo ha UNA sola forma di footprint.
+   immagine (`_group_tracks`, IoU minimo 0.2, max 12 frame persi), scartando
+   le tracce con meno di 4 osservazioni, così da sapere quali osservazioni
+   appartengono allo **stesso oggetto rigido**. È l'unico uso del tracking:
+   un veicolo ha UNA sola forma di footprint.
 6. **Solve globale di bootstrap** — `OrthoHomographySolver`
    (Levenberg-Marquardt su 4 DoF essenziali, residui = coseni degli angoli
    delle footprint + parallelismo opposto, pesi IRLS Cauchy) su tutte le
@@ -158,11 +168,13 @@ Il flusso, in ordine di esecuzione:
    disattiva i pesi IRLS Cauchy (vedi §6.3).
 7. **Raffinamento rigido per-traccia** (vedi §5.6) — ad ogni iterazione le
    footprint proiettate nella gauge corrente vengono allineate alla **forma
-   rigida** della propria traccia (MLE Procrustes + snap a rettangolo, la
-   stessa stima della forma di `refine_v2`), e le osservazioni il cui
-   disaccordo con quella forma supera `--rigid-pct` percentile vengono
-   scartate. Il solve viene poi ripetuto sull'insieme pulito. Di default
-   5 iterazioni.
+   rigida** della propria traccia (stima MLE della forma a mediana con
+   allineamento tipo Procrustes: `_shape_mle` + `_best_alignment`), e le
+   osservazioni il cui disaccordo con quella forma supera `--rigid-pct`
+   percentile vengono scartate. Il solve viene poi ripetito sull'insieme
+   pulito: a partire dalla prima iterazione efficace, il dataset usato dal
+   solver e per la `bev_unit` finale contiene **solo le footprint tracciate**
+   (quelle raggruppate in §5). Di default 5 iterazioni.
 8. **bev_unit** — mediana di √(larghezza×lunghezza) delle footprint proiettate
    con la H appena estratta (formula di `_class_footprint_dims`).
 9. **Salvataggio** dei tre file descritti sopra.
@@ -182,7 +194,7 @@ l'osservazione misura quanto quella vista è "pulita".
 
 Le osservazioni pulite formano un dataset omogeneo per il solver, che a
 quel punto vede solo quadrilateri realmente rettangolari. Questo è il
-contributo che la vecchia pipeline completa traeva da `refine_v2`
+contributo che la vecchia pipeline completa traeva dal refinement offline
 (`_shape_mle` + `_best_alignment`); qui è espresso come **filtro**, così lo
 script resta standalone e non deve ricostruire la geometria 3D per riposare
 i footprint.
@@ -241,39 +253,37 @@ Su `video_041_tagliato_2.avi` (900 frame, 6526 footprint) il default produce
 con meno dati, perché il vincolo di rigidità per-traccia ha bisogno di più
 osservazioni dello stesso oggetto. **Calibrare sul video più lungo disponibile.**
 
-Confronto con la calibrazione già presente nel repo
-(`homography_bangkok.npy`, `bev_unit = 0.31147524796`), la nuova coppia è
-geometricamente equivalente ma espressa in gauge diverse (scala ≈ 0.885,
-rotazione ≈ 1.1°): come ricorda la regola d'oro sotto, **H e bev_unit vanno
-sempre usate insieme**.
+I valori storici `0.373092117369` (default) e `0.367480188935`
+(`--no-robust`) citati in §6.3 appartengono a esecuzioni con versioni
+precedenti dello script e non descrivono la coppia attualmente presente nel
+repo.
+
+### 6.2bis La coppia attualmente nel repo
 
 | Configurazione | `bev_unit` |
 |---|---|
-| Coppia in uso nel repo | `0.31147524796` |
-| Nuova coppia (video 041 integrale) | `0.335545853435` |
+| Coppia in uso nel repo (`homography_bangkok.npy` + `homography_bangkok_bev_unit.txt`) | `0.335545853435` |
+| Stesso valore in `roi_bev.json` | `0.33554585343482757` |
 
-La `bev_unit` della coppia già in uso nel repo
-(`homography_bangkok.npy` + `homography_bangkok_bev_unit.txt`) è
-**`0.31147524796`**; ricalcolata sulle stesse 6526 footprint dà `0.308080`
-(≈ −1 % rispetto al valore memorizzato, che era stato calcolato su un
-insieme di quad leggermente diverso).
-
-Il rapporto fra le due gauge è **0.373092117369 / 0.31147524796 = 1.1978**:
-le due omografie sono geometricamente equivalenti ma espresse in gauge
-diverse (differiscono per una similitudine di scala ≈ 1.20–1.24 e una
-rotazione di pochi gradi). Come ricorda la regola d'oro, **H e bev_unit
-devono essere usate insieme**: passare `--bev-unit-file homography_bangkok_bev_unit.txt`
-con la H nuova (o viceversa) introduce un errore di gauge del ~20 % sulle dimensioni
-delle footprint in BEV, che si traduce in errori sulle distanze di conflitto
-usate dal rilevatore TTC.
+La coppia nel repo è **già coerente**: `roi_bev.json` è stata ri-proiettata con
+l'omografia e la `bev_unit` attualmente presenti (residuo
+similarity-invariant sui vertici della ROI ≈ 3e-7 BEU, scala ≈ 1.000,
+rotazione ≈ 0°). Non va mescolata con calibrazioni provenienti da
+estrazioni diverse: come ricorda la regola d'oro sotto, **H e bev_unit vanno
+sempre usate insieme**, perché una gauge diversa introduce un errore di
+scala sulle dimensioni delle footprint in BEV, che si traduce in errori sulle
+distanze di conflitto usate dal rilevatore TTC.
 
 ### 6.3 Effetto di `--no-robust`
 
-Il solve non robusto **non rigetta i corner outlier**: la loss passa da
-`29.90` a `189.25` (× 6.3) e la convergenza avviene in 7 iterazioni invece
-di 30 (la LM si ferma su un minimo peggiore). La `bev_unit` cambia da
-`0.373092117369` a `0.367480188935` (−1.5 %): la differenza di gauge è
-piccola, ma la rettifica è peggiore.
+Il solve non robusto **non rigetta i corner outlier**: su una esecuzione di
+riferimento la loss passa da `29.90` a `189.25` (× 6.3) e la convergenza
+avviene in 7 iterazioni invece di 30 (la LM si ferma su un minimo peggiore).
+La `bev_unit` cambia da `0.373092117369` a `0.367480188935` (−1.5 %): la
+differenza di gauge è piccola, ma la rettifica è peggiore. Questi numeri
+provengono da una versione precedente dello script (la coppia oggi nel repo
+ha `bev_unit = 0.335545853435`, §6.2bis): vanno usati come ordine di
+grandezza, non come riferimento assoluto.
 
 **Uso corretto**: `--no-robust` serve solo per confronto diagnostico
 ("quanto guadagno il rigetto degli outlier?"). Non va usato per produrre
@@ -293,9 +303,11 @@ rotazione) viene stampato a fianco, così le due calibrazioni sono confrontabili
 sullo stesso piano. Un residuo grande resta una campanella di allarme: la nuova
 calibrazione si discosta da quella su cui la ROI è stata disegnata.
 
-Su `video_041.avi` il residuo similarity-invariant della nuova calibrazione
-rispetto a quella in uso nel repo è **0.032 BEU medio, 0.068 BEU massimo** sui
-vertici della ROI (gauge: scala ≈ 0.885, rotazione ≈ 1.1°).
+Con la coppia attualmente nel repo (H e `bev_unit` coerenti) il residuo
+similarity-invariant è nullo per costruzione (i `bev_points` di
+`roi_bev.json` sono stati ri-proiettati con quella stessa calibrazione).
+Un residuo grande resta una campanella di allarme: la nuova calibrazione si
+discosta da quella su cui la ROI è stata disegnata.
 
 Quando si cambia la calibrazione, la ROI in BEV va ri-proiettata con la nuova
 H: `roi_bev.json` memorizza infatti i `bev_points` assoluti calcolati con la
@@ -367,15 +379,16 @@ La pipeline real-time consuma la coppia in due punti:
    | File | Valore |
    |---|---|
    | `homography_bangkok.npy` | H in gauge "repo" |
-   | `homography_bangkok_bev_unit.txt` | `0.31147524796` |
+   | `homography_bangkok_bev_unit.txt` | `0.335545853435` |
 
    Se si estrae una nuova coppia (es. `--output homography.npy` →
-   `bev_unit = 0.373092117369`), vanno **sostituiti entrambi i file insieme** e
-   `--bev-unit-file` deve puntare al nuovo file `*_bev_unit.txt`.
+   `homography_bev_unit.txt`), vanno **sostituiti entrambi i file insieme** e
+   `--bev-unit-file` deve puntare al nuovo file `*_bev_unit.txt`; anche la
+   ROI va ri-proiettata con `--reproject-roi` (§6.5).
 
-Il confronto con la vecchia coppia Bangkok (`H` con `bev_unit ≈ 0.311`) è
-invariante: la pipeline rende la BEV adattando il viewport alla gauge, quindi
-coppie coerenti diverse producono la stessa vista, a scala di gauge ribaltata.
+   Il confronto con una coppia in una gauge diversa è
+   invariante: la pipeline rende la BEV adattando il viewport alla gauge, quindi
+   coppie coerenti diverse producono la stessa vista, a scala di gauge ribaltata.
 
 ---
 

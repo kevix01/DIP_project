@@ -5,7 +5,7 @@ Questa guida descrive gli script usati nel progetto:
 - **extract_homography.py** stima la trasformazione dal piano immagine al piano stradale BEV e la relativa scala.
 - **select_roi_bev.py** permette di disegnare e salvare la regione stradale d’interesse (ROI).
 - **violation_detector.py** contiene la logica che valuta i conflitti veicolo-pedone e registra le violazioni.
-- **bev_realtime_v2.py** esegue la pipeline di inferenza, tracking, BEV e rilevamento delle violazioni.
+- **bev_realtime_v2.py** è la libreria della pipeline v2 (sorgente video, inferenza, tracking, proiezione BEV e rendering); il rilevamento delle violazioni è orchestrato da **debug_violations.py** e implementato in **violation_detector.py**.
  - **debug_violations.py** esegue la pipeline con visualizzazioni diagnostiche, inclusa la tabella TTC.
  - **export_engine.py** esporta il checkpoint `.pt` in un engine TensorRT/ONNX ottimizzato (vedi `EXPORT_ENGINE.md`).
 
@@ -30,9 +30,7 @@ Prima di elaborare, è consigliabile esportare il modello in engine FP16 (una vo
     python export_engine.py --weights weights/pose.pt --imgsz 640 --half
     # poi usare --kp-model weights/pose_640_fp16.engine
 
-Per elaborare senza la visualizzazione diagnostica, si può eseguire la pipeline normale:
-
-    python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit-file homography_bangkok_bev_unit.txt --device cuda:0 --output "demo.mp4"
+La pipeline v2 senza la tabella diagnostica è disponibile come modulo `bev_realtime_v2.py`; attualmente non esiste un comando CLI autonomo che la avvii senza `debug_violations.py` (che usa sempre `DebugV2Pipeline` e mostra la tabella TTC).
 
 Eseguire gli ultimi due comandi dalla cartella del progetto: la pipeline carica l’omografia statica dal percorso relativo **homography_bangkok.npy**. Per un’altra scena, mettere in quel percorso la matrice della calibrazione corrispondente e creare/aggiornare una ROI con la medesima calibrazione. Non abbinare una matrice H a una bev_unit o a una ROI prodotte con una calibrazione diversa.
 
@@ -40,7 +38,7 @@ Eseguire gli ultimi due comandi dalla cartella del progetto: la pipeline carica 
 
 ### extract_homography.py
 
-Legge un video e inferisce le pose dei veicoli con un checkpoint YOLO pose. Filtra le footprint a terra attendibili, identifica i keypoint a terra, quindi stima una singola omografia globale con vincolo di ortogonalità. Non esegue tracking e non produce un video annotato.
+Legge un video e inferisce le pose dei veicoli con un checkpoint YOLO pose. Filtra le footprint a terra attendibili, identifica i keypoint a terra, quindi stima una singola omografia globale con vincolo di ortogonalità. Non usa il tracker realtime della pipeline (per il refinement calibra le footprint raggruppando osservazioni coerenti in brevi gruppi) e non produce un video annotato.
 
 **Input:** video di calibrazione leggibile da OpenCV e checkpoint pose compatibile (.pt o .engine). È preferibile una telecamera fissa, con veicoli ben visibili distribuiti sulla scena.
 
@@ -79,7 +77,7 @@ Avvia un’interfaccia web locale nel browser. L’utente carica o indica un’i
 
 ### violation_detector.py
 
-Questo file **non è un comando CLI autonomo**: definisce ZebraCrossingROI e ViolationDetector, usati da **bev_realtime_v2.py** e **debug_violations.py**. Riceve le tracce e i frame già elaborati dalla pipeline, valuta i conflitti nella ROI tramite TTC e informazioni sul moto/intento dei pedoni, quindi salva gli eventi confermati.
+Questo file **non è un comando CLI autonomo**: definisce `ZebraCrossingROI` e `ViolationDetector`, usati da **debug_violations.py** e dal runner della webapp `webapp/debug_runner.py`. Riceve le tracce e i frame già elaborati dalla pipeline, valuta i conflitti nella ROI tramite TTC e informazioni sul moto/intento dei pedoni, quindi salva gli eventi confermati.
 
 La ROI JSON deve contenere image_points e bev_points (almeno tre punti per ciascun poligono). Le opzioni per configurare il rilevatore sono passate al programma che lo richiama:
 
@@ -108,7 +106,7 @@ Opzioni specifiche del debug:
 | **--table-height** | 280 px | Altezza del pannello/tabella TTC. |
 | **--no-save-violations** | disattivato | Non salva gli artefatti degli eventi (JSON e clip); non disabilita il video debug passato a --output. |
 
-Oltre a queste due opzioni, lo script accetta le opzioni della pipeline base e quelle v2 riportate nelle tabelle seguenti. Il parser riconosce l’interfaccia completa del runtime, ma il ciclo di debug non applica ogni opzione avanzata: in particolare refinement offline, pseudo-label e detector ausiliario non fanno parte del flusso debug. Le opzioni di violazione elencate sopra valgono anche quando si lancia **bev_realtime_v2.py** direttamente.
+Oltre a queste due opzioni, lo script accetta le opzioni della pipeline base e quelle v2 riportate nelle tabelle seguenti. Il parser riconosce l’interfaccia del runtime attualmente presente nel codice; alcune opzioni riconosciute dal parser base, come il solver `--homography`, non hanno un effetto distinto nel flusso debug, che carica l’omografia statica configurata in `V2Pipeline`. Gli strumenti di refinement offline e pseudo-label descritti nella documentazione originale non sono presenti in questo checkout. `bev_realtime_v2.py` è una libreria di pipeline: non ha un `main()` e non è avviabile direttamente come script.
 
 #### Opzioni base della pipeline (accettate da debug_violations.py)
 
@@ -118,48 +116,39 @@ Oltre a queste due opzioni, lo script accetta le opzioni della pipeline base e q
 | **--kp-imgsz**, **--kp-conf** | 640, 0.25: dimensione e confidenza del detector pose. |
 | **--device**, **--export**, **--half** | cpu; none (engine, tensorrt, onnx disponibili); FP16 per l’export accelerato. |
 | **--ground-indices** | Automatico; altrimenti indici keypoint a terra separati da virgole, ad es. 0,1,2,3. |
-| **--homography** | ortho; modalità ortho, adam o none. |
+| **--homography** | ortho; modalità ortho, adam (alias CLI dell’algoritmo ortogonale) o none. |
 | **--no-3d**, **--no-snap-rect** | Disattivano cuboidi o rettangolarizzazione delle footprint. |
 | **--no-trails**, **--trail-len** | Scie BEV disattivate o lunghezza (16 frame). |
 | **--no-fov** | Nasconde il campo visivo della telecamera nella BEV. |
-| **--no-stabilize**, **--bev-window**, **--solver-ema** | Controllo stabilizzazione; finestra 512 footprint, EMA 0 (disattivata). |
-| **--track-alpha**, **--track-beta** | Parametri del tracker: 0.5, 0.08. |
-| **--max-age**, **--min-hits**, **--no-cmc** | Tracker: 30, 2; disabilita la compensazione del moto camera. |
+| **--no-stabilize**, **--bev-window** | Controllo stabilizzazione; finestra 512 footprint. |
+| **--max-age**, **--min-hits** | Tracker: 30, 2. |
 | **--output**, **--display**, **--max-frames** | Nessun file completo se --output è omesso; mostra la finestra se richiesto; 0 elabora tutto. |
-| **--smooth**, **--smooth-poly** | Finestra offline 0 (disattivata), ordine Savitzky-Golay 2. |
-| **--bev-freeze**, **--scale-lock**, **--fixed-camera** | Opzioni BEV offline; camera off di default (auto/on/off). |
-| **--online** | Attiva la stabilizzazione causale per stream. |
-| **--sync**, **--render-procs**, **--queue** | Rendering sincrono; processi 1 (valore 0 usa un thread); coda 4. |
-| **--aux-model**, **--aux-conf**, **--aux-every**, **--aux-footprint**, **--no-aux-box**, **--aux-overlap**, **--aux-width-scale**, **--aux-gate**, **--aux-gate-iou** | Flag riconosciuti dal parser base per il detector ausiliario (default: yolo26x.pt, confidenza 0.30, intervallo 1, overlap 0.12, scala 0.9, IoU 0.3); il percorso debug imposta il detector ausiliario a none e non lo usa. |
+| **--smooth** | Finestra offline 0 (disattivata). |
 
 #### Opzioni v2 e rendering (accettate da debug_violations.py)
 
 | Opzioni | Default / significato |
 |---|---|
-| **--kp-vis**, **--suppress-nested**, **--class-conf** | 0.5; 0 (disattivato); soglie per classe, ad es. 0:0.4,1:0.5,3:0.5. |
+| **--kp-vis**, **--class-conf** | 0.5; soglie per classe (default vuota), ad es. `0:0.4,1:0.5,3:0.5`. |
 | **--bev-canvas**, **--layout** | Dimensione pannello WxH; layout side oppure dashboard (default side). |
-| **--caption**, **--title** | Testo scena; tempi del titolo di apertura in secondi sorgente. |
-| **--object-px**, **--bev-fit**, **--bev-fit-min-px**, **--bev-fit-pct** | Zoom BEV 40 px per oggetto mediano; autofit disattivato, minimo 22 px, percentile 90. |
-| **--label-min-h**, **--coast-mark**, **--show-bev-ids** | Altezza minima etichetta 26 px; aggiunge ? alle tracce in coast; mostra gli ID BEV. |
+| **--caption**, **--title** | Testo scena; tempi del titolo di apertura `start,fade-in,hold,fade-out` in secondi sorgente (il flusso debug corrente disabilita il titolo). |
+| **--object-px** | Zoom BEV 40 px per oggetto mediano. |
+| **--label-min-h**, **--show-bev-ids** | Altezza minima etichetta 26 px; mostra gli ID BEV. |
 | **--source-type** | auto; selezionare video o stream per forzare il tipo. |
-| **--track-high-conf**, **--track-ocm-weight** | Soglia automatica; peso direzione tracker 0.25. |
-| **--refine** / **--track-cleanup** | Abilita refinement offline delle tracce nella pipeline v2. |
-| **--no-fill-box**, **--no-vel-heading**, **--no-rigid-cuboids** | Disattivano le rispettive correzioni geometriche del refinement. |
-| **--refine-fps**, **--speed-ratio**, **--max-reproj**, **--max-gap**, **--min-fill** | Parametri refinement: FPS sorgente automatico (0), rapporto velocità 3, reproiezione 0.10, gap 45, riempimento minimo 0.5. |
-| **--no-dedupe**, **--no-shape-smooth**, **--shape-win**, **--no-world-lock**, **--no-hold-still** | Controllano deduplicazione, smoothing (finestra 31), world lock e blocco dei veicoli fermi. |
-| **--min-track**, **--coast-tail**, **--merge-gap** | Refinement: 12, 8, 30 frame. |
-| **--labels**, **--labels-from**, **--labels-source** | Esportazione facoltativa geometria pseudo-label; frame iniziale 0, sorgente originale opzionale. |
+| **--track-high-conf**, **--track-ocm-weight** | Se omesso, soglia `max(--kp-conf, 0.35)`; peso direzione tracker 0.25. |
+| **--fps** / **--refine-fps** | 0: letta dai metadati della sorgente. |
+| **--homography-file** | nessuno: default `homography_bangkok.npy`. |
 | **--bev-unit-file** | nessuno (default automatico): file .txt con la bev_unit della calibrazione della ROI. |
 
-Le opzioni refinement in questa tabella sono quelle del parser generale e sono effettive nel normale runtime v2 quando il relativo percorso offline viene usato; il ciclo di **debug_violations.py** non esegue quel refinement. Le opzioni principali effettive per il rilevamento nel debug sono input, checkpoint, ROI, bev_unit, soglia TTC e conferma frame, oltre ai controlli di visualizzazione esplicitamente applicati.
+Le opzioni principali effettive per il rilevamento nel debug sono input, checkpoint, ROI, bev_unit, soglia TTC e conferma frame, oltre ai controlli di visualizzazione esplicitamente applicati.
 
 ### bev_realtime_v2.py
 
-È il programma principale per eseguire il modello v2 su un video o uno stream. Rileva persone e veicoli, stima i cuboidi 3D dai keypoint, mantiene le tracce nel tempo, visualizza la scena in prospettiva e in BEV e, con una ROI, applica il rilevatore di violazioni. Non include la tabella diagnostica TTC di **debug_violations.py**.
+È il **modulo di pipeline** che implementa sorgente video, modello v2, tracking, stima dei cuboidi 3D, visualizzazione in prospettiva e in BEV. Non è un entry point: non ha un `main()` e non rileva violazioni. Il comando CLI che orchestra questa pipeline e applica il rilevatore di violazioni è **debug_violations.py**.
 
-**Input:** video o stream supportato da OpenCV, checkpoint YOLO26 Pose26 compatibile con v2, file JSON ROI e omografia statica. Il file **homography_bangkok.npy** deve essere presente nella cartella di lavoro: il codice lo carica con quel nome. **--bev-unit-file**, se specificato, è il file di testo con la bev_unit e deve provenire dalla stessa calibrazione della ROI.
+**Input:** video o stream supportato da OpenCV, checkpoint YOLO26 Pose26 compatibile con v2, file JSON ROI e omografia statica. Il file **homography_bangkok.npy** deve essere presente nella cartella di lavoro (o indicato con **--homography-file**): il codice lo carica con quel nome. **--bev-unit-file**, se specificato, è il file di testo con la bev_unit e deve provenire dalla stessa calibrazione della ROI.
 
-**Output:** con **--output** salva il video completo annotato; con **--display** mostra la finestra durante l’elaborazione. Il default non salva il video completo. Il rilevatore salva comunque gli eventi confermati in **violations_<nome_video>/**: JSON e clip MP4, a meno che si specifichi **--no-clip**. Il salvataggio del video completo richiede FFmpeg con libx264 nel PATH.
+**Output:** tramite **debug_violations.py**, con **--output** si salva il video completo annotato; con **--display** viene mostrata la finestra durante l’elaborazione. Il default non salva il video completo. Il rilevatore salva gli eventi confermati in **violations_<nome_video>/**: JSON e clip MP4, a meno che si specifichi **--no-clip**. Il salvataggio del video completo richiede FFmpeg con libx264 nel PATH.
 
 | Opzione | Default | Descrizione |
 |---|---:|---|
@@ -179,15 +168,13 @@ Le opzioni refinement in questa tabella sono quelle del parser generale e sono e
 
 Il programma accetta inoltre le opzioni base e v2 elencate nelle due tabelle CLI della sezione **debug_violations.py** sopra. Sono gli stessi parser condivisi; **--table-height** e **--no-save-violations** sono invece specifici dello script di debug.
 
-Esempio:
-
     python debug_violations.py --input "video_demo.mp4" --kp-model "weights/pose.pt" --roi-file roi_bev.json --bev-unit-file homography_bangkok_bev_unit.txt --device cuda:0 --output "demo.mp4"
 
 ## Webapp di debug
 
-La cartella **webapp/** contiene un’interfaccia web locale (FastAPI + uvicorn) che riunisce le quattro fasi del flusso in schede: export del modello, estrazione dell’omografia, selezione della ROI e debug live con overlay delle infrazioni.
+La cartella **webapp/** contiene un’interfaccia web locale (FastAPI + uvicorn) che riunisce le quattro fasi del flusso in schede: export del modello, estrazione dell’omografia, selezione della ROI e debug live, che trasmette via WebSocket i frame renderizzati con la tabella TTC e gli eventi di infrazione.
 
-**Compatibilità:** Linux, macOS e Windows. Il codice usa solo percorsi tramite `pathlib`, non invoca shell e non dipende da utility UNIX: il selettore ROI viene avviato come subprocess con la stessa procedura su ogni piattaforma e il launcher non usa `setsid`, `nohup` o `curl`.
+**Compatibilità:** Linux, macOS e Windows. Il codice usa percorsi tramite `pathlib` e avvia i processi figli con liste di argomenti senza shell; la verifica di readiness usa `urllib`. Su Windows il comando `--stop` usa `taskkill`, su Linux/macOS usa `os.kill`: il launcher non usa `setsid`, `nohup` o `curl`.
 
 Avvio (unico comando, identico su tutte le piattaforme):
 
@@ -206,15 +193,17 @@ Il launcher avvia uvicorn in background e scrive il pidfile e il log; con `--for
 .venv/bin/python webapp/run_server.py --stop
 ```
 
-**Interprete e venv:** `run_server.py` cerca l’ambiente virtuale del progetto in **.venv\\Scripts\\python.exe** (Windows) o **.venv/bin/python** (Linux/macOS) e usa quell’interprete per avviare uvicorn. Se la venv non esiste viene usato l’interprete corrente (`sys.executable`). Gli stessi script lanciano con la stessa venv i processi figli: export dell’engine, estrazione dell’omografia e `select_roi_bev.py` (in locale: `webapp/main.py`, `webapp/roi_server.py`).
+**Interprete e venv:** `run_server.py` cerca l’ambiente virtuale del progetto in **.venv\\Scripts\\python.exe** (Windows) o **.venv/bin/python** (Linux/macOS) e usa quell’interprete per avviare uvicorn. Se la venv non esiste viene usato l’interprete corrente (`sys.executable`). Gli stessi script lanciano con la stessa venv i processi figli: export dell’engine, estrazione dell’omografia e `select_roi_bev.py` (in locale: `webapp/main.py`, `webapp/roi_server.py`); il debug live viene invece eseguito **in-process** in un thread worker (`webapp/debug_runner.py`).
 
-Variabili d’ambiente riconosciute: **DIP_WEB_HOST**, **DIP_WEB_PORT** (default 8099), **DIP_WEB_DEVICE**, **DIP_WEB_WEIGHTS**, **DIP_WEB_HOMOGRAPHY**, **DIP_WEB_BEV_UNIT**, **DIP_WEB_ROI**, **DIP_WEB_WORKDIR**, **DIP_WEB_LOG**, **DIP_WEB_PID**, **DIP_WEB_RUNTIME_DIR**. Il percorso dei pesi viene cercato automaticamente in **checkpoints/**, **weights/** e in un checkout fratello **DIP_new/urbanomnidetect/**; la venv viene rilevata sia in **.venv\\Scripts\\python.exe** sia in **.venv/bin/python**.
+Tra le variabili d’ambiente riconosciute: **DIP_WEB_HOST**, **DIP_WEB_PORT** (default 8099), **DIP_WEB_DEVICE**, **DIP_WEB_WEIGHTS**, **DIP_WEB_ENGINE**, **DIP_WEB_HOMOGRAPHY**, **DIP_WEB_BEV_UNIT**, **DIP_WEB_ROI**, **DIP_WEB_WORKDIR**, **DIP_WEB_LOG**, **DIP_WEB_PID**, **DIP_WEB_RUNTIME_DIR**, **DIP_WEB_MAX_UPLOAD**, **DIP_WEB_JPEG_QUALITY**, **DIP_WEB_FRAME_QUEUE**. Il percorso dei pesi viene cercato automaticamente in **checkpoints/**, **weights/** e in un checkout fratello **DIP_new/urbanomnidetect/** (per `urbanomnidetect_v2_x_640.pt` o `pose.pt`); la venv viene rilevata sia in **.venv\\Scripts\\python.exe** sia in **.venv/bin/python**.
 
 ## Dipendenze e file necessari all’esecuzione
 
 Installare le dipendenze Python con **python -m pip install -r requirements.txt**. L’estrazione e la pipeline di violazioni richiedono un checkpoint YOLO pose compatibile, non contenuto nel repository. Una GPU CUDA è consigliata; con un checkpoint e un ambiente compatibili si può usare **--device cpu**. Per salvare il video completo con **--output** serve anche FFmpeg con libx264.
 
-Per la calibrazione standalone servono **homography_rt.py** e il package **uod** (in particolare il modulo keypoints). Per l’applicazione e il debug v2 servono inoltre **bev_realtime.py**, **bev_realtime_v2.py**, **refine_v2.py**, **violation_detector.py**, **v2/__init__.py**, **v2/hybrid_v2.py** e **uod/**. **select_roi_bev.py** usa OpenCV, NumPy e la libreria standard Python.
+**PyTorch con CUDA:** `requirements.txt` abilita l’indice NVIDIA `cu126` tramite `--extra-index-url https://download.pytorch.org/whl/cu126` e specifica `torch>=2.1`; la build CUDA effettivamente selezionata va verificata dopo l’installazione. Se la vostra GPU richiede una versione di CUDA diversa, cambiate la URL nell’`--extra-index-url` (per esempio `cu128` o `cu130`) prima di installare; su Windows usate lo stesso installer CUDA indicato da PyTorch. Verificate la build installata con `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"`.
+
+Per la calibrazione standalone servono **homography_rt.py** e il package **uod** (in particolare il modulo keypoints). Per l’applicazione e il debug v2 servono inoltre **bev_realtime.py**, **bev_realtime_v2.py**, **violation_detector.py**, **debug_violations.py**, **v2/__init__.py**, **v2/hybrid_v2.py** e **uod/**. Il modulo `refine_v2.py` citato nella documentazione originale non è presente in questo checkout. `select_roi_bev.py` usa OpenCV, NumPy e la libreria standard Python. Il rilevamento delle violazioni richiede inoltre **shapely** (incluso in `requirements.txt`).
 
 Il runtime v2 legge **homography_bangkok.npy** dalla cartella di lavoro (o dal file indicato con **--homography-file**), mentre la ROI è indicata con **--roi-file**. La coppia leggibile **homography_bangkok.txt** e **homography_bangkok_bev_unit.txt** è utile per controllo e per caricare la calibrazione nel selettore ROI; la pipeline riceve la scala tramite **--bev-unit-file**, che indica il file di testo.
 
@@ -283,7 +272,7 @@ Every checkpoint is the epoch of its run with the highest road-class pose mAP, f
 ### Quick start
 
 ```bash
-pip install -r requirements.txt          # ultralytics 8.4.61 (tested), torch, opencv, scipy, ...
+pip install -r requirements.txt          # ultralytics 8.4.61 (tested), torch (CUDA 12.6 via --extra-index-url), opencv, scipy, ...
 huggingface-cli download mehmetkeremturkcan/UrbanOmniDetect-2 \
     checkpoints/urbanomnidetect_v2_x_640.pt --local-dir .
 ```
@@ -337,7 +326,10 @@ urbanomnidetect/
   extract_homography.py  # homography solver
   uod/                   # shared runtime: keypoints, BEV, tracking (OCSort), visualization, HUD
   v2/                    # UrbanOmniDetect-2 model registration: hybrid_v2.py (unpickling)
+  webapp/                # local debug web UI (FastAPI + uvicorn), see "Webapp di debug"
+  requirements.txt       # Python dependencies (PyTorch CUDA index included)
   USAGE.md               # command reference for the inference tools
+  docs/                  # select_roi_bev.md, extract_homography.md
 ```
 
 ## UrbanOmniDetect (CVPR 2026 DriveX)
