@@ -58,6 +58,23 @@ un veicolo ha invaso la ROI.
    eventuali sovrapposizioni in video) sia i vertici BEV (per il conteggio
    delle violazioni), più tutti i metadati di provenienza.
 
+### Come viene salvato il file
+
+Il salvataggio **non** usa il download del browser: il server HTTP locale
+scrive fisicamente il file JSON su disco e poi il browser lo scarica dalla
+rotta `/download-roi`. Questo è il comportamento introdotto per supportare
+Windows, dove il download del browser può fallire silenziosamente.
+
+- **Standalone** (`python select_roi_bev.py ...`): il file viene scritto
+  nella cartella di `--output` (per `--output roi_bev.json` è la cartella
+  di lavoro), con il nome scelto nel campo "Nome file JSON".
+- **Tramite webapp**: il file viene scritto nel percorso indicato da
+  `--save-path` (usato dal frontend per il flusso "estrai ROI dalla
+  webapp").
+
+In entrambi i casi il nome è sanitizzato: vengono rimossi eventuali
+percorsi e il nome viene forzato con estensione `.json`.
+
 ### La gauge: perché la calibrazione è così importante
 
 Una ROI vale solo nella **gauge** in cui è stata creata, cioè nella specifica
@@ -123,7 +140,7 @@ stessa estrazione**: vedi `docs/extract_homography.md`.
 | `--homography` | – | File dell'omografia 3x3. Accettati `.npy` e `.txt` (3 righe di 3 valori). Se non viene dato e c'è una ROI, la calibrazione di provenienza viene ripristinata. |
 | `--bev-unit-file` | – | File di testo con la `bev_unit` (un solo numero). Stessa logica dell'omografia. |
 | `--roi` | – | ROI JSON da pre-caricare. Vengono caricati i vertici, la calibrazione di provenienza e la posizione della sorgente. |
-| `--output` | `roi_bev.json` | Nome suggerito per il file di output (mostrato nel dialog di salvataggio). |
+| `--output` | `roi_bev.json` | Nome/percorso del file di output. In modalità standalone il server scrive il file salvato nella cartella di `--output`; il nome è anche precompilato nel campo "Nome file JSON" dell'interfaccia. |
 | `--frame-index` | `1` | Frame iniziale per i video, **1-based** (stessa base del JSON: 1 = primo frame). Con `--roi`, se non viene indicato un valore esplicito, l'app si posiziona sul frame di riferimento della ROI. |
 | `--port` | `8080` | Porta del server HTTP locale. |
 | `--no-browser` | – | Non aprire il browser automaticamente. |
@@ -142,7 +159,7 @@ browser su quella pagina.
 | **Calibrazione** | Omografia e `bev_unit` caricate, con il nome del file. |
 | **Vista** | Zoom, reset, adatta allo schermo. |
 | **ROI** | Rettangolo di default, cancella punti, carica ROI JSON esistente. |
-| **Salvataggio** | Salva ROI, Esci, e la barra di stato (verde = ok, rosso = warning/errore). |
+| **Salvataggio** | Campo "Nome file JSON" (default `roi_bev.json`), pulsante Salva ROI, Esci, e la barra di stato (verde = ok, rosso = warning/errore). |
 | **Punti BEV** | Elenco dei vertici proiettati con le coordinate. |
 
 ### Comandi mouse

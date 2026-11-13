@@ -194,8 +194,22 @@ class RoiServerManager:
             target = "/" + target
 
         if method.upper() == "POST" and target == "/save-roi":
-            return self._handle_save_roi(body)
+            status, headers, data = self._proxy_to_selector(
+                method, target, body, headers
+            )
+            if 200 <= status < 300:
+                self._capture_saved_roi()
+            return status, headers, data
 
+        return self._proxy_to_selector(method, target, body, headers)
+
+    def _proxy_to_selector(self, method: str, target: str, body: bytes,
+                           headers: Dict[str, str]) -> Tuple[int, Dict[str, str], bytes]:
+        with self._lock:
+            server = self.server
+        if server is None or not server.alive():
+            return 503, {"Content-Type": "application/json"}, \
+                json.dumps({"error": "selettore ROI non in esecuzione"}).encode()
         conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=120)
         try:
             conn.request(method, target, body=body, headers=headers)
@@ -203,13 +217,21 @@ class RoiServerManager:
             data = resp.read()
             out_headers = {k: v for k, v in resp.getheaders()
                            if k.lower() not in ("transfer-encoding", "connection")}
-            if "content-type" in {k.lower() for k in out_headers}:
-                out_headers = {k: v for k, v in out_headers.items()}
-            else:
-                out_headers["Content-Type"] = resp.getheader("Content-Type", "application/octet-stream")
+            if "content-type" not in {k.lower() for k in out_headers}:
+                out_headers["Content-Type"] = resp.getheader(
+                    "Content-Type", "application/octet-stream")
             return resp.status, out_headers, data
         finally:
             conn.close()
+
+    def _capture_saved_roi(self) -> None:
+        with self._lock:
+            save_path = self.server.save_path if self.server else self._save_path
+        try:
+            if save_path.exists():
+                self.set_last_roi(json.loads(save_path.read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_save_roi(self, body: bytes) -> Tuple[int, Dict[str, str], bytes]:
         """Store the ROI the embedded selector posts and persist it server-side.

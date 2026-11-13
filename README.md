@@ -189,19 +189,26 @@ La cartella **webapp/** contiene un’interfaccia web locale (FastAPI + uvicorn)
 
 **Compatibilità:** Linux, macOS e Windows. Il codice usa solo percorsi tramite `pathlib`, non invoca shell e non dipende da utility UNIX: il selettore ROI viene avviato come subprocess con la stessa procedura su ogni piattaforma e il launcher non usa `setsid`, `nohup` o `curl`.
 
-Avvio:
+Avvio (unico comando, identico su tutte le piattaforme):
 
 ```bash
 # Linux / macOS
-webapp/run_server.sh
+.venv/bin/python webapp/run_server.py
 
-# Windows (o qualsiasi piattaforma)
-python webapp\run_server.py
+# Windows
+.venv\Scripts\python.exe webapp\run_server.py
 ```
 
-Variabili d’ambiente riconosciute: **DIP_WEB_HOST**, **DIP_WEB_PORT** (default 8099), **DIP_WEB_DEVICE**, **DIP_WEB_WEIGHTS**, **DIP_WEB_HOMOGRAPHY**, **DIP_WEB_BEV_UNIT**, **DIP_WEB_ROI**, **DIP_WEB_WORKDIR**, **DIP_WEB_LOG**, **DIP_WEB_PID**. Il percorso dei pesi viene cercato automaticamente in **checkpoints/**, **weights/** e in un checkout fratello **DIP_new/urbanomnidetect/**; su Windows l’ambiente virtuale viene rilevato sia in **.venv\\Scripts\\python.exe** sia in **.venv/bin/python**.
+Il launcher avvia uvicorn in background e scrive il pidfile e il log; con `--foreground` il server resta in primo piano, con `--stop` viene arrestato il server registrato nel pidfile:
 
-Il launcher accetta anche `--foreground` (server in primo piano) e `--stop` (arresta il server registrato nel pidfile).
+```bash
+.venv/bin/python webapp/run_server.py --foreground
+.venv/bin/python webapp/run_server.py --stop
+```
+
+**Interprete e venv:** `run_server.py` cerca l’ambiente virtuale del progetto in **.venv\\Scripts\\python.exe** (Windows) o **.venv/bin/python** (Linux/macOS) e usa quell’interprete per avviare uvicorn. Se la venv non esiste viene usato l’interprete corrente (`sys.executable`). Gli stessi script lanciano con la stessa venv i processi figli: export dell’engine, estrazione dell’omografia e `select_roi_bev.py` (in locale: `webapp/main.py`, `webapp/roi_server.py`).
+
+Variabili d’ambiente riconosciute: **DIP_WEB_HOST**, **DIP_WEB_PORT** (default 8099), **DIP_WEB_DEVICE**, **DIP_WEB_WEIGHTS**, **DIP_WEB_HOMOGRAPHY**, **DIP_WEB_BEV_UNIT**, **DIP_WEB_ROI**, **DIP_WEB_WORKDIR**, **DIP_WEB_LOG**, **DIP_WEB_PID**, **DIP_WEB_RUNTIME_DIR**. Il percorso dei pesi viene cercato automaticamente in **checkpoints/**, **weights/** e in un checkout fratello **DIP_new/urbanomnidetect/**; la venv viene rilevata sia in **.venv\\Scripts\\python.exe** sia in **.venv/bin/python**.
 
 ## Dipendenze e file necessari all’esecuzione
 

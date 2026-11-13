@@ -199,7 +199,11 @@ canvas { display: block; cursor: crosshair; }
   <div class="section">
     <h2>Salvataggio</h2>
     <div class="btn-row">
-      <button class="btn btn-success" onclick="saveROI()" id="saveBtn">Salva ROI... (scegli nome)</button>
+      <button class="btn btn-success" onclick="saveROI()" id="saveBtn">Salva ROI</button>
+    </div>
+    <div class="btn-row">
+      <label for="outputNameInput">Nome file JSON</label>
+      <input type="text" id="outputNameInput" value="roi_bev.json" style="width:100%; padding:6px 8px; background:#1e1e1e; color:#ddd; border:1px solid #444; border-radius:3px; font-size:12px;">
     </div>
     <div class="btn-row">
       <button class="btn btn-danger" onclick="quitApp()">Esci</button>
@@ -255,6 +259,9 @@ let HOMOGRAPHY_FILE = INITIAL.homography_file;
 let BEV_UNIT_FILE = INITIAL.bev_unit_file;
 let SOURCE_FRAME = INITIAL.source;
 let OUTPUT_FILE = INITIAL.output_file || 'roi_bev.json';
+const initialOutputName = (OUTPUT_FILE || 'roi_bev.json').split(/[\\/]/).pop() || 'roi_bev.json';
+const outputNameInput = document.getElementById('outputNameInput');
+if (outputNameInput) outputNameInput.value = initialOutputName;
 let IS_VIDEO = INITIAL.is_video;
 let TOTAL_FRAMES = INITIAL.total_frames;
 // CURRENT_FRAME_INDEX è 1-based (il "numero frame" che vede l'utente)
@@ -356,6 +363,27 @@ function fitToScreen() {
   scale = 1; transX = 0; transY = 0;
   draw(); updateBEVDisplay();
 }
+// Il selettore puo' essere caricato mentre la pagina webapp e' in una tab
+// nascosta (dimensioni 0): al rientro in tab il canvas deve essere
+// riadattato, altrimenti resta con width/height a 0.
+function scheduleFitToScreen() {
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fitToScreen);
+  else setTimeout(fitToScreen, 50);
+}
+if (typeof ResizeObserver === 'function') {
+  const canvasContainer = document.querySelector('.canvas-container');
+  if (canvasContainer) {
+    new ResizeObserver(() => {
+      if (img && canvasContainer.clientWidth > 0) fitToScreen();
+    }).observe(canvasContainer);
+  }
+}
+window.addEventListener('resize', scheduleFitToScreen);
+window.addEventListener('load', scheduleFitToScreen);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) scheduleFitToScreen();
+});
+
 function loadImage(url) {
   img = new Image();
   img.onload = () => {
@@ -383,7 +411,8 @@ function loadImage(url) {
       imgWidth + ' x ' + imgHeight +
       (IS_VIDEO ? '  -  Frame ' + CURRENT_FRAME_INDEX + '/' + TOTAL_FRAMES : '');
     document.getElementById('canvasHint').style.display = 'block';
-    fitToScreen();
+    scheduleFitToScreen();
+    setTimeout(fitToScreen, 120);
   };
   img.onerror = () => setStatus('Errore caricamento frame', 'err');
   img.src = url;
@@ -656,50 +685,35 @@ async function saveROI() {
   } else {
     payload.source_frame = SOURCE_FRAME;
   }
-  const jsonStr = JSON.stringify(payload, null, 2);
+  const rawName = (document.getElementById('outputNameInput')?.value || OUTPUT_FILE || 'roi_bev.json').trim();
+  let baseName = rawName.split(/[\\/]/).pop() || 'roi_bev.json';
+  if (!baseName.toLowerCase().endsWith('.json')) baseName += '.json';
 
-  // Server-side persistence (enabled by the web frontend via --save-path).
-  // In standalone mode this returns saved=false and the browser download
-  // below is used as before.
-  let savedServerSide = false;
+  // La ROI viene sempre scritta dal server locale: questo funziona anche
+  // su Windows, dove il download del browser puo' fallire silenziosamente.
+  // Il file viene poi scaricato via HTTP dalla stessa pagina.
   try {
+    setStatus('Salvataggio in corso...', 'info');
     const res = await fetch(BASE_PATH + '/save-roi', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: jsonStr,
+      body: JSON.stringify({ filename: baseName, payload: payload })
     });
     const info = await res.json();
-    if (info.error) { setStatus('Errore salvataggio server: ' + info.error, 'err'); return; }
-    savedServerSide = !!info.saved;
-    if (savedServerSide) {
-      setStatus('Salvato lato server: ' + (info.filename || ''), 'ok');
-      try { window.parent.postMessage({type: 'roi-saved'}, '*'); } catch (e) {}
-      return;
-    }
-  } catch (e) { /* fall back to the browser download */ }
-
-  if (window.showSaveFilePicker) {
-    try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: OUTPUT_FILE,
-        types: [{ description: 'JSON', accept: {'application/json': ['.json']} }]
-      });
-      const w = await handle.createWritable();
-      await w.write(jsonStr);
-      await w.close();
-      setStatus('Salvato: ' + handle.name, 'ok');
-    } catch (e) {
-      if (e && e.name !== 'AbortError') setStatus('Errore salvataggio: ' + e.message, 'err');
-    }
-  } else {
-    const name = prompt('Nome file di output:', OUTPUT_FILE);
-    if (!name) return;
-    const blob = new Blob([jsonStr], {type:'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = name; a.click();
-    URL.revokeObjectURL(url);
-    setStatus('Download: ' + name + ' (usa Chrome/Edge per scegliere la cartella)', 'ok');
+    if (info.error) { setStatus('Errore salvataggio: ' + info.error, 'err'); return; }
+    const dlLink = document.createElement('a');
+    dlLink.style.display = 'none';
+    dlLink.href = BASE_PATH + '/download-roi?t=' + Date.now();
+    dlLink.download = info.filename || baseName;
+    document.body.appendChild(dlLink);
+    dlLink.click();
+    setTimeout(() => {
+      if (dlLink.parentNode) document.body.removeChild(dlLink);
+    }, 3000);
+    setStatus('Salvato su disco in: ' + (info.saved_to || info.filename || ''), 'ok');
+    try { window.parent.postMessage({type: 'roi-saved'}, '*'); } catch (e) {}
+  } catch (e) {
+    setStatus('Errore salvataggio: ' + e.message, 'err');
   }
 }
 function quitApp() {
@@ -1052,6 +1066,8 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
     # web frontend to pick it up). None keeps the standalone behaviour of
     # downloading the file to the browser only.
     save_path = None
+    last_saved_bytes = None
+    last_saved_name = 'roi_bev.json'
 
     def log_message(self, fmt, *args):
         pass
@@ -1071,6 +1087,18 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
             self.wfile.write(self.html_content.encode('utf-8'))
+        elif parsed.path == '/favicon.ico':
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+                '<rect width="32" height="32" rx="6" fill="#4fc1ff"/>'
+                '<path d="M7 22 L14 10 L18 17 L21 13 L25 22 Z" fill="#16181d"/>'
+                '</svg>'
+            ).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/svg+xml')
+            self.send_header('Content-Length', str(len(svg)))
+            self.end_headers()
+            self.wfile.write(svg)
         elif parsed.path == '/frame':
             params = urllib.parse.parse_qs(parsed.query)
             idx = int(params.get('index', ['0'])[0])
@@ -1097,6 +1125,19 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(data)
             except Exception as e:
                 self._send_json({'error': str(e)}, 500)
+        elif parsed.path == '/download-roi':
+            data = getattr(ROIHandler, 'last_saved_bytes', None)
+            name = getattr(ROIHandler, 'last_saved_name', 'roi_bev.json')
+            if not data:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Disposition', f'attachment; filename="{name}"')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
         else:
             self.send_error(404)
 
@@ -1182,20 +1223,29 @@ class ROIHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json({'error': str(e)}, 500)
 
         elif parsed.path == '/save-roi':
-            if ROIHandler.save_path is None:
-                self._send_json({'saved': False})
-                return
             try:
-                length = int(self.headers.get('Content-Length') or 0)
-                raw = self.rfile.read(length) if length else b'{}'
-                data = json.loads(raw.decode('utf-8'))
-                if not data.get('image_points'):
+                raw = body if body else b'{}'
+                request_data = json.loads(raw.decode('utf-8'))
+                payload = request_data.get('payload', request_data)
+                if not payload.get('image_points'):
                     self._send_json({'error': 'formato errato: mancano image_points'}, 400)
                     return
-                out = Path(ROIHandler.save_path)
+                raw_name = request_data.get('filename') or self.output_path or 'roi_bev.json'
+                safe_name = Path(str(raw_name).replace('\\', '/')).name or 'roi_bev.json'
+                if not safe_name.lower().endswith('.json'):
+                    safe_name += '.json'
+                json_bytes = json.dumps(payload, indent=2).encode('utf-8')
+                ROIHandler.last_saved_bytes = json_bytes
+                ROIHandler.last_saved_name = safe_name
+                if ROIHandler.save_path is not None:
+                    out = Path(ROIHandler.save_path)
+                else:
+                    base_dir = Path(self.output_path).resolve().parent if self.output_path else Path.cwd()
+                    out = base_dir / safe_name
                 out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(json.dumps(data, indent=2), encoding='utf-8')
-                self._send_json({'saved': True, 'filename': out.name, 'path': str(out)})
+                out.write_bytes(json_bytes)
+                self._send_json({'saved': True, 'saved_to': str(out),
+                                 'filename': safe_name, 'path': str(out)})
             except Exception as e:
                 self._send_json({'error': str(e)}, 500)
 

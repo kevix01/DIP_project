@@ -139,3 +139,18 @@ python select_roi_bev.py     # pick the zebra-crossing ROI on a frame -> roi_bev
 python extract_homography.py # solve the image->ground homography -> homography_bangkok.npy
 python homography_rt.py      # runtime homography helper
 ```
+
+## Webapp di debug
+
+```bash
+# unico comando, identico su Linux/macOS e Windows
+.venv/bin/python webapp/run_server.py          # Linux/macOS
+.venv\Scripts\python.exe webapp\run_server.py  # Windows
+
+.venv/bin/python webapp/run_server.py --foreground  # server in primo piano
+.venv/bin/python webapp/run_server.py --stop       # ferma il server (pidfile)
+```
+
+Il launcher usa l'interprete della venv del progetto (`.venv/bin/python` o
+`.venv/Scripts/python.exe`) e avvia uvicorn in background; i processi figli
+(export, omografia, selettore ROI) usano la stessa venv.

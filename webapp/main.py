@@ -31,7 +31,7 @@ PROJECT_ROOT = HERE.parent
 config.ensure_dirs()
 
 app = FastAPI(
-    title="Rilevatore di Infrazioni in Attraversamento Pedonale",
+    title="Rilevatore di Infrazioni su Attraversamento Pedonale",
     version="1.0.0",
 )
 jobs = JobRegistry()
@@ -555,8 +555,11 @@ async def roi_selector_proxy(path: str, request: Request) -> Response:
     body = await request.body()
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "connection")}
+    target = "/roi/app/" + path
+    if request.url.query:
+        target += "?" + request.url.query
     status, out_headers, data = roi_selector.proxy(
-        request.method, "/roi/app/" + path, body, headers)
+        request.method, target, body, headers)
     if status == 503 and request.method.upper() == "GET":
         return HTMLResponse(_ROI_PLACEHOLDER, status_code=200)
     return Response(content=data, status_code=status, headers=out_headers)
